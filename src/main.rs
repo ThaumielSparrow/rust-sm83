@@ -26,14 +26,21 @@ fn main() {
         }
     } else {
         // Load test prgram
-        cpu.memory.write_byte(0x0100, 0x3E); // LD A, 0x42
-        cpu.memory.write_byte(0x0101, 0x42);
-        cpu.memory.write_byte(0x0102, 0x06); // LD B, 0x10
-        cpu.memory.write_byte(0x0103, 0x10);
-        cpu.memory.write_byte(0x0104, 0x80); // ADD A, B
-        cpu.memory.write_byte(0x0105, 0xC3); // JP 0x0105 (infinite loop)
-        cpu.memory.write_byte(0x0106, 0x04);
-        cpu.memory.write_byte(0x0107, 0x01);
+        // cpu.memory.write_byte(0x0100, 0x3E); // LD A, 0x42
+        // cpu.memory.write_byte(0x0101, 0x42);
+        // cpu.memory.write_byte(0x0102, 0x06); // LD B, 0x10
+        // cpu.memory.write_byte(0x0103, 0x10);
+        // cpu.memory.write_byte(0x0104, 0x80); // ADD A, B
+        // cpu.memory.write_byte(0x0105, 0x05); // DEC B
+        // cpu.memory.write_byte(0x0106, 0xC3); // JP 0x0104 (infinite loop)
+        // cpu.memory.write_byte(0x0107, 0x04);
+    // Test program: LD B,0x10; DEC B; JP 0x0102 (loop)
+    cpu.memory.write_byte(0x0100, 0x06); // LD B, n
+    cpu.memory.write_byte(0x0101, 0x0A); // n = 0x10
+    cpu.memory.write_byte(0x0102, 0x05); // DEC B
+    cpu.memory.write_byte(0x0103, 0xC3); // JP nn
+    cpu.memory.write_byte(0x0104, 0x02); // low byte -> 0x0102
+    cpu.memory.write_byte(0x0105, 0x01); // high byte -> 0x0102
     }
 
     println!("Starting CPU emulation...");
