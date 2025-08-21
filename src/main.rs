@@ -29,7 +29,7 @@ fn main() {
         cpu.memory.write_byte(0x0103, 0x10);
         cpu.memory.write_byte(0x0104, 0x80); // ADD A, B
         cpu.memory.write_byte(0x0105, 0xC3); // JP 0x0105 (infinite loop)
-        cpu.memory.write_byte(0x0106, 0x05);
+        cpu.memory.write_byte(0x0106, 0x04);
         cpu.memory.write_byte(0x0107, 0x01);
     }
 

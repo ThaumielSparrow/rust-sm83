@@ -708,6 +708,7 @@ impl Memory {
             io_registers: [0; 0x80],
             hram: [0; 0x7F],
             interrupt_enable: 0,
+            // mbc_type: MBCType::None,
             mbc_type: MBCType::None,
             rom_bank: 1,
             ram_bank: 0,
@@ -842,7 +843,18 @@ impl Memory {
 
     fn write_mbc_register(&mut self, addr: u16, value: u8) {
         match self.mbc_type {
-            MBCType::None => {} // No banking
+            MBCType::None => {
+                // No MBC: allow direct writes to the ROM buffers
+                match addr {
+                    0x0000..=0x3FFF => {
+                        self.rom_bank_0[addr as usize] = value;
+                    }
+                    0x4000..=0x7FFF => {
+                        self.rom_bank_n[(addr - 0x4000) as usize] = value;
+                    }
+                    _ => {}
+                }
+            }
             
             MBCType::MBC1 => {
                 match addr {
