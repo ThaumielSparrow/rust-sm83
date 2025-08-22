@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 mimalloc = "0.1.47"
+minifb = "0.23"
 
 [build]
 rustflags = ["-C", "target-cpu=native"]
