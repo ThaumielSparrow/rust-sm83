@@ -1,5 +1,6 @@
 pub mod registers;
 pub mod mmu;
+pub mod hw;
 
 use mmu::Memory;
 use registers::Registers;
@@ -7,6 +8,7 @@ use registers::Registers;
 pub struct CPU {
     pub registers: Registers,
     pub memory: Memory, // 64KB memory space
+    pub timer: hw::timer::Timer,
     pub halted: bool,
     pub ime: bool, // Interrupt Master Enable
 }
@@ -16,6 +18,7 @@ impl CPU {
         CPU {
             registers: Registers::new(),
             memory: Memory::new(),
+            timer: hw::timer::Timer::new(),
             halted: false,
             ime: false,
         }
@@ -36,18 +39,46 @@ impl CPU {
     }
 
     pub fn step(&mut self) -> u8 {
+        // Service interrupts before executing the next instruction if IME is set
+        if self.ime {
+            if let Some(interrupt) = hw::interrupts::highest_pending_interrupt(&self.memory) {
+                // clear IME and handle interrupt
+                self.ime = false;
+                // clear the IF bit for this interrupt
+                let if_index = interrupt as u8;
+                self.memory.io_registers[0x0F] &= !(1 << if_index);
+                // push PC and jump to vector
+                self.push(self.registers.pc);
+                let vector = match interrupt {
+                    hw::interrupts::Interrupt::VBlank => 0x40,
+                    hw::interrupts::Interrupt::LCDStat => 0x48,
+                    hw::interrupts::Interrupt::Timer => 0x50,
+                    hw::interrupts::Interrupt::Serial => 0x58,
+                    hw::interrupts::Interrupt::Joypad => 0x60,
+                };
+                self.registers.pc = vector;
+                // servicing interrupt costs cycles; return typical 20 cycles for now
+                return 20;
+            }
+        }
+
         if self.halted {
             return 4; // NOP timing when halted
         }
 
         let opcode = self.fetch_byte();
 
-        if opcode == 0xCB {
+        let cycles = if opcode == 0xCB {
             let cb_opcode = self.fetch_byte();
             self.execute_cb_instruction(cb_opcode)
         } else {
             self.execute_instruction(opcode)
-        }
+        };
+
+        // Tick the timer with number of cycles executed
+        self.timer.tick(&mut self.memory, cycles);
+
+        cycles
     }
 
     // Fetch next byte from memory at PC and increment PC
