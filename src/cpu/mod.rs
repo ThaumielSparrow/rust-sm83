@@ -1,5 +1,4 @@
 pub mod registers;
-pub mod instructions;
 pub mod mmu;
 
 use mmu::Memory;
@@ -246,6 +245,15 @@ impl CPU {
             0x29 => { self.add_hl(self.registers.get_hl()); 8 }
             0x39 => { self.add_hl(self.registers.sp); 8 }
 
+            // LD (a16), SP - store SP at immediate 16-bit address (low then high)
+            0x08 => {
+                let addr = self.fetch_word();
+                let sp = self.registers.sp;
+                self.memory.write_byte(addr, (sp & 0xFF) as u8);
+                self.memory.write_byte(addr.wrapping_add(1), (sp >> 8) as u8);
+                20
+            }
+
             // Jumps and calls
             0xC3 => { self.registers.pc = self.fetch_word(); 16 }    // JP nn
             0xE9 => { self.registers.pc = self.registers.get_hl(); 4 } // JP (HL)
@@ -434,6 +442,7 @@ impl CPU {
 
             // Misc
             0x00 => 4,    // NOP
+            0x10 => 4,    // STOP
             _ => panic!("Unimplemented instruction: 0x{:02X} at PC: 0x{:04X}", opcode, self.registers.pc - 1),
         }
     }
@@ -547,7 +556,8 @@ impl CPU {
         let result = self.registers.a.wrapping_add(value).wrapping_add(carry);
         let full_carry = (self.registers.a as u16 + value as u16 + carry as u16) > 0xFF;
         let half_carry = (self.registers.a & 0x0F) + (value & 0x0F) + carry > 0x0F;
-        
+
+        self.registers.a = result;
         self.registers.set_flag(registers::Flag::Z, result == 0);
         self.registers.set_flag(registers::Flag::N, false);
         self.registers.set_flag(registers::Flag::H, half_carry);
@@ -558,8 +568,7 @@ impl CPU {
         let result = self.registers.a.wrapping_sub(value);
         let borrow = (self.registers.a as u16) < (value as u16);
         let half_borrow = (self.registers.a & 0x0F) < (value & 0x0F);
-        
-    self.registers.a = result;
+
         self.registers.a = result;
         self.registers.set_flag(registers::Flag::Z, result == 0);
         self.registers.set_flag(registers::Flag::N, true);
