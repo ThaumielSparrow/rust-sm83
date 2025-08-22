@@ -18,10 +18,10 @@ pub struct Registers {
 // Flags
 #[derive(Debug)]
 pub enum Flag {
-    Z = 0b10000000, // Zero
-    N = 0b01000000, // Subtract
-    H = 0b00100000, // Half-carry
-    C = 0b00010000, // Carry
+    Z = 0b1000_0000, // Zero
+    N = 0b0100_0000, // Subtract
+    H = 0b0010_0000, // Half-carry
+    C = 0b0001_0000, // Carry
 }
 
 impl Registers {
