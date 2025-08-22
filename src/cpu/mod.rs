@@ -175,11 +175,26 @@ impl CPU {
                 if src == 6 { 8 } else { 4 }
             }
 
+            // ADC A, r8
+            0x88..=0x8F => {
+                let src = opcode & 0x07;
+                let value = self.get_r8(src);
+                self.adc_a(value);
+                if src == 6 { 8 } else { 4 }
+            }
+
             // SUB r8
             0x90..=0x97 => {
                 let src = opcode & 0x07;
                 let value = self.get_r8(src);
                 self.sub_a(value);
+                if src == 6 { 8 } else { 4 }
+            }
+            // SBC A, r8
+            0x98..=0x9F => {
+                let src = opcode & 0x07;
+                let value = self.get_r8(src);
+                self.sbc_a(value);
                 if src == 6 { 8 } else { 4 }
             }
 
@@ -225,8 +240,51 @@ impl CPU {
             0x33 => { self.registers.sp = self.registers.sp.wrapping_add(1); 8 }                       // INC SP
             0x3B => { self.registers.sp = self.registers.sp.wrapping_sub(1); 8 }                       // DEC SP
 
+            // ADD HL, rr (16-bit add)
+            0x09 => { self.add_hl(self.registers.get_bc()); 8 }
+            0x19 => { self.add_hl(self.registers.get_de()); 8 }
+            0x29 => { self.add_hl(self.registers.get_hl()); 8 }
+            0x39 => { self.add_hl(self.registers.sp); 8 }
+
             // Jumps and calls
             0xC3 => { self.registers.pc = self.fetch_word(); 16 }    // JP nn
+            0xE9 => { self.registers.pc = self.registers.get_hl(); 4 } // JP (HL)
+
+            // Relative jumps
+            0x18 => { // JR n (always)
+                let offset = self.fetch_byte() as i8;
+                let new_pc = ((self.registers.pc as i32) + (offset as i32)) as u16;
+                self.registers.pc = new_pc;
+                12
+            }
+            0x20 => { // JR NZ,n
+                let offset = self.fetch_byte() as i8;
+                if !self.registers.get_flag(registers::Flag::Z) {
+                    self.registers.pc = ((self.registers.pc as i32) + (offset as i32)) as u16;
+                    12
+                } else { 8 }
+            }
+            0x28 => { // JR Z,n
+                let offset = self.fetch_byte() as i8;
+                if self.registers.get_flag(registers::Flag::Z) {
+                    self.registers.pc = ((self.registers.pc as i32) + (offset as i32)) as u16;
+                    12
+                } else { 8 }
+            }
+            0x30 => { // JR NC,n
+                let offset = self.fetch_byte() as i8;
+                if !self.registers.get_flag(registers::Flag::C) {
+                    self.registers.pc = ((self.registers.pc as i32) + (offset as i32)) as u16;
+                    12
+                } else { 8 }
+            }
+            0x38 => { // JR C,n
+                let offset = self.fetch_byte() as i8;
+                if self.registers.get_flag(registers::Flag::C) {
+                    self.registers.pc = ((self.registers.pc as i32) + (offset as i32)) as u16;
+                    12
+                } else { 8 }
+            }
             0xC2 => self.jp_cond(!self.registers.get_flag(registers::Flag::Z)), // JP NZ, nn
             0xCA => self.jp_cond(self.registers.get_flag(registers::Flag::Z)),  // JP Z, nn
             0xD2 => self.jp_cond(!self.registers.get_flag(registers::Flag::C)), // JP NC, nn
@@ -259,15 +317,57 @@ impl CPU {
             0x0F => { self.rrca(); 4 }  // RRCA
             0x17 => { self.rla(); 4 }   // RLA
             0x1F => { self.rra(); 4 }   // RRA
+            0x27 => { self.daa(); 4 }   // DAA
+            0x2F => { self.cpl(); 4 }   // CPL
+            0x37 => { self.scf(); 4 }   // SCF
+            0x3F => { self.ccf(); 4 }   // CCF
 
             // Immediate arithmetic
             0xC6 => { let val = self.fetch_byte(); self.add_a(val); 8 }  // ADD A, n
             0xCE => { let val = self.fetch_byte(); self.adc_a(val); 8 }  // ADC A, n
+            0xDE => { let val = self.fetch_byte(); self.sbc_a(val); 8 }  // SBC A, n
             0xD6 => { let val = self.fetch_byte(); self.sub_a(val); 8 }  // SUB n
             0xE6 => { let val = self.fetch_byte(); self.and_a(val); 8 }  // AND n
             0xEE => { let val = self.fetch_byte(); self.xor_a(val); 8 }  // XOR n
             0xF6 => { let val = self.fetch_byte(); self.or_a(val); 8 }   // OR n
             0xFE => { let val = self.fetch_byte(); self.cp_a(val); 8 }   // CP n
+
+            // Misc arithmetic and special ops
+            0xE8 => { // ADD SP, e (signed immediate)
+                let offset = self.fetch_byte() as i8 as i16 as i32;
+                let result = (self.registers.sp as i32).wrapping_add(offset) as u16;
+                // Flags: Z = 0, N = 0, H and C based on 8-bit addition of low byte
+                let low_sp = (self.registers.sp & 0xFF) as u8;
+                let offset8 = offset as i8 as u8;
+                let half = ((low_sp & 0x0F) as u16 + (offset8 & 0x0F) as u16) > 0x0F;
+                let carry = ((low_sp as u16) + (offset8 as u16)) > 0xFF;
+                self.registers.sp = result;
+                self.registers.set_flag(registers::Flag::Z, false);
+                self.registers.set_flag(registers::Flag::N, false);
+                self.registers.set_flag(registers::Flag::H, half);
+                self.registers.set_flag(registers::Flag::C, carry);
+                16
+            }
+
+            0xF8 => { // LD HL, SP + e
+                let offset = self.fetch_byte() as i8 as i16 as i32;
+                let result = (self.registers.sp as i32).wrapping_add(offset) as u16;
+                let low_sp = (self.registers.sp & 0xFF) as u8;
+                let offset8 = offset as i8 as u8;
+                let half = ((low_sp & 0x0F) as u16 + (offset8 & 0x0F) as u16) > 0x0F;
+                let carry = ((low_sp as u16) + (offset8 as u16)) > 0xFF;
+                self.registers.set_hl(result);
+                self.registers.set_flag(registers::Flag::Z, false);
+                self.registers.set_flag(registers::Flag::N, false);
+                self.registers.set_flag(registers::Flag::H, half);
+                self.registers.set_flag(registers::Flag::C, carry);
+                12
+            }
+
+            0xF9 => { // LD SP, HL
+                self.registers.sp = self.registers.get_hl();
+                8
+            }
 
             // Memory loads with immediate address
             0xEA => { // LD (nn), A
@@ -306,6 +406,31 @@ impl CPU {
             // Interrupt control
             0xF3 => { self.ime = false; 4 } // DI
             0xFB => { self.ime = true; 4 }  // EI
+
+            // Returns and resets
+            0xD9 => { // RETI - return and enable interrupts
+                let pc = self.pop();
+                self.registers.pc = pc;
+                self.ime = true;
+                16
+            }
+
+            0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF => { // RST n
+                let vector = match opcode {
+                    0xC7 => 0x00,
+                    0xCF => 0x08,
+                    0xD7 => 0x10,
+                    0xDF => 0x18,
+                    0xE7 => 0x20,
+                    0xEF => 0x28,
+                    0xF7 => 0x30,
+                    0xFF => 0x38,
+                    _ => 0x00,
+                };
+                self.push(self.registers.pc);
+                self.registers.pc = vector;
+                16
+            }
 
             // Misc
             0x00 => 4,    // NOP
@@ -423,7 +548,6 @@ impl CPU {
         let full_carry = (self.registers.a as u16 + value as u16 + carry as u16) > 0xFF;
         let half_carry = (self.registers.a & 0x0F) + (value & 0x0F) + carry > 0x0F;
         
-        self.registers.a = result;
         self.registers.set_flag(registers::Flag::Z, result == 0);
         self.registers.set_flag(registers::Flag::N, false);
         self.registers.set_flag(registers::Flag::H, half_carry);
@@ -435,6 +559,7 @@ impl CPU {
         let borrow = (self.registers.a as u16) < (value as u16);
         let half_borrow = (self.registers.a & 0x0F) < (value & 0x0F);
         
+    self.registers.a = result;
         self.registers.a = result;
         self.registers.set_flag(registers::Flag::Z, result == 0);
         self.registers.set_flag(registers::Flag::N, true);
@@ -448,6 +573,19 @@ impl CPU {
         self.registers.set_flag(registers::Flag::N, false);
         self.registers.set_flag(registers::Flag::H, true);
         self.registers.set_flag(registers::Flag::C, false);
+    }
+
+    fn sbc_a(&mut self, value: u8) {
+        let carry = if self.registers.get_flag(registers::Flag::C) { 1 } else { 0 };
+        let sub = (value as u16) + (carry as u16);
+        let result = self.registers.a.wrapping_sub(sub as u8);
+        let borrow = (self.registers.a as u16) < sub;
+        let half_borrow = (self.registers.a & 0x0F) < ((value & 0x0F) + (carry as u8));
+        self.registers.a = result;
+        self.registers.set_flag(registers::Flag::Z, result == 0);
+        self.registers.set_flag(registers::Flag::N, true);
+        self.registers.set_flag(registers::Flag::H, half_borrow);
+        self.registers.set_flag(registers::Flag::C, borrow);
     }
 
     fn xor_a(&mut self, value: u8) {
@@ -645,6 +783,61 @@ impl CPU {
         self.registers.set_flag(registers::Flag::H, false);
         self.registers.set_flag(registers::Flag::C, false);
         result
+    }
+
+    fn add_hl(&mut self, value: u16) {
+        let hl = self.registers.get_hl();
+        let result = hl.wrapping_add(value);
+        let half = ((hl & 0x0FFF) as u32 + (value & 0x0FFF) as u32) > 0x0FFF;
+        let carry = (hl as u32 + value as u32) > 0xFFFF;
+        self.registers.set_hl(result);
+        self.registers.set_flag(registers::Flag::N, false);
+        self.registers.set_flag(registers::Flag::H, half);
+        self.registers.set_flag(registers::Flag::C, carry);
+    }
+    // Decimal adjust accumulator - fairly nuanced; implement standard BCD adjust
+    fn daa(&mut self) {
+        let mut a = self.registers.a;
+        let mut adjust: u8 = 0;
+        let mut carry = self.registers.get_flag(registers::Flag::C);
+
+        if self.registers.get_flag(registers::Flag::H) || (!self.registers.get_flag(registers::Flag::N) && (a & 0x0F) > 9) {
+            adjust |= 0x06;
+        }
+        if carry || (!self.registers.get_flag(registers::Flag::N) && a > 0x99) {
+            adjust |= 0x60;
+            carry = true;
+        }
+
+        if self.registers.get_flag(registers::Flag::N) {
+            a = a.wrapping_sub(adjust);
+        } else {
+            a = a.wrapping_add(adjust);
+        }
+
+        self.registers.a = a;
+        self.registers.set_flag(registers::Flag::Z, a == 0);
+        self.registers.set_flag(registers::Flag::H, false);
+        self.registers.set_flag(registers::Flag::C, carry);
+    }
+
+    fn cpl(&mut self) {
+        self.registers.a = !self.registers.a;
+        self.registers.set_flag(registers::Flag::N, true);
+        self.registers.set_flag(registers::Flag::H, true);
+    }
+
+    fn scf(&mut self) {
+        self.registers.set_flag(registers::Flag::N, false);
+        self.registers.set_flag(registers::Flag::H, false);
+        self.registers.set_flag(registers::Flag::C, true);
+    }
+
+    fn ccf(&mut self) {
+        let old_c = self.registers.get_flag(registers::Flag::C);
+        self.registers.set_flag(registers::Flag::N, false);
+        self.registers.set_flag(registers::Flag::H, old_c);
+        self.registers.set_flag(registers::Flag::C, !old_c);
     }
 
     fn srl(&mut self, value: u8) -> u8 {
