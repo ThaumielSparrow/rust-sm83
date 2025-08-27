@@ -4,11 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mimalloc = "0.1.47"
-minifb = "0.23"
-
-[build]
-rustflags = ["-C", "target-cpu=native"]
+mimalloc = "0.1.48"
+glium = "0.36"
+winit = "0.30"
+cpal = "0.16"
+rfd = "0.15"
+egui = "0.29"
+egui_glium = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+bincode = { version = "2.0", features = ["serde"] }
+serde_arrays = "0.2.0"
+typetag = "0.2.20"
+blip_buf = "0.1.5"
+glutin-winit = "0.5.0"
 
 [profile.dev]
 debug = "line-tables-only"
