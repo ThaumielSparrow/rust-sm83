@@ -1,6 +1,6 @@
 pub use crate::gpu::{SCREEN_H, SCREEN_W};
 pub use crate::keypad::KeypadKey;
-pub use crate::sound::AudioPlayer;
+pub use crate::apu::AudioPlayer;
 
 pub mod device;
 
@@ -12,7 +12,7 @@ mod mbc;
 mod mmu;
 mod register;
 mod serial;
-mod sound;
+mod apu;
 mod timer;
 
 pub type StrResult<T> = Result<T, &'static str>;

@@ -2,8 +2,7 @@ use crate::cpu::CPU;
 use crate::gbmode::GbMode;
 use crate::keypad::KeypadKey;
 use crate::mbc;
-// Printer and external serial callback support removed.
-use crate::sound;
+use crate::apu;
 use crate::StrResult;
 use serde::{Deserialize, Serialize};
 
@@ -113,13 +112,13 @@ impl Device {
         &self.cpu.mmu.gpu.data
     }
 
-    pub fn enable_audio(&mut self, player: Box<dyn sound::AudioPlayer>, is_on: bool) {
+    pub fn enable_audio(&mut self, player: Box<dyn apu::AudioPlayer>, is_on: bool) {
         match self.cpu.mmu.gbmode {
             GbMode::Classic => {
-                self.cpu.mmu.sound = Some(sound::Sound::new_dmg(player));
+                self.cpu.mmu.sound = Some(apu::Sound::new_dmg(player));
             }
             GbMode::Color | GbMode::ColorAsClassic => {
-                self.cpu.mmu.sound = Some(sound::Sound::new_cgb(player));
+                self.cpu.mmu.sound = Some(apu::Sound::new_cgb(player));
             }
         };
         if is_on {

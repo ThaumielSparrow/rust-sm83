@@ -3,7 +3,7 @@ use crate::gpu::GPU;
 use crate::keypad::Keypad;
 use crate::mbc;
 use crate::serial::Serial;
-use crate::sound::Sound;
+use crate::apu::Sound;
 use crate::timer::Timer;
 use crate::StrResult;
 use serde::{Deserialize, Serialize};
