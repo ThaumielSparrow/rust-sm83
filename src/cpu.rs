@@ -2549,19 +2549,14 @@ impl CPU {
 mod test {
     use super::CPU;
     use crate::mbc;
-    // Removed unused serde and sync imports from old serial callback tests.
 
     const CPUINSTRS: &'static str = "test/cpu_instrs.gb";
     const GPU_CLASSIC_CHECKSUM: u32 = 3112234583;
     const GPU_COLOR_CHECKSUM: u32 = 938267576;
 
-    // Removed serial callback test scaffolding.
-
     #[test]
     fn cpu_instrs_classic() {
         let mut sum_classic = 0_u32;
-    // Serial output test removed.
-
         {
             let cart = mbc::FileBackedMBC::new(CPUINSTRS.into(), false).unwrap();
             let mut c = match CPU::new(Box::new(cart), None) {
@@ -2580,7 +2575,6 @@ mod test {
             }
         }
 
-    // Serial output assertion removed.
         assert!(
             sum_classic == GPU_CLASSIC_CHECKSUM,
             "GPU did not produce expected graphics"
@@ -2590,8 +2584,6 @@ mod test {
     #[test]
     fn cpu_instrs_color() {
         let mut sum_color = 0_u32;
-
-    // Serial output test removed.
 
         {
             let cart = mbc::FileBackedMBC::new(CPUINSTRS.into(), false).unwrap();
@@ -2611,7 +2603,6 @@ mod test {
             }
         }
 
-    // Serial output assertion removed.
         assert!(
             sum_color == GPU_COLOR_CHECKSUM,
             "GPU did not produce expected graphics"

@@ -57,31 +57,6 @@ pub fn config_path() -> PathBuf {
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("config.json"))).unwrap_or_else(|| PathBuf::from("config.json"))
 }
 
-// Legacy helper used by GUI for translating a winit logical key string to keypad key based on bindings
-// pub fn map_winit_key(bindings: &KeyBindings, logical: &winit::keyboard::Key<&str>) -> Option<rust_gbe::KeypadKey> {
-//     use winit::keyboard::{Key, NamedKey};
-//     match logical {
-//         Key::Character(c) => {
-//             let upc = c.to_uppercase();
-//             if upc == bindings.a { Some(rust_gbe::KeypadKey::A) }
-//             else if upc == bindings.b { Some(rust_gbe::KeypadKey::B) }
-//             else if upc == bindings.start { Some(rust_gbe::KeypadKey::Start) }
-//             else if upc == bindings.select { Some(rust_gbe::KeypadKey::Select) }
-//             else { None }
-//         }
-//         Key::Named(named) => match named {
-//             NamedKey::ArrowUp if bindings.up == "ArrowUp" => Some(rust_gbe::KeypadKey::Up),
-//             NamedKey::ArrowDown if bindings.down == "ArrowDown" => Some(rust_gbe::KeypadKey::Down),
-//             NamedKey::ArrowLeft if bindings.left == "ArrowLeft" => Some(rust_gbe::KeypadKey::Left),
-//             NamedKey::ArrowRight if bindings.right == "ArrowRight" => Some(rust_gbe::KeypadKey::Right),
-//             NamedKey::Space if bindings.select == "Space" => Some(rust_gbe::KeypadKey::Select),
-//             NamedKey::Enter if bindings.start == "Enter" => Some(rust_gbe::KeypadKey::Start),
-//             _ => None,
-//         },
-//         _ => None,
-//     }
-// }
-
 // Provide display text for a keypad key's binding value
 pub fn binding_value(bindings: &KeyBindings, key: rust_gbe::KeypadKey) -> String {
     match key {

@@ -3,17 +3,13 @@ use std::sync::Arc;
 use std::thread;
 
 use cpal::Stream;
-// (glium::Surface trait is imported locally where needed for blit/draw)
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
-// Re-export for main.rs
 pub const EXITCODE_SUCCESS: i32 = 0;
 pub const EXITCODE_CPULOADFAILS: i32 = 2;
-
-// (auto-save constant moved to emulator module)
 
 #[derive(Default)]
 pub struct RenderOptions {
@@ -176,7 +172,7 @@ impl ApplicationHandler for RootApp {
                 if let Some(f) = launch_filename { self.start_game(f); }
                 if quit_requested { self.exit_code = EXITCODE_CPULOADFAILS; event_loop.exit(); }
             }
-            (RootPhase::Running { sender, renderoptions, running, keybindings, capturing, show_keybindings_window, turbo_toggle, turbo_held, turbo_setting, .. }, WindowEvent::KeyboardInput { event: keyevent, .. }) => {
+            (RootPhase::Running { sender, renderoptions, running, keybindings, capturing, show_keybindings_window, turbo_toggle, turbo_held, turbo_setting: _, .. }, WindowEvent::KeyboardInput { event: keyevent, .. }) => {
                 let state = keyevent.state;
                 let logical = keyevent.logical_key.clone();
                 if let Some(kp) = *capturing {
@@ -229,8 +225,10 @@ impl ApplicationHandler for RootApp {
             (RootPhase::Running { sender, texture, receiver, renderoptions, running, keybindings, capturing, show_keybindings_window, turbo_toggle, turbo_setting, .. }, WindowEvent::RedrawRequested) => {
                 if !*running { return; }
                 if let (Some(display), Some(window), Some(egui_glium)) = (&self.display, &self.window, &mut self.egui_glium) {
+                    // Get the menu bar height first
+                    let mut menu_bar_height = 0.0;
                     egui_glium.run(window, |ctx| {
-                        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+                        let top_panel = egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
                             egui::menu::bar(ui, |ui| {
                                 ui.menu_button("File", |ui| {
                                     ui.menu_button("Save State", |ui| {
@@ -261,6 +259,8 @@ impl ApplicationHandler for RootApp {
                                 });
                             });
                         });
+                        menu_bar_height = top_panel.response.rect.height();
+                        
                         if *show_keybindings_window {
                             egui::Window::new("Keybindings").open(show_keybindings_window).show(ctx, |ui| {
                                 ui.label("Click a binding, then press a key (Esc to cancel capture). Reserved keys can't be used.");
@@ -281,12 +281,29 @@ impl ApplicationHandler for RootApp {
                             });
                         }
                     });
-                    // Draw game texture and overlay
+                    
+                    // Draw game texture with offset for menu bar
                     use glium::Surface; let mut target = display.draw();
                     let (target_w, target_h) = target.get_dimensions();
-                    let interpolation_type = if renderoptions.linear_interpolation { glium::uniforms::MagnifySamplerFilter::Linear } else { glium::uniforms::MagnifySamplerFilter::Nearest };
-                    texture.as_surface().blit_whole_color_to(&target, &glium::BlitTarget { left:0, bottom: target_h, width: target_w as i32, height: -(target_h as i32) }, interpolation_type);
-                    egui_glium.paint(display, &mut target); let _ = target.finish();
+                    
+                    // Calculate menu bar height in pixels
+                    let menu_bar_height_pixels = (menu_bar_height * window.scale_factor() as f32) as u32;
+                    let game_area_height = target_h.saturating_sub(menu_bar_height_pixels);
+                    
+                    // Render game texture offset downward by menu bar height
+                    if game_area_height > 0 {
+                        let interpolation_type = if renderoptions.linear_interpolation { glium::uniforms::MagnifySamplerFilter::Linear } else { glium::uniforms::MagnifySamplerFilter::Nearest };
+                        texture.as_surface().blit_whole_color_to(&target, &glium::BlitTarget { 
+                            left: 0, 
+                            bottom: game_area_height,  // Position at bottom of available area
+                            width: target_w as i32, 
+                            height: -(game_area_height as i32)  // Negative height to flip Y
+                        }, interpolation_type);
+                    }
+                    
+                    // Paint egui on top
+                    egui_glium.paint(display, &mut target); 
+                    let _ = target.finish();
                 }
                 // Drain any queued frames and upload
                 loop { match receiver.try_recv() { Ok(data)=>{ upload_screen(texture, &data); }, Err(TryRecvError::Empty)=>break, Err(TryRecvError::Disconnected)=>{ *running=false; event_loop.exit(); break; } } }
@@ -307,22 +324,6 @@ impl ApplicationHandler for RootApp {
     }
 }
 
-// Legacy winit_to_keypad()
-// fn winit_to_keypad(key: winit::keyboard::Key<&str>) -> Option<rust_gbe::KeypadKey> {
-//     use winit::keyboard::{Key, NamedKey};
-//     match key {
-//         Key::Character("Z" | "z") => Some(rust_gbe::KeypadKey::A),
-//         Key::Character("X" | "x") => Some(rust_gbe::KeypadKey::B),
-//         Key::Named(NamedKey::ArrowUp) => Some(rust_gbe::KeypadKey::Up),
-//         Key::Named(NamedKey::ArrowDown) => Some(rust_gbe::KeypadKey::Down),
-//         Key::Named(NamedKey::ArrowLeft) => Some(rust_gbe::KeypadKey::Left),
-//         Key::Named(NamedKey::ArrowRight) => Some(rust_gbe::KeypadKey::Right),
-//         Key::Named(NamedKey::Space) => Some(rust_gbe::KeypadKey::Select),
-//         Key::Named(NamedKey::Enter) => Some(rust_gbe::KeypadKey::Start),
-//         _ => None,
-//     }
-// }
-
 fn upload_screen(texture: &mut glium::texture::texture2d::Texture2d, datavec: &[u8]) {
     let rawimage2d = glium::texture::RawImage2d {
         data: std::borrow::Cow::Borrowed(datavec),
@@ -341,13 +342,13 @@ fn warn(message: &str) {
 }
 
 fn set_window_size(window: &winit::window::Window, scale: u32) {
+    // Add extra height for the menu bar (approximately 30 pixels at 1x scale)
+    let menu_bar_height = 30;
     let _ = window.request_inner_size(winit::dpi::LogicalSize::<u32>::from((
         rust_gbe::SCREEN_W as u32 * scale,
-        rust_gbe::SCREEN_H as u32 * scale,
+        rust_gbe::SCREEN_H as u32 * scale + menu_bar_height,
     )));
 }
-
-// (Audio backend & run loop moved to modules `audio` and `emulator`)
 
 // Dynamic mapping using current keybindings
 fn dynamic_winit_to_keypad(key: winit::keyboard::Key<&str>, bindings: &KeyBindings) -> Option<rust_gbe::KeypadKey> {
@@ -392,8 +393,6 @@ fn key_to_string(key: &winit::keyboard::Key<&str>) -> String {
         _ => "Unknown".into(),
     }
 }
-
-// Conflict detection now centralized in input.rs (is_reserved_key_name)
 
 fn matches_capturing(capturing: Option<rust_gbe::KeypadKey>, k: rust_gbe::KeypadKey) -> bool {
     use rust_gbe::KeypadKey::*;
