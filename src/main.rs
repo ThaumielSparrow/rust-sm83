@@ -6,6 +6,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 mod gui;
 mod audio;
 mod emulator;
+mod config;
 
 use gui::{RootApp, EXITCODE_CPULOADFAILS, EXITCODE_SUCCESS};
 

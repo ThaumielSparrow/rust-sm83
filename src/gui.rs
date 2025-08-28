@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::thread;
 
 use cpal::Stream;
-use glium::Surface; // bring trait methods (get_dimensions, blit_whole_color_to) into scope
+// (glium::Surface trait is imported locally where needed for blit/draw)
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
@@ -22,6 +22,7 @@ pub struct RenderOptions {
 
 use crate::emulator::{GBEvent, construct_cpu_auto, run_cpu};
 use crate::audio::init_audio;
+use crate::config::{Config, KeyBindings, config_path, binding_value};
 
 // Unified state machine for ROM selection and emulator run to ensure a single EventLoop
 enum RootPhase {
@@ -32,7 +33,10 @@ enum RootPhase {
         receiver: Receiver<Vec<u8>>,
         renderoptions: RenderOptions,
         running: bool,
-    _audio: Option<Stream>,
+        keybindings: KeyBindings,
+        capturing: Option<rust_gbe::KeypadKey>,
+        _audio: Option<Stream>,
+    show_keybindings_window: bool,
     },
 }
 
@@ -52,7 +56,8 @@ impl RootApp {
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_string_lossy().to_string()))
             .unwrap_or_else(|| ".".to_string());
-        RootApp {
+    let _cfg = Config::load(&config_path());
+    RootApp {
             window: None,
             display: None,
             egui_glium: None,
@@ -82,7 +87,11 @@ impl RootApp {
                 rust_gbe::SCREEN_W as u32,
                 rust_gbe::SCREEN_H as u32,
             ).unwrap();
-            self.phase = RootPhase::Running { texture, sender, receiver: frame_receiver, renderoptions: RenderOptions::default(), running: true, _audio: audio_stream };
+            let cfg = Config::load(&config_path());
+            let initial_scale = cfg.scale;
+            if let Some(win) = &self.window { set_window_size(win, initial_scale); }
+            self.scale = initial_scale;
+            self.phase = RootPhase::Running { texture, sender, receiver: frame_receiver, renderoptions: RenderOptions::default(), running: true, keybindings: cfg.keybindings, capturing: None, _audio: audio_stream, show_keybindings_window: false };
             // Now that we've transitioned to Running, resize window to game resolution * scale.
             if let Some(win) = &self.window { set_window_size(win, self.scale); }
         } else {
@@ -110,10 +119,8 @@ impl ApplicationHandler for RootApp {
         use winit::event::ElementState::{Pressed, Released};
         use winit::keyboard::{Key, NamedKey};
 
-        // Pass events to egui only when selecting
-        if matches!(self.phase, RootPhase::Selecting { .. }) {
-            if let Some(egui_glium) = &mut self.egui_glium { let resp = egui_glium.on_event(self.window.as_ref().unwrap(), &event); if resp.repaint { if let Some(w) = &self.window { w.request_redraw(); } } if resp.consumed { return; } }
-        }
+    // Pass events to egui in all phases (menus in Running phase)
+    if let Some(egui_glium) = &mut self.egui_glium { let resp = egui_glium.on_event(self.window.as_ref().unwrap(), &event); if resp.repaint { if let Some(w) = &self.window { w.request_redraw(); } } if resp.consumed { return; } }
 
         match (&mut self.phase, event) {
             (_, WindowEvent::CloseRequested) => { event_loop.exit(); },
@@ -147,9 +154,35 @@ impl ApplicationHandler for RootApp {
                 if let Some(f) = launch_filename { self.start_game(f); }
                 if quit_requested { self.exit_code = EXITCODE_CPULOADFAILS; event_loop.exit(); }
             }
-            (RootPhase::Running { sender, renderoptions, running, .. }, WindowEvent::KeyboardInput { event: keyevent, .. }) => {
-                match (keyevent.state, keyevent.logical_key.as_ref()) {
-                    (Pressed, Key::Named(NamedKey::Escape)) => { *running = false; event_loop.exit(); },
+            (RootPhase::Running { sender, renderoptions, running, keybindings, capturing, show_keybindings_window, .. }, WindowEvent::KeyboardInput { event: keyevent, .. }) => {
+                let state = keyevent.state;
+                let logical = keyevent.logical_key.clone();
+                if let Some(kp) = *capturing {
+                    // Capturing mode: ESC cancels, any other key assigns.
+                    if let Key::Named(NamedKey::Escape) = logical.as_ref() { *capturing = None; return; }
+                    if matches!(state, winit::event::ElementState::Pressed) {
+                        let value = key_to_string(&logical.as_ref());
+                        match kp {
+                            rust_gbe::KeypadKey::A => keybindings.a = value.clone(),
+                            rust_gbe::KeypadKey::B => keybindings.b = value.clone(),
+                            rust_gbe::KeypadKey::Start => keybindings.start = value.clone(),
+                            rust_gbe::KeypadKey::Select => keybindings.select = value.clone(),
+                            rust_gbe::KeypadKey::Up => keybindings.up = value.clone(),
+                            rust_gbe::KeypadKey::Down => keybindings.down = value.clone(),
+                            rust_gbe::KeypadKey::Left => keybindings.left = value.clone(),
+                            rust_gbe::KeypadKey::Right => keybindings.right = value.clone(),
+                        }
+                        *capturing = None;
+                        let cfg = Config { keybindings: keybindings.clone(), scale: self.scale }; cfg.save(&config_path());
+                    }
+                    return; // don't treat as game input
+                }
+                match (state, logical.as_ref()) {
+                    // Escape: if keybindings window open, close it; else exit emulator
+                    (Pressed, Key::Named(NamedKey::Escape)) => {
+                        if *show_keybindings_window { *show_keybindings_window = false; }
+                        else { *running = false; event_loop.exit(); }
+                    },
                     (Pressed, Key::Character("1")) => { if let Some(w) = &self.window { set_window_size(w, 1); } },
                     (Pressed, Key::Character("r"|"R")) => { if let Some(w) = &self.window { set_window_size(w, self.scale); } },
                     (Pressed, Key::Named(NamedKey::Shift)) => { let _ = sender.send(GBEvent::SpeedUp); },
@@ -163,19 +196,68 @@ impl ApplicationHandler for RootApp {
                     (Pressed, Key::Named(NamedKey::F6)) => { let _ = sender.send(GBEvent::LoadState(2)); },
                     (Pressed, Key::Named(NamedKey::F7)) => { let _ = sender.send(GBEvent::LoadState(3)); },
                     (Pressed, Key::Named(NamedKey::F8)) => { let _ = sender.send(GBEvent::LoadState(4)); },
-                    (Pressed, wkey) => { if let Some(k)=winit_to_keypad(wkey) { let _=sender.send(GBEvent::KeyDown(k)); } },
-                    (Released, wkey) => { if let Some(k)=winit_to_keypad(wkey) { let _=sender.send(GBEvent::KeyUp(k)); } },
+                    (Pressed, wkey) => { if let Some(k)=dynamic_winit_to_keypad(wkey, keybindings) { let _=sender.send(GBEvent::KeyDown(k)); } },
+                    (Released, wkey) => { if let Some(k)=dynamic_winit_to_keypad(wkey, keybindings) { let _=sender.send(GBEvent::KeyUp(k)); } },
                 }
+            }
+            (RootPhase::Running { sender, texture, receiver, renderoptions, running, keybindings, capturing, show_keybindings_window, .. }, WindowEvent::RedrawRequested) => {
+                if !*running { return; }
+                if let (Some(display), Some(window), Some(egui_glium)) = (&self.display, &self.window, &mut self.egui_glium) {
+                    egui_glium.run(window, |ctx| {
+                        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+                            egui::menu::bar(ui, |ui| {
+                                ui.menu_button("File", |ui| {
+                                    ui.menu_button("Save State", |ui| {
+                                        for i in 1..=4 { if ui.button(format!("Slot {}", i)).clicked() { let _=sender.send(GBEvent::SaveState(i)); ui.close_menu(); } }
+                                    });
+                                    ui.menu_button("Load State", |ui| {
+                                        for i in 1..=4 { if ui.button(format!("Slot {}", i)).clicked() { let _=sender.send(GBEvent::LoadState(i)); ui.close_menu(); } }
+                                    });
+                                    ui.separator();
+                                    if ui.button("Quit").clicked() { *running=false; ui.close_menu(); }
+                                });
+                                ui.menu_button("Options", |ui| {
+                                    ui.menu_button("Scale", |ui| {
+                                        for s in 1..=4 { let selected = self.scale == s; if ui.radio(selected, format!("{}x", s)).clicked() { self.scale = s; set_window_size(window, s); let cfg = Config { keybindings: keybindings.clone(), scale: self.scale }; cfg.save(&config_path()); } }
+                                    });
+                                    if ui.button("Keybindings...").clicked() { *show_keybindings_window = true; }
+                                });
+                            });
+                        });
+                        if *show_keybindings_window {
+                            egui::Window::new("Keybindings").open(show_keybindings_window).show(ctx, |ui| {
+                                ui.label("Click a binding, then press a key (Esc to cancel capture by closing window).");
+                                let keys = [rust_gbe::KeypadKey::A, rust_gbe::KeypadKey::B, rust_gbe::KeypadKey::Start, rust_gbe::KeypadKey::Select,
+                                    rust_gbe::KeypadKey::Up, rust_gbe::KeypadKey::Down, rust_gbe::KeypadKey::Left, rust_gbe::KeypadKey::Right];
+                                for k in keys { ui.horizontal(|ui| {
+                                    ui.label(match k { rust_gbe::KeypadKey::A=>"A", rust_gbe::KeypadKey::B=>"B", rust_gbe::KeypadKey::Start=>"Start", rust_gbe::KeypadKey::Select=>"Select", rust_gbe::KeypadKey::Up=>"Up", rust_gbe::KeypadKey::Down=>"Down", rust_gbe::KeypadKey::Left=>"Left", rust_gbe::KeypadKey::Right=>"Right" });
+                                    let active = matches_capturing(*capturing, k);
+                                    let label = if active { "(press key)".to_string() } else { binding_value(keybindings, k) };
+                                    if ui.button(label).clicked() { *capturing = Some(k); }
+                                }); }
+                                if capturing.is_some() && ui.button("Cancel Capture").clicked() { *capturing=None; }
+                            });
+                        }
+                    });
+                    // Draw game texture and overlay
+                    use glium::Surface; let mut target = display.draw();
+                    let (target_w, target_h) = target.get_dimensions();
+                    let interpolation_type = if renderoptions.linear_interpolation { glium::uniforms::MagnifySamplerFilter::Linear } else { glium::uniforms::MagnifySamplerFilter::Nearest };
+                    texture.as_surface().blit_whole_color_to(&target, &glium::BlitTarget { left:0, bottom: target_h, width: target_w as i32, height: -(target_h as i32) }, interpolation_type);
+                    egui_glium.paint(display, &mut target); let _ = target.finish();
+                }
+                // Drain any queued frames and upload
+                loop { match receiver.try_recv() { Ok(data)=>{ upload_screen(texture, &data); }, Err(TryRecvError::Empty)=>break, Err(TryRecvError::Disconnected)=>{ *running=false; event_loop.exit(); break; } } }
             }
             _ => { if let Some(w) = &self.window { w.request_redraw(); } }
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let RootPhase::Running { receiver, texture, renderoptions, running, .. } = &mut self.phase {
+        if let RootPhase::Running { receiver, texture, running, .. } = &mut self.phase {
             if !*running { return; }
             match receiver.try_recv() {
-                Ok(data) => { if let Some(display) = &self.display { recalculate_screen(display, texture, &data, renderoptions); } },
+                Ok(data) => { upload_screen(texture, &data); if let Some(w) = &self.window { w.request_redraw(); } },
                 Err(TryRecvError::Empty) => {},
                 Err(TryRecvError::Disconnected) => { *running = false; event_loop.exit(); },
             }
@@ -183,35 +265,23 @@ impl ApplicationHandler for RootApp {
     }
 }
 
-fn winit_to_keypad(key: winit::keyboard::Key<&str>) -> Option<rust_gbe::KeypadKey> {
-    use winit::keyboard::{Key, NamedKey};
-    match key {
-        Key::Character("Z" | "z") => Some(rust_gbe::KeypadKey::A),
-        Key::Character("X" | "x") => Some(rust_gbe::KeypadKey::B),
-        Key::Named(NamedKey::ArrowUp) => Some(rust_gbe::KeypadKey::Up),
-        Key::Named(NamedKey::ArrowDown) => Some(rust_gbe::KeypadKey::Down),
-        Key::Named(NamedKey::ArrowLeft) => Some(rust_gbe::KeypadKey::Left),
-        Key::Named(NamedKey::ArrowRight) => Some(rust_gbe::KeypadKey::Right),
-        Key::Named(NamedKey::Space) => Some(rust_gbe::KeypadKey::Select),
-        Key::Named(NamedKey::Enter) => Some(rust_gbe::KeypadKey::Start),
-        _ => None,
-    }
-}
+// Legacy winit_to_keypad()
+// fn winit_to_keypad(key: winit::keyboard::Key<&str>) -> Option<rust_gbe::KeypadKey> {
+//     use winit::keyboard::{Key, NamedKey};
+//     match key {
+//         Key::Character("Z" | "z") => Some(rust_gbe::KeypadKey::A),
+//         Key::Character("X" | "x") => Some(rust_gbe::KeypadKey::B),
+//         Key::Named(NamedKey::ArrowUp) => Some(rust_gbe::KeypadKey::Up),
+//         Key::Named(NamedKey::ArrowDown) => Some(rust_gbe::KeypadKey::Down),
+//         Key::Named(NamedKey::ArrowLeft) => Some(rust_gbe::KeypadKey::Left),
+//         Key::Named(NamedKey::ArrowRight) => Some(rust_gbe::KeypadKey::Right),
+//         Key::Named(NamedKey::Space) => Some(rust_gbe::KeypadKey::Select),
+//         Key::Named(NamedKey::Enter) => Some(rust_gbe::KeypadKey::Start),
+//         _ => None,
+//     }
+// }
 
-fn recalculate_screen<
-    T: glium::glutin::surface::SurfaceTypeTrait + glium::glutin::surface::ResizeableSurface + 'static,
->(
-    display: &glium::Display<T>,
-    texture: &mut glium::texture::texture2d::Texture2d,
-    datavec: &[u8],
-    renderoptions: &RenderOptions,
-) {
-    let interpolation_type = if renderoptions.linear_interpolation {
-        glium::uniforms::MagnifySamplerFilter::Linear
-    } else {
-        glium::uniforms::MagnifySamplerFilter::Nearest
-    };
-
+fn upload_screen(texture: &mut glium::texture::texture2d::Texture2d, datavec: &[u8]) {
     let rawimage2d = glium::texture::RawImage2d {
         data: std::borrow::Cow::Borrowed(datavec),
         width: rust_gbe::SCREEN_W as u32,
@@ -219,29 +289,9 @@ fn recalculate_screen<
         format: glium::texture::ClientFormat::U8U8U8,
     };
     texture.write(
-        glium::Rect {
-            left: 0,
-            bottom: 0,
-            width: rust_gbe::SCREEN_W as u32,
-            height: rust_gbe::SCREEN_H as u32,
-        },
+        glium::Rect { left: 0, bottom: 0, width: rust_gbe::SCREEN_W as u32, height: rust_gbe::SCREEN_H as u32 },
         rawimage2d,
     );
-
-    // We use a custom BlitTarget to transform OpenGL coordinates to row-column coordinates
-    let target = display.draw();
-    let (target_w, target_h) = target.get_dimensions();
-    texture.as_surface().blit_whole_color_to(
-        &target,
-        &glium::BlitTarget {
-            left: 0,
-            bottom: target_h,
-            width: target_w as i32,
-            height: -(target_h as i32),
-        },
-        interpolation_type,
-    );
-    target.finish().unwrap();
 }
 
 fn warn(message: &str) {
@@ -256,3 +306,56 @@ fn set_window_size(window: &winit::window::Window, scale: u32) {
 }
 
 // (Audio backend & run loop moved to modules `audio` and `emulator`)
+
+// Dynamic mapping using current keybindings
+fn dynamic_winit_to_keypad(key: winit::keyboard::Key<&str>, bindings: &KeyBindings) -> Option<rust_gbe::KeypadKey> {
+    use winit::keyboard::{Key, NamedKey};
+    match key {
+        Key::Character(c) => {
+            let upc = c.to_uppercase();
+            if upc == bindings.a { Some(rust_gbe::KeypadKey::A) }
+            else if upc == bindings.b { Some(rust_gbe::KeypadKey::B) }
+            else if upc == bindings.start { Some(rust_gbe::KeypadKey::Start) }
+            else if upc == bindings.select { Some(rust_gbe::KeypadKey::Select) }
+            else if upc == bindings.up { Some(rust_gbe::KeypadKey::Up) }
+            else if upc == bindings.down { Some(rust_gbe::KeypadKey::Down) }
+            else if upc == bindings.left { Some(rust_gbe::KeypadKey::Left) }
+            else if upc == bindings.right { Some(rust_gbe::KeypadKey::Right) }
+            else { None }
+        }
+        Key::Named(named) => match named {
+            NamedKey::ArrowUp if bindings.up == "ArrowUp" => Some(rust_gbe::KeypadKey::Up),
+            NamedKey::ArrowDown if bindings.down == "ArrowDown" => Some(rust_gbe::KeypadKey::Down),
+            NamedKey::ArrowLeft if bindings.left == "ArrowLeft" => Some(rust_gbe::KeypadKey::Left),
+            NamedKey::ArrowRight if bindings.right == "ArrowRight" => Some(rust_gbe::KeypadKey::Right),
+            NamedKey::Space if bindings.select == "Space" => Some(rust_gbe::KeypadKey::Select),
+            NamedKey::Enter if bindings.start == "Enter" => Some(rust_gbe::KeypadKey::Start),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn key_to_string(key: &winit::keyboard::Key<&str>) -> String {
+    use winit::keyboard::{Key, NamedKey};
+    match key {
+        Key::Character(c) => c.to_uppercase(),
+        Key::Named(NamedKey::ArrowUp) => "ArrowUp".into(),
+        Key::Named(NamedKey::ArrowDown) => "ArrowDown".into(),
+        Key::Named(NamedKey::ArrowLeft) => "ArrowLeft".into(),
+        Key::Named(NamedKey::ArrowRight) => "ArrowRight".into(),
+        Key::Named(NamedKey::Enter) => "Enter".into(),
+        Key::Named(NamedKey::Space) => "Space".into(),
+        Key::Named(other) => format!("{other:?}"), // fallback to debug name
+        _ => "Unknown".into(),
+    }
+}
+
+fn matches_capturing(capturing: Option<rust_gbe::KeypadKey>, k: rust_gbe::KeypadKey) -> bool {
+    use rust_gbe::KeypadKey::*;
+    match (capturing, k) {
+        (Some(A), A)|(Some(B), B)|(Some(Start), Start)|(Some(Select), Select)|
+        (Some(Up), Up)|(Some(Down), Down)|(Some(Left), Left)|(Some(Right), Right) => true,
+        _ => false,
+    }
+}
