@@ -2183,7 +2183,6 @@ dependencies = [
  "egui",
  "egui_glium",
  "glium",
- "glutin-winit",
  "mimalloc",
  "rfd",
  "serde",

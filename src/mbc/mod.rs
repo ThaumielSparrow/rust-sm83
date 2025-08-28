@@ -51,7 +51,7 @@ pub trait MBC: Send {
 
 pub fn get_mbc(data: Vec<u8>, skip_checksum: bool) -> StrResult<Box<dyn MBC + 'static>> {
     if data.len() < 0x150 {
-        return Err("Rom size to small");
+        return Err("ROM size too small");
     }
     if !skip_checksum {
         check_checksum(&data)?;
@@ -81,7 +81,7 @@ impl FileBackedMBC {
         let mut mbc = get_mbc(data, skip_checksum)?;
 
         let rampath = rompath.with_extension("gbsave");
-        println!("DEBUG: FileBackedMBC will use save path: {}", rampath.display());
+        // println!("DEBUG: FileBackedMBC will use save path: {}", rampath.display());
 
         if mbc.is_battery_backed() {
             match fs::File::open(&rampath) {
@@ -90,13 +90,13 @@ impl FileBackedMBC {
                     match file.read_to_end(&mut ramdata) {
                         Err(..) => return Err("Error while reading existing save file"),
                         Ok(..) => {
-                            println!("DEBUG: Loaded existing save file with {} bytes", ramdata.len());
+                            // println!("DEBUG: Loaded existing save file with {} bytes", ramdata.len());
                             mbc.loadram(&ramdata)?;
                         }
                     }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
-                    println!("DEBUG: No existing save file found, starting fresh");
+                    // println!("DEBUG: No existing save file found, starting fresh");
                 }
                 Err(_) => return Err("Error loading existing save file"),
             }

@@ -4,6 +4,5 @@
 
 *.7z
 *groundtruth
-*.txt
 *.ppm
 *.log

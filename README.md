@@ -1,0 +1,45 @@
+# SM83 Gameboy Emulator
+
+Gameboy/Gameboy Color emulator. Core functionality from Mathijs "mvdnes" van de Nes (see LICENSE file).
+
+### Usage: 
+
+Build with `cargo b --release`.
+
+Run with `cargo r --release`, or run the executable in `target\release`. Select your ROM using the GUI.
+
+Supports saving in-game (battery-backed RAM) or with savestates.
+
+Build config uses `lld` for faster linking. Default toolchain linker can be used instead if `lld` is not installed by removing `"link-arg=-fuse-ld=lld"` from `.config/config.toml`.
+
+### Emulator Keybinds:
+
+Emulator keybinds are configurable and can be adjusted from the Options dropdown while emulator is running.
+
+`A`: `Z`
+
+`B`: `X`
+
+`Dpad`: `ArrowKeys`
+
+`Start`: `Space`
+
+`Select`: `Enter`
+
+### System Keybinds:
+
+These are reserved keybinds for system functionality and cannot be adjusted through config menu.
+
+`F1-F4`: Save state, slots 1-4
+
+`F5-F8`: Load state, slots 1-4
+
+`T`: Toggle turbo
+
+`RShift`: Hold turbo
+
+`Y`: Toggle interpolation
+
+`Esc`: Close menu/Close emulator
+
+Turbo speed is configurable via the config menu.
