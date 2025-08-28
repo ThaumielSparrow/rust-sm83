@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::thread;
 
 use cpal::Stream;
+use glium::Surface;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
@@ -98,6 +99,7 @@ impl RootApp {
             }
             self.scale = initial_scale;
             self.phase = RootPhase::Running { texture, sender, receiver: frame_receiver, renderoptions: RenderOptions::default(), running: true, keybindings: cfg.keybindings, capturing: None, _audio: audio_stream, show_keybindings_window: false, turbo_toggle: false, turbo_held: false, turbo_setting: cfg.turbo };
+            if let RootPhase::Running { sender, .. } = &self.phase { let _ = sender.send(GBEvent::UpdateTurbo(cfg.turbo)); }
             // Now that we've transitioned to Running, resize window to game resolution * scale.
             if let Some(win) = &self.window {
                 set_window_size(win, self.scale);
@@ -167,12 +169,14 @@ impl ApplicationHandler for RootApp {
                         });
                     });
                     // Paint after UI
-                    use glium::Surface; let mut target = display.draw(); target.clear_color(0.1,0.1,0.1,1.0); egui_glium.paint(display, &mut target); let _ = target.finish();
+                    let mut target = display.draw();
+                    target.clear_color(0.1,0.1,0.1,1.0);
+                    egui_glium.paint(display, &mut target); let _ = target.finish();
                 }
                 if let Some(f) = launch_filename { self.start_game(f); }
                 if quit_requested { self.exit_code = EXITCODE_CPULOADFAILS; event_loop.exit(); }
             }
-            (RootPhase::Running { sender, renderoptions, running, keybindings, capturing, show_keybindings_window, turbo_toggle, turbo_held, turbo_setting: _, .. }, WindowEvent::KeyboardInput { event: keyevent, .. }) => {
+            (RootPhase::Running { sender, renderoptions, running, keybindings, capturing, show_keybindings_window, turbo_toggle, turbo_held, turbo_setting, .. }, WindowEvent::KeyboardInput { event: keyevent, .. }) => {
                 let state = keyevent.state;
                 let logical = keyevent.logical_key.clone();
                 if let Some(kp) = *capturing {
@@ -191,7 +195,13 @@ impl ApplicationHandler for RootApp {
                             rust_gbe::KeypadKey::Right => keybindings.right = value.clone(),
                         }
                         *capturing = None;
-                        let cfg = Config { keybindings: keybindings.clone(), scale: self.scale, turbo: TurboSetting::Double }; cfg.save(&config_path()); // TODO: load actual turbo if needed
+                        // Persist current turbo setting along with keybindings
+                        let cfg = Config {
+                            keybindings: keybindings.clone(),
+                            scale: self.scale,
+                            turbo: *turbo_setting
+                        };
+                        cfg.save(&config_path());
                     }
                     return; // don't treat as game input
                 }
@@ -201,8 +211,16 @@ impl ApplicationHandler for RootApp {
                         SystemAction::SaveState(s)=>{ let _=sender.send(GBEvent::SaveState(s)); },
                         SystemAction::LoadState(s)=>{ let _=sender.send(GBEvent::LoadState(s)); },
                         SystemAction::TurboHold(press)=>{
-                            if press { if !*turbo_toggle && !*turbo_held { let _=sender.send(GBEvent::SpeedUp);} *turbo_held=true; }
-                            else { *turbo_held=false; if !*turbo_toggle { let _=sender.send(GBEvent::SpeedDown);} }
+                            if press {
+                                if !*turbo_toggle && !*turbo_held {
+                                    let _=sender.send(GBEvent::SpeedUp);
+                                } *turbo_held=true;
+                            } else { 
+                                *turbo_held=false;
+                                if !*turbo_toggle {
+                                    let _=sender.send(GBEvent::SpeedDown);
+                                }
+                            }
                         },
                         SystemAction::TurboToggle=>{ *turbo_toggle=! *turbo_toggle; if *turbo_toggle { if !*turbo_held { let _=sender.send(GBEvent::SpeedUp);} } else if !*turbo_held { let _=sender.send(GBEvent::SpeedDown);} },
                         SystemAction::ToggleInterpolation=>{ renderoptions.linear_interpolation = !renderoptions.linear_interpolation; },
@@ -215,9 +233,6 @@ impl ApplicationHandler for RootApp {
                         if *show_keybindings_window { *show_keybindings_window = false; }
                         else { *running = false; event_loop.exit(); }
                     },
-                    // Scale options no longer necessary because GUI allows user to set scale.
-                    // (Pressed, Key::Character("1")) => { if let Some(w) = &self.window { set_window_size(w, 1); } },
-                    // (Pressed, Key::Character("r"|"R")) => { if let Some(w) = &self.window { set_window_size(w, self.scale); } },
                     (Pressed, wkey) => { if let Some(k)=dynamic_winit_to_keypad(wkey, keybindings) { let _=sender.send(GBEvent::KeyDown(k)); } },
                     (Released, wkey) => { if let Some(k)=dynamic_winit_to_keypad(wkey, keybindings) { let _=sender.send(GBEvent::KeyUp(k)); } },
                 }
@@ -273,9 +288,15 @@ impl ApplicationHandler for RootApp {
                                     let conflict = is_reserved_key_name(&val);
                                     let label = if active { "(press key)".to_string() } else { val.clone() };
                                     let mut button = egui::Button::new(label);
-                                    if conflict { button = button.fill(egui::Color32::from_rgb(100,0,0)); }
-                                    if ui.add(button).clicked() { *capturing = Some(k); }
-                                    if conflict { ui.colored_label(egui::Color32::RED, "Conflicts with system keybind"); }
+                                    if conflict {
+                                        button = button.fill(egui::Color32::from_rgb(100,0,0));
+                                    }
+                                    if ui.add(button).clicked() {
+                                        *capturing = Some(k);
+                                    }
+                                    if conflict {
+                                        ui.colored_label(egui::Color32::RED, "Conflicts with system keybind");
+                                    }
                                 }); }
                                 if capturing.is_some() && ui.button("Cancel Capture").clicked() { *capturing=None; }
                             });
