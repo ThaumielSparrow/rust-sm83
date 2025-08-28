@@ -23,6 +23,7 @@ pub struct RenderOptions {
 use crate::emulator::{GBEvent, construct_cpu_auto, run_cpu};
 use crate::audio::init_audio;
 use crate::config::{Config, KeyBindings, config_path, binding_value, TurboSetting};
+use crate::input::is_reserved_key_name;
 
 // Unified state machine for ROM selection and emulator run to ensure a single EventLoop
 enum RootPhase {
@@ -198,6 +199,20 @@ impl ApplicationHandler for RootApp {
                     }
                     return; // don't treat as game input
                 }
+                if let Some(action) = crate::input::system_action_for(&logical.as_ref(), state) {
+                    use crate::input::SystemAction;
+                    match action {
+                        SystemAction::SaveState(s)=>{ let _=sender.send(GBEvent::SaveState(s)); },
+                        SystemAction::LoadState(s)=>{ let _=sender.send(GBEvent::LoadState(s)); },
+                        SystemAction::TurboHold(press)=>{
+                            if press { if !*turbo_toggle && !*turbo_held { let _=sender.send(GBEvent::SpeedUp);} *turbo_held=true; }
+                            else { *turbo_held=false; if !*turbo_toggle { let _=sender.send(GBEvent::SpeedDown);} }
+                        },
+                        SystemAction::TurboToggle=>{ *turbo_toggle=! *turbo_toggle; if *turbo_toggle { if !*turbo_held { let _=sender.send(GBEvent::SpeedUp);} } else if !*turbo_held { let _=sender.send(GBEvent::SpeedDown);} },
+                        SystemAction::ToggleInterpolation=>{ renderoptions.linear_interpolation = !renderoptions.linear_interpolation; },
+                    }
+                    return;
+                }
                 match (state, logical.as_ref()) {
                     // Escape: if keybindings window open, close it; else exit emulator
                     (Pressed, Key::Named(NamedKey::Escape)) => {
@@ -207,18 +222,6 @@ impl ApplicationHandler for RootApp {
                     // Scale options no longer necessary because GUI allows user to set scale.
                     // (Pressed, Key::Character("1")) => { if let Some(w) = &self.window { set_window_size(w, 1); } },
                     // (Pressed, Key::Character("r"|"R")) => { if let Some(w) = &self.window { set_window_size(w, self.scale); } },
-                    (Pressed, Key::Named(NamedKey::Shift)) => { if !*turbo_toggle && !*turbo_held { let _ = sender.send(GBEvent::SpeedUp); } *turbo_held = true; },
-                    (Released, Key::Named(NamedKey::Shift)) => { *turbo_held = false; if !*turbo_toggle { let _ = sender.send(GBEvent::SpeedDown); } },
-                    (Pressed, Key::Character("t"|"T")) => { *turbo_toggle = !*turbo_toggle; if *turbo_toggle { if !*turbo_held { let _=sender.send(GBEvent::SpeedUp);} } else if !*turbo_held { let _=sender.send(GBEvent::SpeedDown);} },
-                    (Pressed, Key::Character("y"|"Y")) => { renderoptions.linear_interpolation = !renderoptions.linear_interpolation; },
-                    (Pressed, Key::Named(NamedKey::F1)) => { let _ = sender.send(GBEvent::SaveState(1)); },
-                    (Pressed, Key::Named(NamedKey::F2)) => { let _ = sender.send(GBEvent::SaveState(2)); },
-                    (Pressed, Key::Named(NamedKey::F3)) => { let _ = sender.send(GBEvent::SaveState(3)); },
-                    (Pressed, Key::Named(NamedKey::F4)) => { let _ = sender.send(GBEvent::SaveState(4)); },
-                    (Pressed, Key::Named(NamedKey::F5)) => { let _ = sender.send(GBEvent::LoadState(1)); },
-                    (Pressed, Key::Named(NamedKey::F6)) => { let _ = sender.send(GBEvent::LoadState(2)); },
-                    (Pressed, Key::Named(NamedKey::F7)) => { let _ = sender.send(GBEvent::LoadState(3)); },
-                    (Pressed, Key::Named(NamedKey::F8)) => { let _ = sender.send(GBEvent::LoadState(4)); },
                     (Pressed, wkey) => { if let Some(k)=dynamic_winit_to_keypad(wkey, keybindings) { let _=sender.send(GBEvent::KeyDown(k)); } },
                     (Released, wkey) => { if let Some(k)=dynamic_winit_to_keypad(wkey, keybindings) { let _=sender.send(GBEvent::KeyUp(k)); } },
                 }
@@ -267,7 +270,7 @@ impl ApplicationHandler for RootApp {
                                     ui.label(match k { rust_gbe::KeypadKey::A=>"A", rust_gbe::KeypadKey::B=>"B", rust_gbe::KeypadKey::Start=>"Start", rust_gbe::KeypadKey::Select=>"Select", rust_gbe::KeypadKey::Up=>"Up", rust_gbe::KeypadKey::Down=>"Down", rust_gbe::KeypadKey::Left=>"Left", rust_gbe::KeypadKey::Right=>"Right" });
                                     let active = matches_capturing(*capturing, k);
                                     let val = binding_value(keybindings, k);
-                                    let conflict = is_reserved_key(&val);
+                                    let conflict = is_reserved_key_name(&val);
                                     let label = if active { "(press key)".to_string() } else { val.clone() };
                                     let mut button = egui::Button::new(label);
                                     if conflict { button = button.fill(egui::Color32::from_rgb(100,0,0)); }
@@ -390,11 +393,7 @@ fn key_to_string(key: &winit::keyboard::Key<&str>) -> String {
     }
 }
 
-fn is_reserved_key(val: &str) -> bool {
-    matches!(val,
-        "F1"|"F2"|"F3"|"F4"|"F5"|"F6"|"F7"|"F8"|
-        "Shift"|"SHIFT"|"T"|"t"|"Y"|"y")
-}
+// Conflict detection now centralized in input.rs (is_reserved_key_name)
 
 fn matches_capturing(capturing: Option<rust_gbe::KeypadKey>, k: rust_gbe::KeypadKey) -> bool {
     use rust_gbe::KeypadKey::*;

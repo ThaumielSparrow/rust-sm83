@@ -7,6 +7,7 @@ mod gui;
 mod audio;
 mod emulator;
 mod config;
+mod input;
 
 use gui::{RootApp, EXITCODE_CPULOADFAILS, EXITCODE_SUCCESS};
 
