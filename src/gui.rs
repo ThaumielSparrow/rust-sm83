@@ -22,7 +22,7 @@ pub struct RenderOptions {
 
 use crate::emulator::{GBEvent, construct_cpu_auto, run_cpu};
 use crate::audio::init_audio;
-use crate::config::{Config, KeyBindings, config_path, binding_value};
+use crate::config::{Config, KeyBindings, config_path, binding_value, TurboSetting};
 
 // Unified state machine for ROM selection and emulator run to ensure a single EventLoop
 enum RootPhase {
@@ -36,7 +36,10 @@ enum RootPhase {
         keybindings: KeyBindings,
         capturing: Option<rust_gbe::KeypadKey>,
         _audio: Option<Stream>,
-    show_keybindings_window: bool,
+        show_keybindings_window: bool,
+        turbo_toggle: bool,
+        turbo_held: bool,
+        turbo_setting: TurboSetting,
     },
 }
 
@@ -56,8 +59,8 @@ impl RootApp {
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_string_lossy().to_string()))
             .unwrap_or_else(|| ".".to_string());
-    let _cfg = Config::load(&config_path());
-    RootApp {
+        let _cfg = Config::load(&config_path());
+        RootApp {
             window: None,
             display: None,
             egui_glium: None,
@@ -69,11 +72,15 @@ impl RootApp {
 
     fn start_game(&mut self, filename: String) {
         // Always run in (CGB-capable) mode; attempt CGB first, fallback to classic if needed.
-    let cpu = construct_cpu_auto(&filename);
+        let cpu = construct_cpu_auto(&filename);
         let mut cpu = match cpu { Some(c) => c, None => { self.exit_code = EXITCODE_CPULOADFAILS; return; } };
         // Enable audio by default; if device fails, continue silently.
-    let mut audio_stream = None;
-    if let Some((player, s)) = init_audio() { cpu.enable_audio(player, true); audio_stream = Some(s);} else { warn("Audio disabled: no output device available"); }
+        let mut audio_stream = None;
+        if let Some((player, s)) = init_audio() {
+            cpu.enable_audio(player, true); audio_stream = Some(s);
+        } else { 
+            warn("Audio disabled: no output device available");
+        }
         let _ = cpu.romname();
         let (sender, recv_events) = mpsc::channel();
         let (frame_sender, frame_receiver) = mpsc::sync_channel(1);
@@ -89,11 +96,15 @@ impl RootApp {
             ).unwrap();
             let cfg = Config::load(&config_path());
             let initial_scale = cfg.scale;
-            if let Some(win) = &self.window { set_window_size(win, initial_scale); }
+            if let Some(win) = &self.window {
+                set_window_size(win, initial_scale);
+            }
             self.scale = initial_scale;
-            self.phase = RootPhase::Running { texture, sender, receiver: frame_receiver, renderoptions: RenderOptions::default(), running: true, keybindings: cfg.keybindings, capturing: None, _audio: audio_stream, show_keybindings_window: false };
+            self.phase = RootPhase::Running { texture, sender, receiver: frame_receiver, renderoptions: RenderOptions::default(), running: true, keybindings: cfg.keybindings, capturing: None, _audio: audio_stream, show_keybindings_window: false, turbo_toggle: false, turbo_held: false, turbo_setting: cfg.turbo };
             // Now that we've transitioned to Running, resize window to game resolution * scale.
-            if let Some(win) = &self.window { set_window_size(win, self.scale); }
+            if let Some(win) = &self.window {
+                set_window_size(win, self.scale);
+            }
         } else {
             self.exit_code = EXITCODE_CPULOADFAILS;
         }
@@ -111,7 +122,9 @@ impl ApplicationHandler for RootApp {
             self.egui_glium = Some(egui_glium);
             self.display = Some(display);
             self.window = Some(Arc::new(window));
-            if let Some(w) = &self.window { w.request_redraw(); }
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
         }
     }
 
@@ -119,8 +132,16 @@ impl ApplicationHandler for RootApp {
         use winit::event::ElementState::{Pressed, Released};
         use winit::keyboard::{Key, NamedKey};
 
-    // Pass events to egui in all phases (menus in Running phase)
-    if let Some(egui_glium) = &mut self.egui_glium { let resp = egui_glium.on_event(self.window.as_ref().unwrap(), &event); if resp.repaint { if let Some(w) = &self.window { w.request_redraw(); } } if resp.consumed { return; } }
+        // Pass events to egui in all phases (menus in Running phase)
+        if let Some(egui_glium) = &mut self.egui_glium {
+            let resp = egui_glium.on_event(self.window.as_ref().unwrap(), &event);
+            if resp.repaint {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            if resp.consumed { return; }
+        }
 
         match (&mut self.phase, event) {
             (_, WindowEvent::CloseRequested) => { event_loop.exit(); },
@@ -154,7 +175,7 @@ impl ApplicationHandler for RootApp {
                 if let Some(f) = launch_filename { self.start_game(f); }
                 if quit_requested { self.exit_code = EXITCODE_CPULOADFAILS; event_loop.exit(); }
             }
-            (RootPhase::Running { sender, renderoptions, running, keybindings, capturing, show_keybindings_window, .. }, WindowEvent::KeyboardInput { event: keyevent, .. }) => {
+            (RootPhase::Running { sender, renderoptions, running, keybindings, capturing, show_keybindings_window, turbo_toggle, turbo_held, turbo_setting, .. }, WindowEvent::KeyboardInput { event: keyevent, .. }) => {
                 let state = keyevent.state;
                 let logical = keyevent.logical_key.clone();
                 if let Some(kp) = *capturing {
@@ -173,7 +194,7 @@ impl ApplicationHandler for RootApp {
                             rust_gbe::KeypadKey::Right => keybindings.right = value.clone(),
                         }
                         *capturing = None;
-                        let cfg = Config { keybindings: keybindings.clone(), scale: self.scale }; cfg.save(&config_path());
+                        let cfg = Config { keybindings: keybindings.clone(), scale: self.scale, turbo: TurboSetting::Double }; cfg.save(&config_path()); // TODO: load actual turbo if needed
                     }
                     return; // don't treat as game input
                 }
@@ -183,11 +204,13 @@ impl ApplicationHandler for RootApp {
                         if *show_keybindings_window { *show_keybindings_window = false; }
                         else { *running = false; event_loop.exit(); }
                     },
-                    (Pressed, Key::Character("1")) => { if let Some(w) = &self.window { set_window_size(w, 1); } },
-                    (Pressed, Key::Character("r"|"R")) => { if let Some(w) = &self.window { set_window_size(w, self.scale); } },
-                    (Pressed, Key::Named(NamedKey::Shift)) => { let _ = sender.send(GBEvent::SpeedUp); },
-                    (Released, Key::Named(NamedKey::Shift)) => { let _ = sender.send(GBEvent::SpeedDown); },
-                    (Pressed, Key::Character("t"|"T")) => { renderoptions.linear_interpolation = !renderoptions.linear_interpolation; },
+                    // Scale options no longer necessary because GUI allows user to set scale.
+                    // (Pressed, Key::Character("1")) => { if let Some(w) = &self.window { set_window_size(w, 1); } },
+                    // (Pressed, Key::Character("r"|"R")) => { if let Some(w) = &self.window { set_window_size(w, self.scale); } },
+                    (Pressed, Key::Named(NamedKey::Shift)) => { if !*turbo_toggle && !*turbo_held { let _ = sender.send(GBEvent::SpeedUp); } *turbo_held = true; },
+                    (Released, Key::Named(NamedKey::Shift)) => { *turbo_held = false; if !*turbo_toggle { let _ = sender.send(GBEvent::SpeedDown); } },
+                    (Pressed, Key::Character("t"|"T")) => { *turbo_toggle = !*turbo_toggle; if *turbo_toggle { if !*turbo_held { let _=sender.send(GBEvent::SpeedUp);} } else if !*turbo_held { let _=sender.send(GBEvent::SpeedDown);} },
+                    (Pressed, Key::Character("y"|"Y")) => { renderoptions.linear_interpolation = !renderoptions.linear_interpolation; },
                     (Pressed, Key::Named(NamedKey::F1)) => { let _ = sender.send(GBEvent::SaveState(1)); },
                     (Pressed, Key::Named(NamedKey::F2)) => { let _ = sender.send(GBEvent::SaveState(2)); },
                     (Pressed, Key::Named(NamedKey::F3)) => { let _ = sender.send(GBEvent::SaveState(3)); },
@@ -200,7 +223,7 @@ impl ApplicationHandler for RootApp {
                     (Released, wkey) => { if let Some(k)=dynamic_winit_to_keypad(wkey, keybindings) { let _=sender.send(GBEvent::KeyUp(k)); } },
                 }
             }
-            (RootPhase::Running { sender, texture, receiver, renderoptions, running, keybindings, capturing, show_keybindings_window, .. }, WindowEvent::RedrawRequested) => {
+            (RootPhase::Running { sender, texture, receiver, renderoptions, running, keybindings, capturing, show_keybindings_window, turbo_toggle, turbo_setting, .. }, WindowEvent::RedrawRequested) => {
                 if !*running { return; }
                 if let (Some(display), Some(window), Some(egui_glium)) = (&self.display, &self.window, &mut self.egui_glium) {
                     egui_glium.run(window, |ctx| {
@@ -218,22 +241,38 @@ impl ApplicationHandler for RootApp {
                                 });
                                 ui.menu_button("Options", |ui| {
                                     ui.menu_button("Scale", |ui| {
-                                        for s in 1..=4 { let selected = self.scale == s; if ui.radio(selected, format!("{}x", s)).clicked() { self.scale = s; set_window_size(window, s); let cfg = Config { keybindings: keybindings.clone(), scale: self.scale }; cfg.save(&config_path()); } }
+                                        for s in 1..=4 { let selected = self.scale == s; if ui.radio(selected, format!("{}x", s)).clicked() { self.scale = s; set_window_size(window, s); let cfg = Config { keybindings: keybindings.clone(), scale: self.scale, turbo: *turbo_setting }; cfg.save(&config_path()); } }
                                     });
+                                    ui.menu_button("Turbo Speed", |ui| {
+                                        for ts in TurboSetting::all() {
+                                            let selected = *turbo_setting == *ts;
+                                            if ui.radio(selected, ts.label()).clicked() {
+                                                *turbo_setting = *ts;
+                                                let cfg = Config { keybindings: keybindings.clone(), scale: self.scale, turbo: *turbo_setting }; cfg.save(&config_path());
+                                                let _ = sender.send(GBEvent::UpdateTurbo(*ts));
+                                            }
+                                        }
+                                    });
+                                    ui.checkbox(turbo_toggle, "Turbo Enabled (T)");
                                     if ui.button("Keybindings...").clicked() { *show_keybindings_window = true; }
                                 });
                             });
                         });
                         if *show_keybindings_window {
                             egui::Window::new("Keybindings").open(show_keybindings_window).show(ctx, |ui| {
-                                ui.label("Click a binding, then press a key (Esc to cancel capture by closing window).");
+                                ui.label("Click a binding, then press a key (Esc to cancel capture). Reserved keys can't be used.");
                                 let keys = [rust_gbe::KeypadKey::A, rust_gbe::KeypadKey::B, rust_gbe::KeypadKey::Start, rust_gbe::KeypadKey::Select,
                                     rust_gbe::KeypadKey::Up, rust_gbe::KeypadKey::Down, rust_gbe::KeypadKey::Left, rust_gbe::KeypadKey::Right];
                                 for k in keys { ui.horizontal(|ui| {
                                     ui.label(match k { rust_gbe::KeypadKey::A=>"A", rust_gbe::KeypadKey::B=>"B", rust_gbe::KeypadKey::Start=>"Start", rust_gbe::KeypadKey::Select=>"Select", rust_gbe::KeypadKey::Up=>"Up", rust_gbe::KeypadKey::Down=>"Down", rust_gbe::KeypadKey::Left=>"Left", rust_gbe::KeypadKey::Right=>"Right" });
                                     let active = matches_capturing(*capturing, k);
-                                    let label = if active { "(press key)".to_string() } else { binding_value(keybindings, k) };
-                                    if ui.button(label).clicked() { *capturing = Some(k); }
+                                    let val = binding_value(keybindings, k);
+                                    let conflict = is_reserved_key(&val);
+                                    let label = if active { "(press key)".to_string() } else { val.clone() };
+                                    let mut button = egui::Button::new(label);
+                                    if conflict { button = button.fill(egui::Color32::from_rgb(100,0,0)); }
+                                    if ui.add(button).clicked() { *capturing = Some(k); }
+                                    if conflict { ui.colored_label(egui::Color32::RED, "Conflicts with system keybind"); }
                                 }); }
                                 if capturing.is_some() && ui.button("Cancel Capture").clicked() { *capturing=None; }
                             });
@@ -349,6 +388,12 @@ fn key_to_string(key: &winit::keyboard::Key<&str>) -> String {
         Key::Named(other) => format!("{other:?}"), // fallback to debug name
         _ => "Unknown".into(),
     }
+}
+
+fn is_reserved_key(val: &str) -> bool {
+    matches!(val,
+        "F1"|"F2"|"F3"|"F4"|"F5"|"F6"|"F7"|"F8"|
+        "Shift"|"SHIFT"|"T"|"t"|"Y"|"y")
 }
 
 fn matches_capturing(capturing: Option<rust_gbe::KeypadKey>, k: rust_gbe::KeypadKey) -> bool {

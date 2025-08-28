@@ -2,6 +2,26 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum TurboSetting { Quarter, Half, Double, Triple, Quadruple, Octuple, Hexadecuple, Uncapped }
+
+impl Default for TurboSetting { fn default() -> Self { TurboSetting::Double } }
+
+impl TurboSetting {
+    pub fn all() -> &'static [TurboSetting] { &[
+        TurboSetting::Quarter,
+        TurboSetting::Half,
+        TurboSetting::Double,
+        TurboSetting::Triple,
+        TurboSetting::Quadruple,
+        TurboSetting::Octuple,
+        TurboSetting::Hexadecuple,
+        TurboSetting::Uncapped,
+    ] }
+    pub fn label(&self) -> &'static str { match self { TurboSetting::Quarter=>"0.25x", TurboSetting::Half=>"0.5x", TurboSetting::Double=>"2x", TurboSetting::Triple=>"3x", TurboSetting::Quadruple=>"4x", TurboSetting::Octuple=>"8x", TurboSetting::Hexadecuple=>"16x", TurboSetting::Uncapped=>"Uncapped" } }
+    pub fn multiplier(&self) -> Option<f32> { match self { TurboSetting::Quarter=>Some(0.25), TurboSetting::Half=>Some(0.5), TurboSetting::Double=>Some(2.0), TurboSetting::Triple=>Some(3.0), TurboSetting::Quadruple=>Some(4.0), TurboSetting::Octuple=>Some(8.0), TurboSetting::Hexadecuple=>Some(16.0), TurboSetting::Uncapped=>None } }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct KeyBindings {
     pub a: String,
@@ -21,9 +41,9 @@ impl Default for KeyBindings {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct Config { pub keybindings: KeyBindings, pub scale: u32 }
+pub struct Config { pub keybindings: KeyBindings, pub scale: u32, #[serde(default)] pub turbo: TurboSetting }
 
-impl Default for Config { fn default() -> Self { Self { keybindings: KeyBindings::default(), scale: 3 } } }
+impl Default for Config { fn default() -> Self { Self { keybindings: KeyBindings::default(), scale: 3, turbo: TurboSetting::default() } } }
 
 impl Config {
     pub fn load(path: &PathBuf) -> Self {

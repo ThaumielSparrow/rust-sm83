@@ -13,6 +13,7 @@ pub enum GBEvent {
     SpeedDown,
     SaveState(u8),
     LoadState(u8),
+    UpdateTurbo(crate::config::TurboSetting),
 }
 
 pub fn construct_cpu_auto(filename: &str) -> Option<Box<Device>> {
@@ -31,23 +32,27 @@ pub fn construct_cpu_auto(filename: &str) -> Option<Box<Device>> {
 
 pub fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Receiver<GBEvent>) {
     let periodic = timer_periodic(16);
-    let mut limit_speed = true;
+    let mut limit_speed = true; // true = normal 1x pacing with 16ms frame sleep
+    let mut turbo_setting = crate::config::TurboSetting::Double; // default
 
-    let waitticks = (4_194_304f64 / 1000.0 * 16.0).round() as u32; // ~16ms frame chunk
+    let base_waitticks = (4_194_304f64 / 1000.0 * 16.0).round() as u32; // ~16ms frame chunk
     let mut ticks = 0;
     let mut frame_count = 0;
     let mut last_ram_save_frame = 0;
     let mut ram_needs_save = false;
 
     'outer: loop {
-        while ticks < waitticks {
+        // Always execute at least one frame worth of cycles.
+        let frame_target = base_waitticks;
+        while ticks < frame_target {
             ticks += cpu.do_cycle();
             if cpu.check_and_reset_gpu_updated() {
                 let data = cpu.get_gpu_data().to_vec();
                 if let Err(TrySendError::Disconnected(..)) = sender.try_send(data) { break 'outer; }
             }
         }
-        ticks -= waitticks; frame_count += 1;
+        ticks -= frame_target;
+        frame_count += 1;
 
         if cpu.check_and_reset_ram_updated() {
             if cpu.save_battery_ram_silent().is_ok() {}
@@ -61,8 +66,33 @@ pub fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Rece
             GBEvent::KeyUp(k)=>cpu.keyup(k), GBEvent::KeyDown(k)=>cpu.keydown(k), GBEvent::SpeedUp=>limit_speed=false,
             GBEvent::SpeedDown=>{limit_speed=true; cpu.sync_audio();}, GBEvent::SaveState(s)=>{println!("Attempting to save state to slot {}...",s); if let Err(e)=cpu.save_state_slot(s){eprintln!("Failed to save state to slot {}: {}",s,e);} },
             GBEvent::LoadState(s)=>{println!("Attempting to load state from slot {}...",s); if let Err(e)=cpu.load_state_slot(s){eprintln!("Failed to load state from slot {}: {}",s,e);} },
+            GBEvent::UpdateTurbo(ts)=>{ turbo_setting = ts; },
         }, Err(TryRecvError::Empty)=>break 'recv, Err(TryRecvError::Disconnected)=>break 'outer } }
-        if limit_speed { let _ = periodic.recv(); }
+
+        if limit_speed {
+            // Normal pacing: fixed 16ms sleep
+            let _ = periodic.recv();
+        } else {
+            // Turbo active. Adjust pacing based on selected multiplier.
+            match turbo_setting.multiplier() {
+                Some(m) if m < 1.0 => {
+                    // Slow motion: sleep extra proportionally.
+                    // For m=0.5 we want half speed => double frame time (extra 16ms)
+                    let extra_factor = (1.0 / m) - 1.0; // e.g. m=0.5 -> 1.0
+                    let extra_ms = (16.0 * extra_factor).round() as u64;
+                    if extra_ms > 0 { std::thread::sleep(std::time::Duration::from_millis(extra_ms)); }
+                }
+                Some(m) if m >= 1.0 => {
+                    // Faster: process additional frames back-to-back, but yield periodically.
+                    if frame_count % 240 == 0 { std::thread::yield_now(); }
+                }
+                None => {
+                    // Uncapped: tight loop but yield sometimes to avoid starving system.
+                    if frame_count % 120 == 0 { std::thread::yield_now(); }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
