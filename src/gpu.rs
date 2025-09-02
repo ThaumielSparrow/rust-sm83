@@ -55,7 +55,11 @@ pub struct GPU {
     csprit_ind: u8,
     csprit: [[[u8; 3]; 4]; 8],
     vrambank: usize,
-    pub data: Vec<u8>,
+    // Two reusable frame buffers (RGB bytes). We render into the back buffer and
+    // swap at start of VBlank, flagging 'updated'. This allows the front buffer
+    // to be read concurrently (e.g., by UI) without copying mid-frame.
+    frame_buffers: [Vec<u8>; 2],
+    front: usize, // index of front buffer (0 or 1)
     #[serde(with = "serde_arrays")]
     bgprio: [PrioType; SCREEN_W],
     pub updated: bool,
@@ -98,7 +102,8 @@ impl GPU {
             pal1: [0; 4],
             vram: [0; VRAM_SIZE],
             voam: [0; VOAM_SIZE],
-            data: vec![0; SCREEN_W * SCREEN_H * 3],
+            frame_buffers: [vec![0; SCREEN_W * SCREEN_H * 3], vec![0; SCREEN_W * SCREEN_H * 3]],
+            front: 0,
             bgprio: [PrioType::Normal; SCREEN_W],
             updated: false,
             interrupt: 0,
@@ -184,6 +189,8 @@ impl GPU {
                 // Vertical blank
                 self.wy_trigger = false;
                 self.interrupt |= 0x01;
+                // Frame complete: swap front/back so consumers see a stable frame.
+                self.front ^= 1;
                 self.updated = true;
                 self.first_frame = false;
                 self.m1_inte
@@ -381,7 +388,8 @@ impl GPU {
     }
 
     fn clear_screen(&mut self) {
-        for v in self.data.iter_mut() {
+    let buf = &mut self.frame_buffers[self.front ^ 1];
+    for v in buf.iter_mut() {
             *v = 255;
         }
         self.updated = true;
@@ -419,24 +427,27 @@ impl GPU {
     }
 
     fn setcolor(&mut self, x: usize, color: u8) {
-        self.data[self.line as usize * SCREEN_W * 3 + x * 3 + 0] = color;
-        self.data[self.line as usize * SCREEN_W * 3 + x * 3 + 1] = color;
-        self.data[self.line as usize * SCREEN_W * 3 + x * 3 + 2] = color;
+        let buf = &mut self.frame_buffers[self.front ^ 1];
+        let base = self.line as usize * SCREEN_W * 3 + x * 3;
+        buf[base] = color;
+        buf[base + 1] = color;
+        buf[base + 2] = color;
     }
 
     fn setrgb(&mut self, x: usize, r: u8, g: u8, b: u8) {
         // Gameboy Color RGB correction
         // Taken from the Gambatte emulator
         // assume r, g and b are between 0 and 1F
-        let baseidx = self.line as usize * SCREEN_W * 3 + x * 3;
+    let buf = &mut self.frame_buffers[self.front ^ 1];
+    let baseidx = self.line as usize * SCREEN_W * 3 + x * 3;
 
         let r = r as u32;
         let g = g as u32;
         let b = b as u32;
 
-        self.data[baseidx + 0] = ((r * 13 + g * 2 + b) >> 1) as u8;
-        self.data[baseidx + 1] = ((g * 3 + b) << 1) as u8;
-        self.data[baseidx + 2] = ((r * 3 + g * 2 + b * 11) >> 1) as u8;
+    buf[baseidx + 0] = ((r * 13 + g * 2 + b) >> 1) as u8;
+    buf[baseidx + 1] = ((g * 3 + b) << 1) as u8;
+    buf[baseidx + 2] = ((r * 3 + g * 2 + b * 11) >> 1) as u8;
     }
 
     fn draw_bg(&mut self) {
@@ -641,6 +652,11 @@ impl GPU {
     pub fn may_hdma(&self) -> bool {
         return self.hblanking;
     }
+}
+
+impl GPU {
+    /// Returns the current front (display) frame buffer.
+    pub fn front_buffer(&self) -> &[u8] { &self.frame_buffers[self.front] }
 }
 
 // Functions to determine the order of sprites. Input is a tuple x-coord, OAM position

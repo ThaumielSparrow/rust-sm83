@@ -30,8 +30,6 @@ impl Drop for Device {
     }
 }
 
-// StdoutPrinter & SerialCallback removed.
-
 impl Device {
     pub fn load_state(path: &str) -> Option<Box<Device>> {
         let mut file = std::fs::File::open(path).ok()?;
@@ -100,8 +98,6 @@ impl Device {
         self.cpu.do_cycle()
     }
 
-    // set_stdout / attach_printer / set_serial_callback removed.
-
     pub fn check_and_reset_gpu_updated(&mut self) -> bool {
         let result = self.cpu.mmu.gpu.updated;
         self.cpu.mmu.gpu.updated = false;
@@ -109,7 +105,7 @@ impl Device {
     }
 
     pub fn get_gpu_data(&self) -> &[u8] {
-        &self.cpu.mmu.gpu.data
+    self.cpu.mmu.gpu.front_buffer()
     }
 
     pub fn enable_audio(&mut self, player: Box<dyn apu::AudioPlayer>, is_on: bool) {

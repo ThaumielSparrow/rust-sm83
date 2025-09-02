@@ -1,5 +1,6 @@
 //! High-level emulator orchestration: device construction, run loop & events.
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rust_gbe::device::Device;
@@ -31,7 +32,9 @@ pub fn construct_cpu_auto(filename: &str) -> Option<Box<Device>> {
     }
 }
 
-pub fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Receiver<GBEvent>) {
+// Runs the emulation core loop. Sends video frames through a bounded channel.
+// Replaces per-frame Vec allocations with a small pool of Arc<Vec<u8>> buffers.
+pub fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Arc<Vec<u8>>>, receiver: Receiver<GBEvent>) {
     // limit_speed: when true we pace at 1x (approx 60 FPS / 16ms per frame)
     // when false we apply turbo/slowmo pacing based on turbo_setting
     let mut limit_speed = true;
@@ -45,14 +48,32 @@ pub fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Rece
     let mut last_ram_save_frame = 0;
     let mut ram_needs_save = false;
 
+    // Two reusable frame buffers; we only write to a buffer if it is uniquely held (strong_count==1).
+    let frame_len = cpu.get_gpu_data().len();
+    let mut frame_buffers = [Arc::new(vec![0u8; frame_len]), Arc::new(vec![0u8; frame_len])];
+    let mut next_fb = 0usize;
+
     'outer: loop {
         // Always execute at least one frame worth of cycles.
         let frame_target = base_waitticks;
         while ticks < frame_target {
             ticks += cpu.do_cycle();
             if cpu.check_and_reset_gpu_updated() {
-                let data = cpu.get_gpu_data().to_vec();
-                if let Err(TrySendError::Disconnected(..)) = sender.try_send(data) { break 'outer; }
+                // Try to find a free (uniquely owned) buffer to copy into.
+                for attempt in 0..frame_buffers.len() {
+                    let idx = (next_fb + attempt) % frame_buffers.len();
+                    if let Some(buf_mut) = Arc::get_mut(&mut frame_buffers[idx]) {
+                        // Safe to mutate this buffer: no other references.
+                        let src = cpu.get_gpu_data();
+                        buf_mut.copy_from_slice(src);
+                        match sender.try_send(frame_buffers[idx].clone()) {
+                            Ok(_) => { next_fb = (idx + 1) % frame_buffers.len(); }
+                            Err(TrySendError::Disconnected(..)) => { break 'outer; }
+                            Err(TrySendError::Full(_)) => { /* Drop frame if receiver busy */ }
+                        }
+                        break;
+                    }
+                }
             }
         }
         ticks -= frame_target;

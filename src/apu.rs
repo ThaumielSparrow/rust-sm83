@@ -674,6 +674,10 @@ pub struct Sound {
     need_sync: bool,
     dmg_mode: bool,
     player: Box<dyn AudioPlayer>,
+    // Reusable mixing scratch buffers to avoid per-call large stack allocations.
+    mix_left: Vec<f32>,
+    mix_right: Vec<f32>,
+    mix_temp: Vec<i16>,
 }
 
 impl Sound {
@@ -716,6 +720,9 @@ impl Sound {
             need_sync: false,
             dmg_mode: dmg_mode,
             player: player,
+            mix_left: vec![0.0; OUTPUT_SAMPLE_COUNT + 10],
+            mix_right: vec![0.0; OUTPUT_SAMPLE_COUNT + 10],
+            mix_temp: vec![0i16; OUTPUT_SAMPLE_COUNT + 10],
         }
     }
 
@@ -876,9 +883,13 @@ impl Sound {
         let right_vol = (self.volume_right as f32 / 7.0) * (1.0 / 15.0) * 0.25;
 
         while outputted < sample_count {
-            let buf_left = &mut [0f32; OUTPUT_SAMPLE_COUNT + 10];
-            let buf_right = &mut [0f32; OUTPUT_SAMPLE_COUNT + 10];
-            let buf = &mut [0i16; OUTPUT_SAMPLE_COUNT + 10];
+            // Reset only the range we'll fill this iteration.
+            self.mix_left.fill(0.0);
+            self.mix_right.fill(0.0);
+            // temp buffer reused
+            let buf_left = &mut self.mix_left;
+            let buf_right = &mut self.mix_right;
+            let buf = &mut self.mix_temp;
 
             let count1 = self.channel1.blip.read_samples(buf, false);
             for (i, v) in buf[..count1].iter().enumerate() {
