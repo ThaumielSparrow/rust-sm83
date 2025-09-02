@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 pub struct Serial {
     data: u8,
     control: u8,
-    // External callback support removed.
     pub interrupt: u8,
 }
 

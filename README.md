@@ -1,6 +1,6 @@
 # SM83 Gameboy Emulator
 
-Gameboy/Gameboy Color emulator. Core functionality from Mathijs "mvdnes" van de Nes (see LICENSE file).
+Gameboy/Gameboy Color emulator. Core functionality based on implementation from Mathijs "mvdnes" van de Nes (see LICENSE file).
 
 ### Usage: 
 
