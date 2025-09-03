@@ -141,7 +141,7 @@ impl CPU {
 
     fn popstack(&mut self) -> u16 {
         let res = self.mmu.rw(self.reg.sp);
-        self.reg.sp += 2;
+        self.reg.sp = self.reg.sp.wrapping_add(2);
         res
     }
 
@@ -371,7 +371,9 @@ fn op_ld_r_r(cpu: &mut CPU, op: u8) -> u32 {
     match dest { 0 => cpu.reg.b = val, 1 => cpu.reg.c = val, 2 => cpu.reg.d = val, 3 => cpu.reg.e = val, 4 => cpu.reg.h = val, 5 => cpu.reg.l = val, 6 => { // LD (HL),r
             cpu.mmu.wb(hl, val);
         }, 7 => cpu.reg.a = val, _ => unreachable!() };
-    if dest == 6 { 2 } else { 1 }
+    // Timing: any access involving (HL) is 2 cycles (8 T). Original code only checked dest==6 (LD (HL),r)
+    // but LD r,(HL) also requires 2 cycles. Fix: check either src or dest is (HL).
+    if dest == 6 || src == 6 { 2 } else { 1 }
 }
 
 // LD r,d8 already handled for specific opcodes; add LD (HL),d8 (0x36)
@@ -459,16 +461,13 @@ fn op_add_hl_rr(cpu: &mut CPU, op: u8) -> u32 {
 // PUSH rr (0xC5,0xD5,0xE5,0xF5) note af on 0xF5
 fn op_push_rr(cpu: &mut CPU, op: u8) -> u32 {
     let v = match op { 0xC5 => cpu.reg.bc(), 0xD5 => cpu.reg.de(), 0xE5 => cpu.reg.hl(), 0xF5 => cpu.reg.af(), _ => unreachable!() };
-    cpu.reg.sp = cpu.reg.sp.wrapping_sub(1); cpu.mmu.wb(cpu.reg.sp, (v >> 8) as u8);
-    cpu.reg.sp = cpu.reg.sp.wrapping_sub(1); cpu.mmu.wb(cpu.reg.sp, v as u8);
+    cpu.pushstack(v);
     4
 }
 
 // POP rr (0xC1,0xD1,0xE1,0xF1) note af on 0xF1 with lower nibble of F always zeroed by legacy code (flags bits)
 fn op_pop_rr(cpu: &mut CPU, op: u8) -> u32 {
-    let lo = cpu.mmu.rb(cpu.reg.sp); cpu.reg.sp = cpu.reg.sp.wrapping_add(1);
-    let hi = cpu.mmu.rb(cpu.reg.sp); cpu.reg.sp = cpu.reg.sp.wrapping_add(1);
-    let v = ((hi as u16) << 8) | (lo as u16);
+    let v = cpu.popstack();
     match op { 0xC1 => cpu.reg.setbc(v), 0xD1 => cpu.reg.setde(v), 0xE1 => cpu.reg.sethl(v), 0xF1 => { cpu.reg.setaf(v & 0xFFF0); }, _ => unreachable!() }
     3
 }
@@ -514,17 +513,17 @@ fn op_jp(cpu: &mut CPU, op: u8) -> u32 {
 fn op_call(cpu: &mut CPU, op: u8) -> u32 {
     let addr = cpu.fetchword();
     let cond = match op { 0xCD => true, 0xC4 => !cpu.reg.getflag(Z), 0xCC => cpu.reg.getflag(Z), 0xD4 => !cpu.reg.getflag(C), 0xDC => cpu.reg.getflag(C), _ => unreachable!() };
-    if cond { let pc = cpu.reg.pc; cpu.reg.sp = cpu.reg.sp.wrapping_sub(1); cpu.mmu.wb(cpu.reg.sp, (pc >> 8) as u8); cpu.reg.sp = cpu.reg.sp.wrapping_sub(1); cpu.mmu.wb(cpu.reg.sp, pc as u8); cpu.reg.pc = addr; 6 } else { 3 }
+    if cond { let pc = cpu.reg.pc; cpu.pushstack(pc); cpu.reg.pc = addr; 6 } else { 3 }
 }
 
 // RET and conditional (0xC9, C0, C8, D0, D8) ; RETI 0xD9
 fn op_ret(cpu: &mut CPU, op: u8) -> u32 {
     match op {
-        0xC9 => { let lo = cpu.mmu.rb(cpu.reg.sp); cpu.reg.sp = cpu.reg.sp.wrapping_add(1); let hi = cpu.mmu.rb(cpu.reg.sp); cpu.reg.sp = cpu.reg.sp.wrapping_add(1); cpu.reg.pc = ((hi as u16) << 8) | lo as u16; 4 },
-    0xD9 => { let lo = cpu.mmu.rb(cpu.reg.sp); cpu.reg.sp = cpu.reg.sp.wrapping_add(1); let hi = cpu.mmu.rb(cpu.reg.sp); cpu.reg.sp = cpu.reg.sp.wrapping_add(1); cpu.reg.pc = ((hi as u16) << 8) | lo as u16; cpu.setei = 1; 4 },
+    0xC9 => { let v = cpu.popstack(); cpu.reg.pc = v; 4 },
+    0xD9 => { let v = cpu.popstack(); cpu.reg.pc = v; cpu.setei = 1; 4 },
         0xC0 | 0xC8 | 0xD0 | 0xD8 => {
             let cond = match op { 0xC0 => !cpu.reg.getflag(Z), 0xC8 => cpu.reg.getflag(Z), 0xD0 => !cpu.reg.getflag(C), 0xD8 => cpu.reg.getflag(C), _ => unreachable!() };
-            if cond { let lo = cpu.mmu.rb(cpu.reg.sp); cpu.reg.sp = cpu.reg.sp.wrapping_add(1); let hi = cpu.mmu.rb(cpu.reg.sp); cpu.reg.sp = cpu.reg.sp.wrapping_add(1); cpu.reg.pc = ((hi as u16) << 8) | lo as u16; 5 } else { 2 }
+        if cond { let v = cpu.popstack(); cpu.reg.pc = v; 5 } else { 2 }
         }
         _ => unreachable!(),
     }
@@ -555,7 +554,7 @@ fn op_cb(cpu:&mut CPU,_:u8)->u32 { let opc = cpu.fetchbyte(); CB_TABLE[opc as us
 
 fn op_fallback(_cpu: &mut CPU, op: u8) -> u32 { panic!("Unimplemented opcode {:02X}", op); }
 
-// Build opcode table. Unmigrated opcodes point to fallback.
+// Opcode table
 #[allow(non_upper_case_globals)]
 static OPCODE_TABLE: [OpHandler; 256] = {
     let mut table: [OpHandler; 256] = [op_fallback; 256];
@@ -623,15 +622,18 @@ mod test {
     use super::CPU;
     use crate::mbc;
 
-    const CPUINSTRS: &'static str = "test/cpu_instrs.gb";
+    const CPU_INSTRS: &'static str = "test/cpu_instrs.gb";
+    const INSTR_TIMING: &'static str = "test/instr_timing.gb";
     const GPU_CLASSIC_CHECKSUM: u32 = 3112234583;
     const GPU_COLOR_CHECKSUM: u32 = 938267576;
+    const TIMING_CLASSIC_CHECKSUM: u32 = 1949059212;
+    const TIMING_COLOR_CHECKSUM: u32 = 2805078112;
 
     #[test]
     fn cpu_instrs_classic() {
         let mut sum_classic = 0_u32;
         {
-            let cart = mbc::FileBackedMBC::new(CPUINSTRS.into(), false).unwrap();
+            let cart = mbc::FileBackedMBC::new(CPU_INSTRS.into(), false).unwrap();
             let mut c = match CPU::new(Box::new(cart), None) {
                 Err(message) => {
                     panic!("{}", message);
@@ -659,7 +661,7 @@ mod test {
         let mut sum_color = 0_u32;
 
         {
-            let cart = mbc::FileBackedMBC::new(CPUINSTRS.into(), false).unwrap();
+            let cart = mbc::FileBackedMBC::new(CPU_INSTRS.into(), false).unwrap();
             let mut c = match CPU::new_cgb(Box::new(cart), None) {
                 Err(message) => {
                     panic!("{}", message);
@@ -679,6 +681,55 @@ mod test {
         assert!(
             sum_color == GPU_COLOR_CHECKSUM,
             "GPU did not produce expected graphics"
+        );
+    }
+
+    #[test]
+    fn instr_timing_classic() {
+        let mut sum_classic = 0_u32;
+        {
+            let cart = mbc::FileBackedMBC::new(INSTR_TIMING.into(), false).unwrap();
+            let mut c = match CPU::new(Box::new(cart), None) {
+                Err(message) => { panic!("{}", message); }
+                Ok(cpu) => cpu,
+            };
+            let mut ticks = 0;
+            // Reuse same tick budget as cpu_instrs for now; adjust if needed
+            while ticks < 63802933 * 4 {
+                ticks += c.do_cycle();
+            }
+            let fb = c.mmu.gpu.front_buffer();
+            for i in 0..fb.len() {
+                sum_classic = sum_classic.wrapping_add((fb[i] as u32).wrapping_mul(i as u32));
+            }
+        }
+        assert!(
+            sum_classic == TIMING_CLASSIC_CHECKSUM, 
+            "Classic mode instruction timing test failed"
+        );
+    }
+
+    #[test]
+    fn instr_timing_color() {
+        let mut sum_color = 0_u32;
+        {
+            let cart = mbc::FileBackedMBC::new(INSTR_TIMING.into(), false).unwrap();
+            let mut c = match CPU::new_cgb(Box::new(cart), None) {
+                Err(message) => { panic!("{}", message); }
+                Ok(cpu) => cpu,
+            };
+            let mut ticks = 0;
+            while ticks < 63802933 * 2 {
+                ticks += c.do_cycle();
+            }
+            let fb = c.mmu.gpu.front_buffer();
+            for i in 0..fb.len() {
+                sum_color = sum_color.wrapping_add((fb[i] as u32).wrapping_mul(i as u32));
+            }
+        }
+        assert!(
+            sum_color == TIMING_COLOR_CHECKSUM, 
+            "Color mode instruction timing test failed"
         );
     }
 }
