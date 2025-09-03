@@ -1,5 +1,8 @@
 # SM83 Gameboy Emulator
 
+[![Rust](https://github.com/ThaumielSparrow/rust-sm83/actions/workflows/rust.yml/badge.svg)](https://github.com/ThaumielSparrow/rust-sm83/actions)
+
+
 Gameboy/Gameboy Color emulator. Core functionality based on implementation from Mathijs "mvdnes" van de Nes (see LICENSE file).
 
 ### Usage: 
