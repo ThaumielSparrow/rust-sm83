@@ -1,2 +1,2 @@
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-cpu=native", "link-arg=-fuse-ld=lld"]
+rustflags = ["-C", "target-cpu=native"]
