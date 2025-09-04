@@ -371,12 +371,11 @@ fn op_ld_r_r(cpu: &mut CPU, op: u8) -> u32 {
     match dest { 0 => cpu.reg.b = val, 1 => cpu.reg.c = val, 2 => cpu.reg.d = val, 3 => cpu.reg.e = val, 4 => cpu.reg.h = val, 5 => cpu.reg.l = val, 6 => { // LD (HL),r
             cpu.mmu.wb(hl, val);
         }, 7 => cpu.reg.a = val, _ => unreachable!() };
-    // Timing: any access involving (HL) is 2 cycles (8 T). Original code only checked dest==6 (LD (HL),r)
-    // but LD r,(HL) also requires 2 cycles. Fix: check either src or dest is (HL).
+
     if dest == 6 || src == 6 { 2 } else { 1 }
 }
 
-// LD r,d8 already handled for specific opcodes; add LD (HL),d8 (0x36)
+// LD r,d8 already handled for specific opcodes
 fn op_ld_hl_d8(cpu: &mut CPU, _op: u8) -> u32 { let v = cpu.fetchbyte(); let hl = cpu.reg.hl(); cpu.mmu.wb(hl, v); 3 }
 
 // ALU helpers mapping register code to value (including (HL))
@@ -532,10 +531,10 @@ fn op_ret(cpu: &mut CPU, op: u8) -> u32 {
 // RST t (0xC7,CF,D7,DF,E7,EF,F7,FF)
 fn op_rst(cpu: &mut CPU, op: u8) -> u32 { let target = match op { 0xC7 => 0x00, 0xCF => 0x08, 0xD7 => 0x10, 0xDF => 0x18, 0xE7 => 0x20, 0xEF => 0x28, 0xF7 => 0x30, 0xFF => 0x38, _ => unreachable!() }; let pc = cpu.reg.pc; cpu.reg.sp = cpu.reg.sp.wrapping_sub(1); cpu.mmu.wb(cpu.reg.sp, (pc >> 8) as u8); cpu.reg.sp = cpu.reg.sp.wrapping_sub(1); cpu.mmu.wb(cpu.reg.sp, pc as u8); cpu.reg.pc = target; 4 }
 
-// Misc single opcodes not yet migrated: DAA(0x27), CPL(0x2F), SCF(0x37), CCF(0x3F), DI(0xF3), EI(0xFB), STOP(0x10)
+// Misc single opcodes: DAA(0x27), CPL(0x2F), SCF(0x37), CCF(0x3F), DI(0xF3), EI(0xFB), STOP(0x10)
 fn op_misc(cpu: &mut CPU, op: u8) -> u32 { match op { 0x27 => { cpu.alu_daa(); 1 }, 0x2F => { cpu.reg.a = !cpu.reg.a; cpu.reg.flag(H,true); cpu.reg.flag(N,true); 1 }, 0x37 => { cpu.reg.flag(C,true); cpu.reg.flag(H,false); cpu.reg.flag(N,false); 1 }, 0x3F => { let c = cpu.reg.getflag(C); cpu.reg.flag(C,!c); cpu.reg.flag(H,false); cpu.reg.flag(N,false); 1 }, 0xF3 => { cpu.ime = false; 1 }, 0xFB => { cpu.setei = 2; 1 }, 0x10 => { cpu.mmu.switch_speed(); 1 }, _ => unreachable!() } }
 
-// Simple LD A,(rr) and LD (rr),A for BC/DE plus HL +/- already partially handled legacy (0x0A,0x1A,0x02,0x12,0x22,0x2A,0x32,0x3A) bring them in
+// Simple LD A,(rr) and LD (rr),A for BC/DE plus HL +/- (0x0A,0x1A,0x02,0x12,0x22,0x2A,0x32,0x3A)
 fn op_ld_a_rr_ind(cpu: &mut CPU, op:u8) -> u32 { match op { 0x0A => cpu.reg.a = cpu.mmu.rb(cpu.reg.bc()), 0x1A => cpu.reg.a = cpu.mmu.rb(cpu.reg.de()), _=> unreachable!()}; 2 }
 fn op_ld_rr_ind_a(cpu: &mut CPU, op:u8) -> u32 { match op { 0x02 => cpu.mmu.wb(cpu.reg.bc(), cpu.reg.a), 0x12 => cpu.mmu.wb(cpu.reg.de(), cpu.reg.a), _=> unreachable!()}; 2 }
 fn op_ld_hl_incdec_a(cpu:&mut CPU, op:u8) -> u32 { match op { 0x22 => { cpu.mmu.wb(cpu.reg.hli(), cpu.reg.a); }, 0x2A => { cpu.reg.a = cpu.mmu.rb(cpu.reg.hli()); }, 0x32 => { cpu.mmu.wb(cpu.reg.hld(), cpu.reg.a); }, 0x3A => { cpu.reg.a = cpu.mmu.rb(cpu.reg.hld()); }, _=> unreachable!()}; 2 }
@@ -694,7 +693,6 @@ mod test {
                 Ok(cpu) => cpu,
             };
             let mut ticks = 0;
-            // Reuse same tick budget as cpu_instrs for now; adjust if needed
             while ticks < 63802933 * 4 {
                 ticks += c.do_cycle();
             }

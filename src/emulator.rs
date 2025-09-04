@@ -33,7 +33,6 @@ pub fn construct_cpu_auto(filename: &str) -> Option<Box<Device>> {
 }
 
 // Runs the emulation core loop. Sends video frames through a bounded channel.
-// Replaces per-frame Vec allocations with a small pool of Arc<Vec<u8>> buffers.
 pub fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Arc<Vec<u8>>>, receiver: Receiver<GBEvent>) {
     // limit_speed: when true we pace at 1x (approx 60 FPS / 16ms per frame)
     // when false we apply turbo/slowmo pacing based on turbo_setting
@@ -118,5 +117,3 @@ pub fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Arc<Vec<u8>>>, receiver:
         last_frame_instant = Instant::now();
     }
 }
-
-// (Old periodic timer removed in favor of Instant-based frame pacing.)

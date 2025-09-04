@@ -438,16 +438,16 @@ impl GPU {
         // Gameboy Color RGB correction
         // Taken from the Gambatte emulator
         // assume r, g and b are between 0 and 1F
-    let buf = &mut self.frame_buffers[self.front ^ 1];
-    let baseidx = self.line as usize * SCREEN_W * 3 + x * 3;
+        let buf = &mut self.frame_buffers[self.front ^ 1];
+        let baseidx = self.line as usize * SCREEN_W * 3 + x * 3;
 
         let r = r as u32;
         let g = g as u32;
         let b = b as u32;
 
-    buf[baseidx + 0] = ((r * 13 + g * 2 + b) >> 1) as u8;
-    buf[baseidx + 1] = ((g * 3 + b) << 1) as u8;
-    buf[baseidx + 2] = ((r * 3 + g * 2 + b * 11) >> 1) as u8;
+        buf[baseidx + 0] = ((r * 13 + g * 2 + b) >> 1) as u8;
+        buf[baseidx + 1] = ((g * 3 + b) << 1) as u8;
+        buf[baseidx + 2] = ((r * 3 + g * 2 + b * 11) >> 1) as u8;
     }
 
     fn draw_bg(&mut self) {
