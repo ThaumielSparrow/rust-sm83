@@ -41,9 +41,16 @@ impl Default for KeyBindings {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct Config { pub keybindings: KeyBindings, pub scale: u32, #[serde(default)] pub turbo: TurboSetting }
+pub struct Config { 
+    pub keybindings: KeyBindings, 
+    pub scale: u32, 
+    #[serde(default)] pub turbo: TurboSetting,
+    #[serde(default="default_volume")] pub volume: u8, // 0-100 user slider value (perceptual)
+}
 
-impl Default for Config { fn default() -> Self { Self { keybindings: KeyBindings::default(), scale: 3, turbo: TurboSetting::default() } } }
+fn default_volume() -> u8 { 100 }
+
+impl Default for Config { fn default() -> Self { Self { keybindings: KeyBindings::default(), scale: 3, turbo: TurboSetting::default(), volume: default_volume() } } }
 
 impl Config {
     pub fn load(path: &PathBuf) -> Self {

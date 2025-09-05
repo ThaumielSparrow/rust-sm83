@@ -16,6 +16,7 @@ pub enum GBEvent {
     SaveState(u8),
     LoadState(u8),
     UpdateTurbo(crate::config::TurboSetting),
+    UpdateVolume(f32), // master volume 0.0-1.0
 }
 
 pub fn construct_cpu_auto(filename: &str) -> Option<Box<Device>> {
@@ -91,6 +92,7 @@ pub fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Arc<Vec<u8>>>, receiver:
             GBEvent::SpeedDown=>{limit_speed=true; cpu.sync_audio();}, GBEvent::SaveState(s)=>{println!("Attempting to save state to slot {}...",s); if let Err(e)=cpu.save_state_slot(s){eprintln!("Failed to save state to slot {}: {}",s,e);} },
             GBEvent::LoadState(s)=>{println!("Attempting to load state from slot {}...",s); if let Err(e)=cpu.load_state_slot(s){eprintln!("Failed to load state from slot {}: {}",s,e);} },
             GBEvent::UpdateTurbo(ts)=>{ turbo_setting = ts; },
+            GBEvent::UpdateVolume(v)=>{ cpu.set_master_volume(v); },
         }, Err(TryRecvError::Empty)=>break 'recv, Err(TryRecvError::Disconnected)=>break 'outer } }
 
         // Timing / pacing

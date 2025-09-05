@@ -124,6 +124,10 @@ impl Device {
         }
     }
 
+    pub fn set_master_volume(&mut self, v: f32) {
+        if let Some(sound) = self.cpu.mmu.sound.as_mut() { sound.set_master_volume(v); }
+    }
+
     pub fn sync_audio(&mut self) {
         if let Some(ref mut sound) = self.cpu.mmu.sound {
             sound.sync();

@@ -678,6 +678,8 @@ pub struct Sound {
     mix_left: Vec<f32>,
     mix_right: Vec<f32>,
     mix_temp: Vec<i16>,
+    // Master volume scalar 0.0 - 1.0 (after perceptual mapping from UI value)
+    master_volume: f32,
 }
 
 impl Sound {
@@ -723,8 +725,11 @@ impl Sound {
             mix_left: vec![0.0; OUTPUT_SAMPLE_COUNT + 10],
             mix_right: vec![0.0; OUTPUT_SAMPLE_COUNT + 10],
             mix_temp: vec![0i16; OUTPUT_SAMPLE_COUNT + 10],
+        master_volume: 1.0,
         }
     }
+
+    pub fn set_master_volume(&mut self, v: f32) { self.master_volume = v.clamp(0.0, 1.0); }
 
     pub fn rb(&mut self, a: u16) -> u8 {
         self.run();
@@ -937,6 +942,10 @@ impl Sound {
             debug_assert!(count1 == count3);
             debug_assert!(count1 == count4);
 
+            if self.master_volume != 1.0 {
+                // Apply master volume scaling in-place
+                for i in 0..count1 { buf_left[i] *= self.master_volume; buf_right[i] *= self.master_volume; }
+            }
             self.player.play(&buf_left[..count1], &buf_right[..count1]);
 
             outputted += count1;

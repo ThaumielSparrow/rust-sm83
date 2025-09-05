@@ -38,6 +38,7 @@ enum RootPhase {
         turbo_toggle: bool,
         turbo_held: bool,
         turbo_setting: TurboSetting,
+        volume: u8,
     },
 }
 
@@ -98,8 +99,9 @@ impl RootApp {
                 set_window_size(win, initial_scale);
             }
             self.scale = initial_scale;
-            self.phase = RootPhase::Running { texture, sender, receiver: frame_receiver, renderoptions: RenderOptions::default(), running: true, keybindings: cfg.keybindings, capturing: None, _audio: audio_stream, show_keybindings_window: false, turbo_toggle: false, turbo_held: false, turbo_setting: cfg.turbo };
+            self.phase = RootPhase::Running { texture, sender, receiver: frame_receiver, renderoptions: RenderOptions::default(), running: true, keybindings: cfg.keybindings, capturing: None, _audio: audio_stream, show_keybindings_window: false, turbo_toggle: false, turbo_held: false, turbo_setting: cfg.turbo, volume: cfg.volume };
             if let RootPhase::Running { sender, .. } = &self.phase { let _ = sender.send(GBEvent::UpdateTurbo(cfg.turbo)); }
+            if let RootPhase::Running { sender, volume, .. } = &self.phase { let _ = sender.send(GBEvent::UpdateVolume(perceptual_to_linear(*volume))); }
             // Now that we've transitioned to Running, resize window to game resolution * scale.
             if let Some(win) = &self.window {
                 set_window_size(win, self.scale);
@@ -176,7 +178,7 @@ impl ApplicationHandler for RootApp {
                 if let Some(f) = launch_filename { self.start_game(f); }
                 if quit_requested { self.exit_code = EXITCODE_CPULOADFAILS; event_loop.exit(); }
             }
-            (RootPhase::Running { sender, renderoptions, running, keybindings, capturing, show_keybindings_window, turbo_toggle, turbo_held, turbo_setting, .. }, WindowEvent::KeyboardInput { event: keyevent, .. }) => {
+            (RootPhase::Running { sender, renderoptions, running, keybindings, capturing, show_keybindings_window, turbo_toggle, turbo_held, turbo_setting, volume, .. }, WindowEvent::KeyboardInput { event: keyevent, .. }) => {
                 let state = keyevent.state;
                 let logical = keyevent.logical_key.clone();
                 if let Some(kp) = *capturing {
@@ -196,11 +198,7 @@ impl ApplicationHandler for RootApp {
                         }
                         *capturing = None;
                         // Persist current turbo setting along with keybindings
-                        let cfg = Config {
-                            keybindings: keybindings.clone(),
-                            scale: self.scale,
-                            turbo: *turbo_setting
-                        };
+                        let cfg = Config { keybindings: keybindings.clone(), scale: self.scale, turbo: *turbo_setting, volume: *volume };
                         cfg.save(&config_path());
                     }
                     return; // don't treat as game input
@@ -237,7 +235,7 @@ impl ApplicationHandler for RootApp {
                     (Released, wkey) => { if let Some(k)=dynamic_winit_to_keypad(wkey, keybindings) { let _=sender.send(GBEvent::KeyUp(k)); } },
                 }
             }
-            (RootPhase::Running { sender, texture, receiver, renderoptions, running, keybindings, capturing, show_keybindings_window, turbo_toggle, turbo_setting, .. }, WindowEvent::RedrawRequested) => {
+            (RootPhase::Running { sender, texture, receiver, renderoptions, running, keybindings, capturing, show_keybindings_window, turbo_toggle, turbo_setting, volume, .. }, WindowEvent::RedrawRequested) => {
                 if !*running { return; }
                 if let (Some(display), Some(window), Some(egui_glium)) = (&self.display, &self.window, &mut self.egui_glium) {
                     // Get the menu bar height first
@@ -257,14 +255,26 @@ impl ApplicationHandler for RootApp {
                                 });
                                 ui.menu_button("Options", |ui| {
                                     ui.menu_button("Scale", |ui| {
-                                        for s in 1..=4 { let selected = self.scale == s; if ui.radio(selected, format!("{}x", s)).clicked() { self.scale = s; set_window_size(window, s); let cfg = Config { keybindings: keybindings.clone(), scale: self.scale, turbo: *turbo_setting }; cfg.save(&config_path()); } }
+                                        for s in 1..=4 { let selected = self.scale == s; if ui.radio(selected, format!("{}x", s)).clicked() { self.scale = s; set_window_size(window, s); let cfg = Config { keybindings: keybindings.clone(), scale: self.scale, turbo: *turbo_setting, volume: *volume }; cfg.save(&config_path()); } }
+                                    });
+                                    // Volume slider (0-100) with perceptual scaling. 50 should feel ~half as loud.
+                                    ui.horizontal(|ui| {
+                                        ui.label("Volume");
+                                        let mut v = *volume as i32;
+                                        let slider = egui::Slider::new(&mut v, 0..=100).show_value(false);
+                                        if ui.add(slider).changed() {
+                                            *volume = v as u8;
+                                            let lin = perceptual_to_linear(*volume);
+                                            let _ = sender.send(GBEvent::UpdateVolume(lin));
+                                            let cfg = Config { keybindings: keybindings.clone(), scale: self.scale, turbo: *turbo_setting, volume: *volume }; cfg.save(&config_path());
+                                        }
+                                        ui.label(format!("{}%", *volume));
                                     });
                                     ui.menu_button("Turbo Speed", |ui| {
                                         for ts in TurboSetting::all() {
                                             let selected = *turbo_setting == *ts;
                                             if ui.radio(selected, ts.label()).clicked() {
-                                                *turbo_setting = *ts;
-                                                let cfg = Config { keybindings: keybindings.clone(), scale: self.scale, turbo: *turbo_setting }; cfg.save(&config_path());
+                                                *turbo_setting = *ts; let cfg = Config { keybindings: keybindings.clone(), scale: self.scale, turbo: *turbo_setting, volume: *volume }; cfg.save(&config_path());
                                                 let _ = sender.send(GBEvent::UpdateTurbo(*ts));
                                             }
                                         }
@@ -369,6 +379,14 @@ fn set_window_size(window: &winit::window::Window, scale: u32) {
         rust_gbe::SCREEN_W as u32 * scale,
         rust_gbe::SCREEN_H as u32 * scale + menu_bar_height,
     )));
+}
+
+// Convert 0-100 slider value to linear gain (0.0-1.0) using a perceptual (log-like) curve.
+// 50 -> ~0.5 perceived loudness; we map percentage p to gain = (p/100)^(gamma) with gamma ~ 1.5
+// This softens high-end changes and gives finer control at low volumes.
+fn perceptual_to_linear(v: u8) -> f32 {
+    let p = (v as f32) / 100.0;
+    if p <= 0.0 { 0.0 } else { p.powf(1.5) } // simple gamma curve
 }
 
 // Dynamic mapping using current keybindings
