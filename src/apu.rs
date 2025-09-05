@@ -725,7 +725,7 @@ impl Sound {
             mix_left: vec![0.0; OUTPUT_SAMPLE_COUNT + 10],
             mix_right: vec![0.0; OUTPUT_SAMPLE_COUNT + 10],
             mix_temp: vec![0i16; OUTPUT_SAMPLE_COUNT + 10],
-        master_volume: 1.0,
+            master_volume: 1.0,
         }
     }
 
