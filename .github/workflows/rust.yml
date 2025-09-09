@@ -8,6 +8,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".cargo/**"
+      - ".github/workflows/rust.yml"
   pull_request:
     branches: [ "main" ]
 
@@ -16,12 +17,35 @@ env:
 
 jobs:
   build:
-
-    runs-on: windows-latest
+    name: build-and-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --lib --verbose
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libwayland-dev libxkbcommon-dev mesa-common-dev
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run tests (library)
+        run: cargo test --lib --verbose
