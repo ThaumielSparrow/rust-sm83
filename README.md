@@ -5,9 +5,15 @@
 
 Gameboy/Gameboy Color emulator. Core functionality based on implementation from Mathijs "mvdnes" van de Nes (see LICENSE file).
 
+Supports Windows, MacOS, and Linux. Prebuilt binary is included for Windows.
+
 ### Usage: 
 
 Build with `cargo b --release`.
+
+On Linux systems, some system dependencies are required:
+
+```sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libwayland-dev libxkbcommon-dev mesa-common-dev```
 
 Run with `cargo r --release`, or run the executable in `target\release`. Select your ROM using the GUI.
 
