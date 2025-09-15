@@ -5,7 +5,7 @@
 
 Gameboy/Gameboy Color emulator. Core functionality based on implementation from Mathijs "mvdnes" van de Nes (see LICENSE file).
 
-Supports Windows, MacOS, and Linux. Prebuilt binary is included for Windows.
+Supports Windows, MacOS, and Linux (tested on Ubuntu LTS 22.04/24.04). Prebuilt binary is included for Windows.
 
 ### Usage: 
 
@@ -18,8 +18,6 @@ On Linux systems, some system dependencies are required:
 Run with `cargo r --release`, or run the executable in `target\release`. Select your ROM using the GUI.
 
 Supports saving in-game (battery-backed RAM) or with savestates.
-
-Build config uses `lld` for faster linking. Default toolchain linker can be used instead if `lld` is not installed by removing `"link-arg=-fuse-ld=lld"` from `.config/config.toml`.
 
 ### Emulator Keybinds:
 
