@@ -47,6 +47,6 @@ These are reserved keybinds for system functionality and cannot be adjusted thro
 
 `Y`: Toggle interpolation
 
-`Esc`: Close menu/Close emulator
+`Esc`: Close menu/Close emulator (double-press required to close emulator)
 
 Turbo speed is configurable via the config menu.

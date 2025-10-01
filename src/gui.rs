@@ -1,6 +1,7 @@
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use cpal::Stream;
 use glium::Surface;
@@ -35,6 +36,10 @@ enum RootPhase {
         capturing: Option<rust_gbe::KeypadKey>,
         _audio: Option<Stream>,
         show_keybindings_window: bool,
+        // Timestamp of last Escape press. A single press will set this; a second press
+        // within ESC_DOUBLE_PRESS_MS will trigger emulator exit. Kept here so the state
+        // survives between key events.
+        last_escape: Option<Instant>,
         turbo_toggle: bool,
         turbo_held: bool,
         turbo_setting: TurboSetting,
@@ -99,7 +104,7 @@ impl RootApp {
                 set_window_size(win, initial_scale);
             }
             self.scale = initial_scale;
-            self.phase = RootPhase::Running { texture, sender, receiver: frame_receiver, renderoptions: RenderOptions::default(), running: true, keybindings: cfg.keybindings, capturing: None, _audio: audio_stream, show_keybindings_window: false, turbo_toggle: false, turbo_held: false, turbo_setting: cfg.turbo, volume: cfg.volume };
+            self.phase = RootPhase::Running { texture, sender, receiver: frame_receiver, renderoptions: RenderOptions::default(), running: true, keybindings: cfg.keybindings, capturing: None, _audio: audio_stream, show_keybindings_window: false, last_escape: None, turbo_toggle: false, turbo_held: false, turbo_setting: cfg.turbo, volume: cfg.volume };
             if let RootPhase::Running { sender, .. } = &self.phase { let _ = sender.send(GBEvent::UpdateTurbo(cfg.turbo)); }
             if let RootPhase::Running { sender, volume, .. } = &self.phase { let _ = sender.send(GBEvent::UpdateVolume(perceptual_to_linear(*volume))); }
             // Now that we've transitioned to Running, resize window to game resolution * scale.
@@ -178,7 +183,8 @@ impl ApplicationHandler for RootApp {
                 if let Some(f) = launch_filename { self.start_game(f); }
                 if quit_requested { self.exit_code = EXITCODE_CPULOADFAILS; event_loop.exit(); }
             }
-            (RootPhase::Running { sender, renderoptions, running, keybindings, capturing, show_keybindings_window, turbo_toggle, turbo_held, turbo_setting, volume, .. }, WindowEvent::KeyboardInput { event: keyevent, .. }) => {
+            // ESC double-press logic: require two presses within ESC_DOUBLE_PRESS_MS to exit.
+            (RootPhase::Running { sender, renderoptions, running, keybindings, capturing, show_keybindings_window, last_escape, turbo_toggle, turbo_held, turbo_setting, volume, .. }, WindowEvent::KeyboardInput { event: keyevent, .. }) => {
                 let state = keyevent.state;
                 let logical = keyevent.logical_key.clone();
                 if let Some(kp) = *capturing {
@@ -226,10 +232,29 @@ impl ApplicationHandler for RootApp {
                     return;
                 }
                 match (state, logical.as_ref()) {
-                    // Escape: if keybindings window open, close it; else exit emulator
+                    // Escape: if keybindings window open, close it immediately; else require double-press to exit.
                     (Pressed, Key::Named(NamedKey::Escape)) => {
-                        if *show_keybindings_window { *show_keybindings_window = false; }
-                        else { *running = false; event_loop.exit(); }
+                        if *show_keybindings_window {
+                            *show_keybindings_window = false;
+                            // Do not treat this as a potential exit press
+                            *last_escape = None;
+                        } else {
+                            const ESC_DOUBLE_PRESS_MS: u128 = 500;
+                            let now = Instant::now();
+                            if let Some(prev) = last_escape {
+                                if now.duration_since(*prev).as_millis() <= ESC_DOUBLE_PRESS_MS {
+                                    // Second press within window -> exit
+                                    *running = false; event_loop.exit();
+                                    *last_escape = None;
+                                } else {
+                                    // Too slow; treat this as new first press
+                                    *last_escape = Some(now);
+                                }
+                            } else {
+                                // First press: record timestamp and do nothing else
+                                *last_escape = Some(now);
+                            }
+                        }
                     },
                     (Pressed, wkey) => { if let Some(k)=dynamic_winit_to_keypad(wkey, keybindings) { let _=sender.send(GBEvent::KeyDown(k)); } },
                     (Released, wkey) => { if let Some(k)=dynamic_winit_to_keypad(wkey, keybindings) { let _=sender.send(GBEvent::KeyUp(k)); } },

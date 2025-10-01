@@ -2175,7 +2175,7 @@ dependencies = [
 
 [[package]]
 name = "rust-gbe"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "bincode",
  "blip_buf",
