@@ -87,7 +87,7 @@ impl RootApp {
         }
         let _ = cpu.romname();
         let (sender, recv_events) = mpsc::channel();
-    let (frame_sender, frame_receiver) = mpsc::sync_channel(1);
+        let (frame_sender, frame_receiver) = mpsc::sync_channel(1);
         let frame_sender_clone = frame_sender.clone();
         thread::spawn(move || run_cpu(cpu, frame_sender_clone, recv_events));
         if let Some(display) = &self.display {

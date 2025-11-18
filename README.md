@@ -23,9 +23,9 @@ Supports saving in-game (battery-backed RAM) or with savestates.
 
 Emulator keybinds are configurable and can be adjusted from the Options dropdown while emulator is running.
 
-`A`: `Z`
+`A`: `X`
 
-`B`: `X`
+`B`: `Z`
 
 `Dpad`: `ArrowKeys`
 

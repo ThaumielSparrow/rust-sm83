@@ -36,7 +36,7 @@ pub struct KeyBindings {
 
 impl Default for KeyBindings {
     fn default() -> Self { Self {
-        a: "Z".into(), b: "X".into(), start: "Enter".into(), select: "Space".into(),
+        a: "X".into(), b: "Z".into(), start: "Enter".into(), select: "Space".into(),
         up: "ArrowUp".into(), down: "ArrowDown".into(), left: "ArrowLeft".into(), right: "ArrowRight".into() } }
 }
 
