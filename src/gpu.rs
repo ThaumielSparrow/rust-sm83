@@ -1,5 +1,4 @@
 use crate::gbmode::GbMode;
-use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
 const VRAM_SIZE: usize = 0x4000;
@@ -7,14 +6,14 @@ const VOAM_SIZE: usize = 0xA0;
 pub const SCREEN_W: usize = 160;
 pub const SCREEN_H: usize = 144;
 
-#[derive(PartialEq, Copy, Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Copy, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 enum PrioType {
     Color0,
     PrioFlag,
     Normal,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct GPU {
     mode: u8,
     modeclock: u32,
@@ -44,9 +43,7 @@ pub struct GPU {
     palb: [u8; 4],
     pal0: [u8; 4],
     pal1: [u8; 4],
-    #[serde(with = "serde_arrays")]
     vram: [u8; VRAM_SIZE],
-    #[serde(with = "serde_arrays")]
     voam: [u8; VOAM_SIZE],
     cbgpal_inc: bool,
     cbgpal_ind: u8,
@@ -60,7 +57,6 @@ pub struct GPU {
     // to be read concurrently (e.g., by UI) without copying mid-frame.
     frame_buffers: [Vec<u8>; 2],
     front: usize, // index of front buffer (0 or 1)
-    #[serde(with = "serde_arrays")]
     bgprio: [PrioType; SCREEN_W],
     pub updated: bool,
     pub interrupt: u8,

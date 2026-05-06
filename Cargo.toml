@@ -1,22 +1,20 @@
 [package]
 name = "rust-gbe"
-version = "1.2.1"
+version = "2.0.0"
 edition = "2024"
 
 [dependencies]
-mimalloc = "0.1.48"
+mimalloc = "0.1.50"
 glium = "0.36"
-winit = "0.30"
-cpal = "0.16"
-rfd = "0.15"
-egui = "0.31"
-egui_glium = "0.31"
+winit = "0.30.13"
+cpal = "0.17.3"
+rfd = "0.17.2"
+egui = "0.33"
+egui_glium = "0.33.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-bincode = { version = "2.0", features = ["serde"] }
-serde_arrays = "0.2.0"
-typetag = "0.2.20"
-blip_buf = "0.1.5"
+blip_buf = "0.1.6"
+rkyv = { version = "0.8.16", features = ["little_endian", "unaligned", "pointer_width_32"] }
 
 [profile.dev]
 debug = "line-tables-only"

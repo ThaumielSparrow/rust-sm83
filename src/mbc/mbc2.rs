@@ -1,8 +1,7 @@
 use crate::mbc::{rom_banks, MBC};
 use crate::StrResult;
-use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MBC2 {
     rom: Vec<u8>,
     ram: Vec<u8>,
@@ -35,7 +34,6 @@ impl MBC2 {
     }
 }
 
-#[typetag::serde]
 impl MBC for MBC2 {
     fn readrom(&self, a: u16) -> u8 {
         let bank = if a < 0x4000 { 0 } else { self.rombank };

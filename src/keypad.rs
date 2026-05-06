@@ -1,6 +1,4 @@
-use serde::{Deserialize, Serialize};
-
-#[derive(Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Keypad {
     row0: u8,
     row1: u8,
@@ -8,7 +6,7 @@ pub struct Keypad {
     pub interrupt: u8,
 }
 
-#[derive(Copy, Clone, Serialize, Deserialize)]
+#[derive(Copy, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum KeypadKey {
     Right,
     Left,

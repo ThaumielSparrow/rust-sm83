@@ -1,5 +1,4 @@
 use crate::StrResult;
-use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io;
 use std::io::prelude::*;
@@ -11,7 +10,6 @@ mod mbc2;
 mod mbc3;
 mod mbc5;
 
-#[typetag::serde(tag = "type")]
 pub trait MBC: Send {
     fn readrom(&self, a: u16) -> u8;
     fn readram(&self, a: u16) -> u8;
@@ -49,7 +47,98 @@ pub trait MBC: Send {
     }
 }
 
-pub fn get_mbc(data: Vec<u8>, skip_checksum: bool) -> StrResult<Box<dyn MBC + 'static>> {
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum MbcState {
+    Mbc0(mbc0::MBC0),
+    Mbc1(mbc1::MBC1),
+    Mbc2(mbc2::MBC2),
+    Mbc3(mbc3::MBC3),
+    Mbc5(mbc5::MBC5),
+}
+
+impl MBC for MbcState {
+    fn readrom(&self, a: u16) -> u8 {
+        match self {
+            MbcState::Mbc0(mbc) => mbc.readrom(a),
+            MbcState::Mbc1(mbc) => mbc.readrom(a),
+            MbcState::Mbc2(mbc) => mbc.readrom(a),
+            MbcState::Mbc3(mbc) => mbc.readrom(a),
+            MbcState::Mbc5(mbc) => mbc.readrom(a),
+        }
+    }
+
+    fn readram(&self, a: u16) -> u8 {
+        match self {
+            MbcState::Mbc0(mbc) => mbc.readram(a),
+            MbcState::Mbc1(mbc) => mbc.readram(a),
+            MbcState::Mbc2(mbc) => mbc.readram(a),
+            MbcState::Mbc3(mbc) => mbc.readram(a),
+            MbcState::Mbc5(mbc) => mbc.readram(a),
+        }
+    }
+
+    fn writerom(&mut self, a: u16, v: u8) {
+        match self {
+            MbcState::Mbc0(mbc) => mbc.writerom(a, v),
+            MbcState::Mbc1(mbc) => mbc.writerom(a, v),
+            MbcState::Mbc2(mbc) => mbc.writerom(a, v),
+            MbcState::Mbc3(mbc) => mbc.writerom(a, v),
+            MbcState::Mbc5(mbc) => mbc.writerom(a, v),
+        }
+    }
+
+    fn writeram(&mut self, a: u16, v: u8) {
+        match self {
+            MbcState::Mbc0(mbc) => mbc.writeram(a, v),
+            MbcState::Mbc1(mbc) => mbc.writeram(a, v),
+            MbcState::Mbc2(mbc) => mbc.writeram(a, v),
+            MbcState::Mbc3(mbc) => mbc.writeram(a, v),
+            MbcState::Mbc5(mbc) => mbc.writeram(a, v),
+        }
+    }
+
+    fn check_and_reset_ram_updated(&mut self) -> bool {
+        match self {
+            MbcState::Mbc0(mbc) => mbc.check_and_reset_ram_updated(),
+            MbcState::Mbc1(mbc) => mbc.check_and_reset_ram_updated(),
+            MbcState::Mbc2(mbc) => mbc.check_and_reset_ram_updated(),
+            MbcState::Mbc3(mbc) => mbc.check_and_reset_ram_updated(),
+            MbcState::Mbc5(mbc) => mbc.check_and_reset_ram_updated(),
+        }
+    }
+
+    fn is_battery_backed(&self) -> bool {
+        match self {
+            MbcState::Mbc0(mbc) => mbc.is_battery_backed(),
+            MbcState::Mbc1(mbc) => mbc.is_battery_backed(),
+            MbcState::Mbc2(mbc) => mbc.is_battery_backed(),
+            MbcState::Mbc3(mbc) => mbc.is_battery_backed(),
+            MbcState::Mbc5(mbc) => mbc.is_battery_backed(),
+        }
+    }
+
+    fn loadram(&mut self, ramdata: &[u8]) -> StrResult<()> {
+        match self {
+            MbcState::Mbc0(mbc) => mbc.loadram(ramdata),
+            MbcState::Mbc1(mbc) => mbc.loadram(ramdata),
+            MbcState::Mbc2(mbc) => mbc.loadram(ramdata),
+            MbcState::Mbc3(mbc) => mbc.loadram(ramdata),
+            MbcState::Mbc5(mbc) => mbc.loadram(ramdata),
+        }
+    }
+
+    fn dumpram(&self) -> Vec<u8> {
+        match self {
+            MbcState::Mbc0(mbc) => mbc.dumpram(),
+            MbcState::Mbc1(mbc) => mbc.dumpram(),
+            MbcState::Mbc2(mbc) => mbc.dumpram(),
+            MbcState::Mbc3(mbc) => mbc.dumpram(),
+            MbcState::Mbc5(mbc) => mbc.dumpram(),
+        }
+    }
+}
+
+pub fn get_mbc(data: Vec<u8>, skip_checksum: bool) -> StrResult<MbcState> {
     if data.len() < 0x150 {
         return Err("ROM size too small");
     }
@@ -57,19 +146,19 @@ pub fn get_mbc(data: Vec<u8>, skip_checksum: bool) -> StrResult<Box<dyn MBC + 's
         check_checksum(&data)?;
     }
     match data[0x147] {
-        0x00 => mbc0::MBC0::new(data).map(|v| Box::new(v) as Box<dyn MBC>),
-        0x01..=0x03 => mbc1::MBC1::new(data).map(|v| Box::new(v) as Box<dyn MBC>),
-        0x05..=0x06 => mbc2::MBC2::new(data).map(|v| Box::new(v) as Box<dyn MBC>),
-        0x0F..=0x13 => mbc3::MBC3::new(data).map(|v| Box::new(v) as Box<dyn MBC>),
-        0x19..=0x1E => mbc5::MBC5::new(data).map(|v| Box::new(v) as Box<dyn MBC>),
+        0x00 => mbc0::MBC0::new(data).map(MbcState::Mbc0),
+        0x01..=0x03 => mbc1::MBC1::new(data).map(MbcState::Mbc1),
+        0x05..=0x06 => mbc2::MBC2::new(data).map(MbcState::Mbc2),
+        0x0F..=0x13 => mbc3::MBC3::new(data).map(MbcState::Mbc3),
+        0x19..=0x1E => mbc5::MBC5::new(data).map(MbcState::Mbc5),
         _ => Err("Unsupported MBC type"),
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct FileBackedMBC {
-    rampath: path::PathBuf,
-    mbc: Box<dyn MBC>,
+    rampath: String,
+    mbc: MbcState,
 }
 
 impl FileBackedMBC {
@@ -102,12 +191,14 @@ impl FileBackedMBC {
             }
         }
 
-        Ok(FileBackedMBC { rampath, mbc })
+        Ok(FileBackedMBC {
+            rampath: rampath.to_string_lossy().to_string(),
+            mbc,
+        })
     }
 }
 
 // Implement MBC for FileBackedMBC such that the MMU can use this transparently
-#[typetag::serde]
 impl MBC for FileBackedMBC {
     fn readrom(&self, a: u16) -> u8 {
         self.mbc.readrom(a)
@@ -142,7 +233,7 @@ impl MBC for FileBackedMBC {
     }
 
     fn get_save_path(&self) -> Option<String> {
-        Some(self.rampath.to_string_lossy().to_string())
+        Some(self.rampath.clone())
     }
 }
 
@@ -155,6 +246,87 @@ impl Drop for FileBackedMBC {
                 Err(..) => return,
             };
             let _ = file.write_all(&self.mbc.dumpram());
+        }
+    }
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum Cartridge {
+    Memory(MbcState),
+    FileBacked(FileBackedMBC),
+}
+
+impl Cartridge {
+    pub fn from_file(rompath: path::PathBuf, skip_checksum: bool) -> StrResult<Cartridge> {
+        FileBackedMBC::new(rompath, skip_checksum).map(Cartridge::FileBacked)
+    }
+
+    pub fn from_buffer(data: Vec<u8>, skip_checksum: bool) -> StrResult<Cartridge> {
+        get_mbc(data, skip_checksum).map(Cartridge::Memory)
+    }
+}
+
+impl MBC for Cartridge {
+    fn readrom(&self, a: u16) -> u8 {
+        match self {
+            Cartridge::Memory(mbc) => mbc.readrom(a),
+            Cartridge::FileBacked(mbc) => mbc.readrom(a),
+        }
+    }
+
+    fn readram(&self, a: u16) -> u8 {
+        match self {
+            Cartridge::Memory(mbc) => mbc.readram(a),
+            Cartridge::FileBacked(mbc) => mbc.readram(a),
+        }
+    }
+
+    fn writerom(&mut self, a: u16, v: u8) {
+        match self {
+            Cartridge::Memory(mbc) => mbc.writerom(a, v),
+            Cartridge::FileBacked(mbc) => mbc.writerom(a, v),
+        }
+    }
+
+    fn writeram(&mut self, a: u16, v: u8) {
+        match self {
+            Cartridge::Memory(mbc) => mbc.writeram(a, v),
+            Cartridge::FileBacked(mbc) => mbc.writeram(a, v),
+        }
+    }
+
+    fn check_and_reset_ram_updated(&mut self) -> bool {
+        match self {
+            Cartridge::Memory(mbc) => mbc.check_and_reset_ram_updated(),
+            Cartridge::FileBacked(mbc) => mbc.check_and_reset_ram_updated(),
+        }
+    }
+
+    fn is_battery_backed(&self) -> bool {
+        match self {
+            Cartridge::Memory(mbc) => mbc.is_battery_backed(),
+            Cartridge::FileBacked(mbc) => mbc.is_battery_backed(),
+        }
+    }
+
+    fn loadram(&mut self, ramdata: &[u8]) -> StrResult<()> {
+        match self {
+            Cartridge::Memory(mbc) => mbc.loadram(ramdata),
+            Cartridge::FileBacked(mbc) => mbc.loadram(ramdata),
+        }
+    }
+
+    fn dumpram(&self) -> Vec<u8> {
+        match self {
+            Cartridge::Memory(mbc) => mbc.dumpram(),
+            Cartridge::FileBacked(mbc) => mbc.dumpram(),
+        }
+    }
+
+    fn get_save_path(&self) -> Option<String> {
+        match self {
+            Cartridge::Memory(mbc) => mbc.get_save_path(),
+            Cartridge::FileBacked(mbc) => mbc.get_save_path(),
         }
     }
 }

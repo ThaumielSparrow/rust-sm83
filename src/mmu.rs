@@ -1,28 +1,25 @@
 use crate::gbmode::{GbMode, GbSpeed};
 use crate::gpu::GPU;
 use crate::keypad::Keypad;
-use crate::mbc;
+use crate::mbc::{self, MBC};
 use crate::serial::Serial;
 use crate::apu::Sound;
 use crate::timer::Timer;
 use crate::StrResult;
-use serde::{Deserialize, Serialize};
 
 const WRAM_SIZE: usize = 0x8000;
 const ZRAM_SIZE: usize = 0x7F;
 
-#[derive(PartialEq, Serialize, Deserialize)]
+#[derive(PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 enum DMAType {
     NoDMA,
     GDMA,
     HDMA,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MMU {
-    #[serde(with = "serde_arrays")]
     wram: [u8; WRAM_SIZE],
-    #[serde(with = "serde_arrays")]
     zram: [u8; ZRAM_SIZE],
     hdma: [u8; 4],
     pub inte: u8,
@@ -31,14 +28,14 @@ pub struct MMU {
     pub timer: Timer,
     pub keypad: Keypad,
     pub gpu: GPU,
-    #[serde(skip)]
+    #[rkyv(with = rkyv::with::Skip)]
     pub sound: Option<Sound>,
     hdma_status: DMAType,
     hdma_src: u16,
     hdma_dst: u16,
     hdma_len: u8,
     wrambank: usize,
-    pub mbc: Box<dyn mbc::MBC + 'static>,
+    pub mbc: mbc::Cartridge,
     pub gbmode: GbMode,
     gbspeed: GbSpeed,
     speed_switch_req: bool,
@@ -60,7 +57,7 @@ fn fill_random(slice: &mut [u8], start: u32) {
 
 impl MMU {
     pub fn new(
-        cart: Box<dyn mbc::MBC + 'static>,
+        cart: mbc::Cartridge,
         _serial_callback: Option<Box<()>>,
     ) -> StrResult<MMU> {
         let serial = Serial::new();
@@ -95,7 +92,7 @@ impl MMU {
     }
 
     pub fn new_cgb(
-        cart: Box<dyn mbc::MBC + 'static>,
+        cart: mbc::Cartridge,
         _serial_callback: Option<Box<()>>,
     ) -> StrResult<MMU> {
         let serial = Serial::new();

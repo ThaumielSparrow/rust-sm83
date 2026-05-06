@@ -1,7 +1,6 @@
 use crate::gbmode::GbMode;
-use serde::{Deserialize, Serialize};
 
-#[derive(Copy, Clone, Serialize, Deserialize)]
+#[derive(Copy, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Registers {
     pub a: u8,
     f: u8,

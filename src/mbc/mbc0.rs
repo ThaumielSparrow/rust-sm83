@@ -1,8 +1,7 @@
 use crate::mbc::MBC;
 use crate::StrResult;
-use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MBC0 {
     rom: Vec<u8>,
 }
@@ -13,7 +12,6 @@ impl MBC0 {
     }
 }
 
-#[typetag::serde]
 impl MBC for MBC0 {
     fn readrom(&self, a: u16) -> u8 {
         self.rom[a as usize]

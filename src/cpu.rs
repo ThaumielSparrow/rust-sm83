@@ -3,9 +3,8 @@ use crate::mmu::MMU;
 use crate::register::CpuFlag::{C, H, N, Z};
 use crate::register::Registers;
 use crate::StrResult;
-use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CPU {
     reg: Registers,
     pub mmu: MMU,
@@ -18,7 +17,7 @@ pub struct CPU {
 
 impl CPU {
     pub fn new(
-        cart: Box<dyn mbc::MBC + 'static>,
+        cart: mbc::Cartridge,
         _serial_callback: Option<Box<()>>,
     ) -> StrResult<CPU> {
         let cpu_mmu = MMU::new(cart, None)?;
@@ -35,7 +34,7 @@ impl CPU {
     }
 
     pub fn new_cgb(
-        cart: Box<dyn mbc::MBC + 'static>,
+        cart: mbc::Cartridge,
         _serial_callback: Option<Box<()>>,
     ) -> StrResult<CPU> {
         let cpu_mmu = MMU::new_cgb(cart, None)?;
@@ -632,8 +631,8 @@ mod test {
     fn cpu_instrs_classic() {
         let mut sum_classic = 0_u32;
         {
-            let cart = mbc::FileBackedMBC::new(CPU_INSTRS.into(), false).unwrap();
-            let mut c = match CPU::new(Box::new(cart), None) {
+            let cart = mbc::Cartridge::from_file(CPU_INSTRS.into(), false).unwrap();
+            let mut c = match CPU::new(cart, None) {
                 Err(message) => {
                     panic!("{}", message);
                 }
@@ -660,8 +659,8 @@ mod test {
         let mut sum_color = 0_u32;
 
         {
-            let cart = mbc::FileBackedMBC::new(CPU_INSTRS.into(), false).unwrap();
-            let mut c = match CPU::new_cgb(Box::new(cart), None) {
+            let cart = mbc::Cartridge::from_file(CPU_INSTRS.into(), false).unwrap();
+            let mut c = match CPU::new_cgb(cart, None) {
                 Err(message) => {
                     panic!("{}", message);
                 }
@@ -687,8 +686,8 @@ mod test {
     fn instr_timing_classic() {
         let mut sum_classic = 0_u32;
         {
-            let cart = mbc::FileBackedMBC::new(INSTR_TIMING.into(), false).unwrap();
-            let mut c = match CPU::new(Box::new(cart), None) {
+            let cart = mbc::Cartridge::from_file(INSTR_TIMING.into(), false).unwrap();
+            let mut c = match CPU::new(cart, None) {
                 Err(message) => { panic!("{}", message); }
                 Ok(cpu) => cpu,
             };
@@ -711,8 +710,8 @@ mod test {
     fn instr_timing_color() {
         let mut sum_color = 0_u32;
         {
-            let cart = mbc::FileBackedMBC::new(INSTR_TIMING.into(), false).unwrap();
-            let mut c = match CPU::new_cgb(Box::new(cart), None) {
+            let cart = mbc::Cartridge::from_file(INSTR_TIMING.into(), false).unwrap();
+            let mut c = match CPU::new_cgb(cart, None) {
                 Err(message) => { panic!("{}", message); }
                 Ok(cpu) => cpu,
             };

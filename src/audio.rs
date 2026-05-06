@@ -13,7 +13,7 @@ impl CpalPlayer {
     fn get() -> Option<(CpalPlayer, cpal::Stream)> {
         let device = cpal::default_host().default_output_device()?;
 
-        let wanted_samplerate = cpal::SampleRate(44100);
+        let wanted_samplerate = 44100;
         let supported_configs = device.supported_output_configs().ok()?;
         let mut supported_config = None;
         for f in supported_configs {
@@ -33,7 +33,7 @@ impl CpalPlayer {
         let err_fn = |err| eprintln!("An error occurred on the output audio stream: {}", err);
         let shared_buffer = Arc::new(Mutex::new(Vec::new()));
         let stream_buffer = shared_buffer.clone();
-        let player = CpalPlayer { buffer: shared_buffer, sample_rate: config.sample_rate.0 };
+        let player = CpalPlayer { buffer: shared_buffer, sample_rate: config.sample_rate };
 
         let stream = match sample_format {
             cpal::SampleFormat::I8 => device.build_output_stream(&config, move |d:&mut [i8], _| cpal_thread(d,&stream_buffer), err_fn, None),

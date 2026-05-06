@@ -267,16 +267,16 @@ impl ApplicationHandler for RootApp {
                     let mut menu_bar_height = 0.0;
                     egui_glium.run(window, |ctx| {
                         let top_panel = egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-                            egui::menu::bar(ui, |ui| {
+                            egui::MenuBar::new().ui(ui, |ui| {
                                 ui.menu_button("File", |ui| {
                                     ui.menu_button("Save State", |ui| {
-                                        for i in 1..=4 { if ui.button(format!("Slot {}", i)).clicked() { let _=sender.send(GBEvent::SaveState(i)); ui.close_menu(); } }
+                                        for i in 1..=4 { if ui.button(format!("Slot {}", i)).clicked() { let _=sender.send(GBEvent::SaveState(i)); ui.close(); } }
                                     });
                                     ui.menu_button("Load State", |ui| {
-                                        for i in 1..=4 { if ui.button(format!("Slot {}", i)).clicked() { let _=sender.send(GBEvent::LoadState(i)); ui.close_menu(); } }
+                                        for i in 1..=4 { if ui.button(format!("Slot {}", i)).clicked() { let _=sender.send(GBEvent::LoadState(i)); ui.close(); } }
                                     });
                                     ui.separator();
-                                    if ui.button("Quit").clicked() { *running=false; ui.close_menu(); }
+                                    if ui.button("Quit").clicked() { *running=false; ui.close(); }
                                 });
                                 ui.menu_button("Options", |ui| {
                                     ui.menu_button("Scale", |ui| {
