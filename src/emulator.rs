@@ -1,9 +1,9 @@
 //! High-level emulator orchestration: device construction, run loop & events.
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rust_gbe::device::Device;
+use rust_gbe::device::{Device, SaveStatePreview};
 
 // Global setting for additional periodic auto-save functionality
 static AUTO_SAVE_ENABLED: bool = false;
@@ -13,10 +13,18 @@ pub enum GBEvent {
     KeyDown(rust_gbe::KeypadKey),
     SpeedUp,
     SpeedDown,
-    SaveState(u8),
+    SaveState {
+        slot: u8,
+        thumbnail: Option<Arc<Vec<u8>>>,
+    },
     LoadState(u8),
     UpdateTurbo(crate::config::TurboSetting),
     UpdateVolume(f32), // master volume 0.0-1.0
+}
+
+pub enum GuiEvent {
+    SaveStateSaved { slot: u8, preview: SaveStatePreview },
+    SaveStateFailed { slot: u8 },
 }
 
 pub fn construct_cpu_auto(filename: &str) -> Option<Box<Device>> {
@@ -28,13 +36,21 @@ pub fn construct_cpu_auto(filename: &str) -> Option<Box<Device>> {
         Ok(cpu) => Some(Box::new(cpu)),
         Err(_) => match Device::new(filename, false, Some(save_state_str)) {
             Ok(cpu) => Some(Box::new(cpu)),
-            Err(msg) => { eprintln!("{}", msg); None }
-        }
+            Err(msg) => {
+                eprintln!("{}", msg);
+                None
+            }
+        },
     }
 }
 
 // Runs the emulation core loop. Sends video frames through a bounded channel.
-pub fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Arc<Vec<u8>>>, receiver: Receiver<GBEvent>) {
+pub fn run_cpu(
+    mut cpu: Box<Device>,
+    sender: SyncSender<Arc<Vec<u8>>>,
+    receiver: Receiver<GBEvent>,
+    ui_sender: Sender<GuiEvent>,
+) {
     // limit_speed: when true we pace at 1x (approx 60 FPS / 16ms per frame)
     // when false we apply turbo/slowmo pacing based on turbo_setting
     let mut limit_speed = true;
@@ -50,7 +66,10 @@ pub fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Arc<Vec<u8>>>, receiver:
 
     // Two reusable frame buffers; we only write to a buffer if it is uniquely held (strong_count==1).
     let frame_len = cpu.get_gpu_data().len();
-    let mut frame_buffers = [Arc::new(vec![0u8; frame_len]), Arc::new(vec![0u8; frame_len])];
+    let mut frame_buffers = [
+        Arc::new(vec![0u8; frame_len]),
+        Arc::new(vec![0u8; frame_len]),
+    ];
     let mut next_fb = 0usize;
 
     'outer: loop {
@@ -67,8 +86,12 @@ pub fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Arc<Vec<u8>>>, receiver:
                         let src = cpu.get_gpu_data();
                         buf_mut.copy_from_slice(src);
                         match sender.try_send(frame_buffers[idx].clone()) {
-                            Ok(_) => { next_fb = (idx + 1) % frame_buffers.len(); }
-                            Err(TrySendError::Disconnected(..)) => { break 'outer; }
+                            Ok(_) => {
+                                next_fb = (idx + 1) % frame_buffers.len();
+                            }
+                            Err(TrySendError::Disconnected(..)) => {
+                                break 'outer;
+                            }
                             Err(TrySendError::Full(_)) => { /* Drop frame if receiver busy */ }
                         }
                         break;
@@ -81,19 +104,55 @@ pub fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Arc<Vec<u8>>>, receiver:
 
         if cpu.check_and_reset_ram_updated() {
             if cpu.save_battery_ram_silent().is_ok() {}
-            ram_needs_save = false; last_ram_save_frame = frame_count;
+            ram_needs_save = false;
+            last_ram_save_frame = frame_count;
         }
         if AUTO_SAVE_ENABLED && ram_needs_save && (frame_count - last_ram_save_frame) > 180 {
-            if cpu.save_battery_ram_silent().is_ok() { ram_needs_save = false; }
+            if cpu.save_battery_ram_silent().is_ok() {
+                ram_needs_save = false;
+            }
         }
 
-        'recv: loop { match receiver.try_recv() { Ok(ev)=>match ev {
-            GBEvent::KeyUp(k)=>cpu.keyup(k), GBEvent::KeyDown(k)=>cpu.keydown(k), GBEvent::SpeedUp=>limit_speed=false,
-            GBEvent::SpeedDown=>{limit_speed=true; cpu.sync_audio();}, GBEvent::SaveState(s)=>{println!("Attempting to save state to slot {}...",s); if let Err(e)=cpu.save_state_slot(s){eprintln!("Failed to save state to slot {}: {}",s,e);} },
-            GBEvent::LoadState(s)=>{println!("Attempting to load state from slot {}...",s); if let Err(e)=cpu.load_state_slot(s){eprintln!("Failed to load state from slot {}: {}",s,e);} },
-            GBEvent::UpdateTurbo(ts)=>{ turbo_setting = ts; },
-            GBEvent::UpdateVolume(v)=>{ cpu.set_master_volume(v); },
-        }, Err(TryRecvError::Empty)=>break 'recv, Err(TryRecvError::Disconnected)=>break 'outer } }
+        'recv: loop {
+            match receiver.try_recv() {
+                Ok(ev) => match ev {
+                    GBEvent::KeyUp(k) => cpu.keyup(k),
+                    GBEvent::KeyDown(k) => cpu.keydown(k),
+                    GBEvent::SpeedUp => limit_speed = false,
+                    GBEvent::SpeedDown => {
+                        limit_speed = true;
+                        cpu.sync_audio();
+                    }
+                    GBEvent::SaveState { slot, thumbnail } => {
+                        println!("Attempting to save state to slot {}...", slot);
+                        let thumbnail = thumbnail.as_deref().map(Vec::as_slice);
+                        match cpu.save_state_slot(slot, thumbnail) {
+                            Ok(preview) => {
+                                let _ = ui_sender.send(GuiEvent::SaveStateSaved { slot, preview });
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to save state to slot {}: {}", slot, e);
+                                let _ = ui_sender.send(GuiEvent::SaveStateFailed { slot });
+                            }
+                        }
+                    }
+                    GBEvent::LoadState(s) => {
+                        println!("Attempting to load state from slot {}...", s);
+                        if let Err(e) = cpu.load_state_slot(s) {
+                            eprintln!("Failed to load state from slot {}: {}", s, e);
+                        }
+                    }
+                    GBEvent::UpdateTurbo(ts) => {
+                        turbo_setting = ts;
+                    }
+                    GBEvent::UpdateVolume(v) => {
+                        cpu.set_master_volume(v);
+                    }
+                },
+                Err(TryRecvError::Empty) => break 'recv,
+                Err(TryRecvError::Disconnected) => break 'outer,
+            }
+        }
 
         // Timing / pacing
         let target_frame_ms = if limit_speed {
@@ -114,7 +173,9 @@ pub fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Arc<Vec<u8>>>, receiver:
             }
         } else {
             // Uncapped: still yield occasionally to avoid starving other threads
-            if frame_count % 120 == 0 { std::thread::yield_now(); }
+            if frame_count % 120 == 0 {
+                std::thread::yield_now();
+            }
         }
         last_frame_instant = Instant::now();
     }

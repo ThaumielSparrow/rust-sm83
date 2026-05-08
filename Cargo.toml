@@ -15,6 +15,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 blip_buf = "0.1.6"
 rkyv = { version = "0.8.16", features = ["little_endian", "unaligned", "pointer_width_32"] }
+time = { version = "0.3.47", features = ["formatting", "local-offset"] }
 
 [profile.dev]
 debug = "line-tables-only"
