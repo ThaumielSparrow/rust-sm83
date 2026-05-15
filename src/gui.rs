@@ -495,6 +495,7 @@ impl ApplicationHandler for RootApp {
                 {
                     // Get the menu bar height first
                     let mut menu_bar_height = 0.0;
+                    let mut quit_requested = false;
                     egui_glium.run(window, |ctx| {
                         let top_panel = egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
                             egui::MenuBar::new().ui(ui, |ui| {
@@ -503,7 +504,10 @@ impl ApplicationHandler for RootApp {
                                         show_states_menu(ui, sender, save_slots, latest_frame);
                                     });
                                     ui.separator();
-                                    if ui.button("Quit").clicked() { *running=false; ui.close(); }
+                                    if ui.button("Quit").clicked() {
+                                        quit_requested = true;
+                                        ui.close();
+                                    }
                                 });
                                 ui.menu_button("Options", |ui| {
                                     ui.menu_button("Scale", |ui| {
@@ -564,6 +568,9 @@ impl ApplicationHandler for RootApp {
                             });
                         }
                     });
+                    if quit_requested {
+                        *running = false;
+                    }
 
                     // Draw game texture with offset for menu bar
                     use glium::Surface;
@@ -597,6 +604,11 @@ impl ApplicationHandler for RootApp {
                     // Paint egui on top
                     egui_glium.paint(display, &mut target);
                     let _ = target.finish();
+
+                    if quit_requested {
+                        event_loop.exit();
+                        return;
+                    }
                 }
                 // Drain any queued frames and upload
                 loop {
