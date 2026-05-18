@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use cpal::Stream;
@@ -11,7 +12,8 @@ use time::{Month, OffsetDateTime, UtcOffset};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
-use winit::window::WindowId;
+use winit::keyboard::ModifiersState;
+use winit::window::{Fullscreen, WindowId};
 
 pub const EXITCODE_SUCCESS: i32 = 0;
 pub const EXITCODE_CPULOADFAILS: i32 = 2;
@@ -22,9 +24,10 @@ pub struct RenderOptions {
 }
 
 use crate::audio::init_audio;
-use crate::config::{binding_value, config_path, Config, KeyBindings, TurboSetting};
+use crate::config::{binding_value, config_path, Config, DmgPalettePreset, KeyBindings, TurboSetting};
 use crate::emulator::{construct_cpu_auto, run_cpu, GBEvent, GuiEvent};
 use crate::input::is_reserved_key_name;
+use crate::palette::{apply_dmg_palette, palette_for_preset, DmgPalette};
 
 struct SaveSlotUi {
     slot: u8,
@@ -81,6 +84,39 @@ impl SaveSlotCache {
     }
 }
 
+struct FpsMeter {
+    times: VecDeque<Instant>,
+    cap: usize,
+}
+
+impl FpsMeter {
+    fn new() -> Self {
+        Self { times: VecDeque::with_capacity(120), cap: 120 }
+    }
+    fn record(&mut self) {
+        if self.times.len() == self.cap {
+            self.times.pop_front();
+        }
+        self.times.push_back(Instant::now());
+    }
+    fn fps(&self) -> f32 {
+        if self.times.len() < 2 {
+            return 0.0;
+        }
+        let span = self
+            .times
+            .back()
+            .unwrap()
+            .duration_since(*self.times.front().unwrap())
+            .as_secs_f32();
+        if span <= 0.0 {
+            0.0
+        } else {
+            (self.times.len() - 1) as f32 / span
+        }
+    }
+}
+
 // Unified state machine for ROM selection and emulator run to ensure a single EventLoop
 enum RootPhase {
     Selecting {
@@ -108,7 +144,27 @@ enum RootPhase {
         turbo_held: bool,
         turbo_setting: TurboSetting,
         volume: u8,
+        rom_path: PathBuf,
+        is_color: bool,
+        emu_thread: Option<JoinHandle<()>>,
+        modifiers: ModifiersState,
+        paused: bool,
+        pre_mute_volume: Option<u8>,
+        fullscreen: bool,
+        fps_overlay: bool,
+        fps_meter: FpsMeter,
+        dmg_palette_preset: DmgPalettePreset,
+        dmg_palette_custom: [[u8; 3]; 4],
+        // Scratch buffer reused across frames for host-side palette mapping in DMG mode.
+        palette_scratch: Vec<u8>,
     },
+}
+
+/// Actions requested while the emulator phase is mutably borrowed, deferred until
+/// after the borrow ends so they can call `&mut self` methods (stop_emulator, start_game_from_path).
+enum PendingAction {
+    Reset,
+    LoadRom(PathBuf),
 }
 
 pub struct RootApp {
@@ -116,13 +172,14 @@ pub struct RootApp {
     display: Option<glium::Display<glium::glutin::surface::WindowSurface>>,
     egui_glium: Option<egui_glium::EguiGlium>,
     phase: RootPhase,
-    // future GUI settings could go here
     scale: u32,
+    pending_rom: Option<PathBuf>,
+    pending_action: Option<PendingAction>,
     pub exit_code: i32,
 }
 
 impl RootApp {
-    pub fn new(scale: u32) -> Self {
+    pub fn new(scale: u32, pending_rom: Option<PathBuf>) -> Self {
         let default_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_string_lossy().to_string()))
@@ -137,15 +194,42 @@ impl RootApp {
                 browse_requested: false,
             },
             scale,
+            pending_rom,
+            pending_action: None,
             exit_code: EXITCODE_SUCCESS,
         }
     }
 
-    fn start_game(&mut self, filename: String) {
+    /// Drains any deferred actions set during a phase borrow. Called at the end of
+    /// each window_event so reset / open-recent can call mutating methods on self.
+    fn drain_pending_action(&mut self) {
+        let action = self.pending_action.take();
+        match action {
+            Some(PendingAction::Reset) => {
+                let path = match &self.phase {
+                    RootPhase::Running { rom_path, .. } => Some(rom_path.clone()),
+                    _ => None,
+                };
+                if let Some(p) = path {
+                    self.stop_emulator();
+                    self.start_game_from_path(p);
+                }
+            }
+            Some(PendingAction::LoadRom(p)) => {
+                if let RootPhase::Running { .. } = &self.phase {
+                    self.stop_emulator();
+                }
+                self.start_game_from_path(p);
+            }
+            None => {}
+        }
+    }
+
+    fn start_game_from_path(&mut self, rom_path: PathBuf) {
         // Always run in (CGB-capable) mode; attempt CGB first, fallback to classic if needed.
-        let cpu = construct_cpu_auto(&filename);
-        let mut cpu = match cpu {
-            Some(c) => c,
+        let filename = rom_path.to_string_lossy().to_string();
+        let (mut cpu, is_color) = match construct_cpu_auto(&filename) {
+            Some(pair) => pair,
             None => {
                 self.exit_code = EXITCODE_CPULOADFAILS;
                 return;
@@ -169,7 +253,7 @@ impl RootApp {
         let (frame_sender, frame_receiver) = mpsc::sync_channel(1);
         let (ui_sender, ui_receiver) = mpsc::channel();
         let frame_sender_clone = frame_sender.clone();
-        thread::spawn(move || run_cpu(cpu, frame_sender_clone, recv_events, ui_sender));
+        let emu_thread = thread::spawn(move || run_cpu(cpu, frame_sender_clone, recv_events, ui_sender));
         if let Some(display) = &self.display {
             let texture = glium::texture::texture2d::Texture2d::empty_with_format(
                 display,
@@ -181,10 +265,11 @@ impl RootApp {
             .unwrap();
             let cfg = Config::load(&config_path());
             let initial_scale = cfg.scale;
-            if let Some(win) = &self.window {
-                set_window_size(win, initial_scale);
-            }
             self.scale = initial_scale;
+
+            // Push to recent ROMs.
+            crate::config::update_config(|c| c.push_recent(&rom_path));
+
             self.phase = RootPhase::Running {
                 texture,
                 sender,
@@ -194,7 +279,7 @@ impl RootApp {
                 latest_frame: None,
                 renderoptions: RenderOptions::default(),
                 running: true,
-                keybindings: cfg.keybindings,
+                keybindings: cfg.keybindings.clone(),
                 capturing: None,
                 _audio: audio_stream,
                 show_keybindings_window: false,
@@ -203,21 +288,63 @@ impl RootApp {
                 turbo_held: false,
                 turbo_setting: cfg.turbo,
                 volume: cfg.volume,
+                rom_path,
+                is_color,
+                emu_thread: Some(emu_thread),
+                modifiers: ModifiersState::empty(),
+                paused: false,
+                pre_mute_volume: None,
+                fullscreen: cfg.fullscreen,
+                fps_overlay: cfg.fps_overlay,
+                fps_meter: FpsMeter::new(),
+                dmg_palette_preset: cfg.dmg_palette_preset,
+                dmg_palette_custom: cfg.dmg_palette_custom,
+                palette_scratch: Vec::new(),
             };
             if let RootPhase::Running { sender, .. } = &self.phase {
                 let _ = sender.send(GBEvent::UpdateTurbo(cfg.turbo));
+                let _ = sender.send(GBEvent::UpdateVolume(perceptual_to_linear(cfg.volume)));
             }
-            if let RootPhase::Running { sender, volume, .. } = &self.phase {
-                let _ = sender.send(GBEvent::UpdateVolume(perceptual_to_linear(*volume)));
-            }
-            // Now that we've transitioned to Running, resize window to game resolution * scale.
+            // Now that we've transitioned to Running, resize/configure window.
             if let Some(win) = &self.window {
-                set_window_size(win, self.scale);
+                apply_window_mode(win, self.scale, cfg.fullscreen);
             }
         } else {
             self.exit_code = EXITCODE_CPULOADFAILS;
         }
     }
+
+    /// Send Shutdown to the emulator worker and join its thread. Leaves `self.phase`
+    /// in `Running` (with `emu_thread = None`) so the caller can immediately transition
+    /// to a new phase (Selecting or another Running via `start_game_from_path`).
+    fn stop_emulator(&mut self) {
+        let handle = match &mut self.phase {
+            RootPhase::Running { sender, emu_thread, .. } => {
+                let _ = sender.send(GBEvent::Shutdown);
+                emu_thread.take()
+            }
+            _ => None,
+        };
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
+    }
+}
+
+fn apply_window_mode(window: &winit::window::Window, scale: u32, fullscreen: bool) {
+    if fullscreen {
+        window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+    } else {
+        window.set_fullscreen(None);
+        set_window_size(window, scale);
+    }
+}
+
+fn rom_path_is_supported(p: &Path) -> bool {
+    matches!(
+        p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()),
+        Some(ref ext) if ext == "gb" || ext == "gbc"
+    )
 }
 
 impl ApplicationHandler for RootApp {
@@ -234,6 +361,10 @@ impl ApplicationHandler for RootApp {
             self.window = Some(Arc::new(window));
             if let Some(w) = &self.window {
                 w.request_redraw();
+            }
+            // If a ROM path was supplied on the command line, skip the file picker.
+            if let Some(p) = self.pending_rom.take() {
+                self.start_game_from_path(p);
             }
         }
     }
@@ -282,8 +413,9 @@ impl ApplicationHandler for RootApp {
                         *rom_path = p.to_string_lossy().to_string();
                     }
                 }
-                let mut launch_filename: Option<String> = None;
+                let mut launch_path: Option<PathBuf> = None;
                 let mut quit_requested = false;
+                let recent_roms = Config::load(&config_path()).recent_roms;
                 if let (Some(window), Some(display), Some(egui_glium)) =
                     (&self.window, &self.display, &mut self.egui_glium)
                 {
@@ -301,8 +433,9 @@ impl ApplicationHandler for RootApp {
                             });
                             ui.add_space(8.0);
                             if ui.button("Load ROM").clicked() {
-                                if std::path::Path::new(&rom_path).exists() {
-                                    launch_filename = Some(rom_path.clone());
+                                let p = PathBuf::from(&*rom_path);
+                                if p.is_file() {
+                                    launch_path = Some(p);
                                 }
                             }
                             if ui.button("Quit").clicked() {
@@ -319,6 +452,28 @@ impl ApplicationHandler for RootApp {
                             } else {
                                 ui.colored_label(egui::Color32::GREEN, "Path OK");
                             }
+                            if !recent_roms.is_empty() {
+                                ui.add_space(10.0);
+                                ui.label("Recent ROMs:");
+                                for entry in &recent_roms {
+                                    let label = std::path::Path::new(entry)
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| entry.clone());
+                                    if ui
+                                        .button(format!("{}  —  {}", label, entry))
+                                        .on_hover_text(entry)
+                                        .clicked()
+                                    {
+                                        let p = PathBuf::from(entry);
+                                        if p.is_file() {
+                                            launch_path = Some(p);
+                                        }
+                                    }
+                                }
+                            }
+                            ui.add_space(8.0);
+                            ui.label("Tip: drag a .gb/.gbc file onto this window to load it.");
                         });
                     });
                     // Paint after UI
@@ -327,13 +482,30 @@ impl ApplicationHandler for RootApp {
                     egui_glium.paint(display, &mut target);
                     let _ = target.finish();
                 }
-                if let Some(f) = launch_filename {
-                    self.start_game(f);
+                if let Some(p) = launch_path {
+                    self.start_game_from_path(p);
                 }
                 if quit_requested {
                     self.exit_code = EXITCODE_CPULOADFAILS;
                     event_loop.exit();
                 }
+            }
+            // Drag-and-drop ROM into the Selecting screen.
+            (
+                RootPhase::Selecting { rom_path, .. },
+                WindowEvent::DroppedFile(path),
+            ) => {
+                if rom_path_is_supported(&path) && path.is_file() {
+                    *rom_path = path.to_string_lossy().into_owned();
+                    self.start_game_from_path(path);
+                }
+            }
+            // Track modifier state so chords like Ctrl+R work.
+            (
+                RootPhase::Running { modifiers, .. },
+                WindowEvent::ModifiersChanged(new_mods),
+            ) => {
+                *modifiers = new_mods.state();
             }
             // ESC double-press logic: require two presses within ESC_DOUBLE_PRESS_MS to exit.
             (
@@ -349,8 +521,12 @@ impl ApplicationHandler for RootApp {
                     last_escape,
                     turbo_toggle,
                     turbo_held,
-                    turbo_setting,
                     volume,
+                    modifiers,
+                    paused,
+                    pre_mute_volume,
+                    fullscreen,
+                    fps_overlay,
                     ..
                 },
                 WindowEvent::KeyboardInput {
@@ -378,18 +554,16 @@ impl ApplicationHandler for RootApp {
                             rust_gbe::KeypadKey::Right => keybindings.right = value.clone(),
                         }
                         *capturing = None;
-                        // Persist current turbo setting along with keybindings
-                        let cfg = Config {
-                            keybindings: keybindings.clone(),
-                            scale: self.scale,
-                            turbo: *turbo_setting,
-                            volume: *volume,
-                        };
-                        cfg.save(&config_path());
+                        let bindings_clone = keybindings.clone();
+                        crate::config::update_config(|c| c.keybindings = bindings_clone);
                     }
                     return; // don't treat as game input
                 }
-                if let Some(action) = crate::input::system_action_for(&logical.as_ref(), state) {
+                // System action dispatch. Reset and ToggleFullscreen need post-match handling
+                // (a method call or window mutation) once the &mut self.phase borrow is released.
+                let mut request_reset = false;
+                let mut apply_fs_now = false;
+                if let Some(action) = crate::input::system_action_for(&logical.as_ref(), state, *modifiers) {
                     use crate::input::SystemAction;
                     match action {
                         SystemAction::SaveState(s) => {
@@ -422,9 +596,48 @@ impl ApplicationHandler for RootApp {
                             }
                         }
                         SystemAction::ToggleInterpolation => {
-                            renderoptions.linear_interpolation =
-                                !renderoptions.linear_interpolation;
+                            renderoptions.linear_interpolation = !renderoptions.linear_interpolation;
                         }
+                        SystemAction::TogglePause => {
+                            *paused = !*paused;
+                            let _ = sender.send(GBEvent::SetPaused(*paused));
+                        }
+                        SystemAction::Reset => {
+                            request_reset = true;
+                        }
+                        SystemAction::ToggleFullscreen => {
+                            *fullscreen = !*fullscreen;
+                            let fs = *fullscreen;
+                            crate::config::update_config(|c| c.fullscreen = fs);
+                            apply_fs_now = true;
+                        }
+                        SystemAction::ToggleMute => {
+                            if let Some(restored) = pre_mute_volume.take() {
+                                *volume = restored;
+                            } else {
+                                *pre_mute_volume = Some(*volume);
+                                *volume = 0;
+                            }
+                            let _ = sender.send(GBEvent::UpdateVolume(perceptual_to_linear(*volume)));
+                            let v = *volume;
+                            crate::config::update_config(|c| c.volume = v);
+                        }
+                        SystemAction::ToggleFpsOverlay => {
+                            *fps_overlay = !*fps_overlay;
+                            let on = *fps_overlay;
+                            crate::config::update_config(|c| c.fps_overlay = on);
+                        }
+                    }
+                    // Snapshot values we'll need outside the phase borrow.
+                    let fs = *fullscreen;
+                    let sc = self.scale;
+                    if apply_fs_now {
+                        if let Some(win) = &self.window {
+                            apply_window_mode(win, sc, fs);
+                        }
+                    }
+                    if request_reset {
+                        self.pending_action = Some(PendingAction::Reset);
                     }
                     return;
                 }
@@ -482,6 +695,15 @@ impl ApplicationHandler for RootApp {
                     turbo_toggle,
                     turbo_setting,
                     volume,
+                    paused,
+                    fullscreen,
+                    fps_overlay,
+                    fps_meter,
+                    dmg_palette_preset,
+                    dmg_palette_custom,
+                    is_color,
+                    palette_scratch,
+                    pre_mute_volume,
                     ..
                 },
                 WindowEvent::RedrawRequested,
@@ -490,12 +712,19 @@ impl ApplicationHandler for RootApp {
                     return;
                 }
                 drain_gui_events(ui_receiver, save_slots);
+                // Deferred actions set inside the egui closure or below, applied after the borrow ends.
+                let mut quit_requested = false;
+                let mut reset_clicked = false;
+                let mut open_recent: Option<PathBuf> = None;
+                let mut new_scale: Option<u32> = None;
+                let mut apply_fullscreen_now = false;
+                let recent_roms = Config::load(&config_path()).recent_roms;
                 if let (Some(display), Some(window), Some(egui_glium)) =
                     (&self.display, &self.window, &mut self.egui_glium)
                 {
-                    // Get the menu bar height first
                     let mut menu_bar_height = 0.0;
-                    let mut quit_requested = false;
+                    let is_color_ro = *is_color;
+                    let cur_scale = self.scale;
                     egui_glium.run(window, |ctx| {
                         let top_panel = egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
                             egui::MenuBar::new().ui(ui, |ui| {
@@ -503,17 +732,97 @@ impl ApplicationHandler for RootApp {
                                     ui.menu_button("States", |ui| {
                                         show_states_menu(ui, sender, save_slots, latest_frame);
                                     });
+                                    ui.add_enabled_ui(!recent_roms.is_empty(), |ui| {
+                                        ui.menu_button("Open Recent", |ui| {
+                                            for entry in &recent_roms {
+                                                let label = std::path::Path::new(entry)
+                                                    .file_name()
+                                                    .map(|n| n.to_string_lossy().into_owned())
+                                                    .unwrap_or_else(|| entry.clone());
+                                                if ui.button(label).on_hover_text(entry).clicked() {
+                                                    open_recent = Some(PathBuf::from(entry));
+                                                    ui.close();
+                                                }
+                                            }
+                                        });
+                                    });
                                     ui.separator();
                                     if ui.button("Quit").clicked() {
                                         quit_requested = true;
                                         ui.close();
                                     }
                                 });
-                                ui.menu_button("Options", |ui| {
-                                    ui.menu_button("Scale", |ui| {
-                                        for s in 1..=4 { let selected = self.scale == s; if ui.radio(selected, format!("{}x", s)).clicked() { self.scale = s; set_window_size(window, s); let cfg = Config { keybindings: keybindings.clone(), scale: self.scale, turbo: *turbo_setting, volume: *volume }; cfg.save(&config_path()); } }
+                                ui.menu_button("Emulation", |ui| {
+                                    if ui.checkbox(paused, "Pause (P)").changed() {
+                                        let _ = sender.send(GBEvent::SetPaused(*paused));
+                                    }
+                                    if ui.button("Reset (Ctrl+R)").clicked() {
+                                        reset_clicked = true;
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    ui.menu_button("Turbo Speed", |ui| {
+                                        for ts in TurboSetting::all() {
+                                            let selected = *turbo_setting == *ts;
+                                            if ui.radio(selected, ts.label()).clicked() {
+                                                *turbo_setting = *ts;
+                                                let ts_now = *ts;
+                                                crate::config::update_config(|c| c.turbo = ts_now);
+                                                let _ = sender.send(GBEvent::UpdateTurbo(*ts));
+                                            }
+                                        }
                                     });
-                                    // Volume slider (0-100) with perceptual scaling. 50 should feel ~half as loud.
+                                    ui.checkbox(turbo_toggle, "Turbo Enabled (T)");
+                                });
+                                ui.menu_button("Display", |ui| {
+                                    if ui.checkbox(fullscreen, "Fullscreen (F11)").changed() {
+                                        apply_fullscreen_now = true;
+                                        let fs = *fullscreen;
+                                        crate::config::update_config(|c| c.fullscreen = fs);
+                                    }
+                                    ui.menu_button("Scale", |ui| {
+                                        for s in 1..=4 {
+                                            let selected = cur_scale == s;
+                                            if ui.radio(selected, format!("{}x", s)).clicked() {
+                                                new_scale = Some(s);
+                                            }
+                                        }
+                                    });
+                                    ui.separator();
+                                    ui.checkbox(&mut renderoptions.linear_interpolation, "Linear interpolation (Y)");
+                                    ui.add_enabled_ui(!is_color_ro, |ui| {
+                                        ui.menu_button("DMG Palette", |ui| {
+                                            for preset in DmgPalettePreset::all() {
+                                                let selected = *dmg_palette_preset == *preset;
+                                                if ui.radio(selected, preset.label()).clicked() {
+                                                    *dmg_palette_preset = *preset;
+                                                    let p = *preset;
+                                                    crate::config::update_config(|c| c.dmg_palette_preset = p);
+                                                }
+                                            }
+                                            ui.separator();
+                                            ui.label("Custom shades (lightest → darkest):");
+                                            let mut custom_changed = false;
+                                            for i in 0..4 {
+                                                let mut rgb = dmg_palette_custom[i];
+                                                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                                    dmg_palette_custom[i] = rgb;
+                                                    custom_changed = true;
+                                                }
+                                            }
+                                            if custom_changed {
+                                                let pal = *dmg_palette_custom;
+                                                crate::config::update_config(|c| c.dmg_palette_custom = pal);
+                                            }
+                                        });
+                                    });
+                                    ui.separator();
+                                    if ui.checkbox(fps_overlay, "Show FPS (F9)").changed() {
+                                        let on = *fps_overlay;
+                                        crate::config::update_config(|c| c.fps_overlay = on);
+                                    }
+                                });
+                                ui.menu_button("Settings", |ui| {
                                     ui.horizontal(|ui| {
                                         ui.label("Volume");
                                         let mut v = *volume as i32;
@@ -522,25 +831,42 @@ impl ApplicationHandler for RootApp {
                                             *volume = v as u8;
                                             let lin = perceptual_to_linear(*volume);
                                             let _ = sender.send(GBEvent::UpdateVolume(lin));
-                                            let cfg = Config { keybindings: keybindings.clone(), scale: self.scale, turbo: *turbo_setting, volume: *volume }; cfg.save(&config_path());
+                                            let vol_now = *volume;
+                                            crate::config::update_config(|c| c.volume = vol_now);
                                         }
                                         ui.label(format!("{}%", *volume));
                                     });
-                                    ui.menu_button("Turbo Speed", |ui| {
-                                        for ts in TurboSetting::all() {
-                                            let selected = *turbo_setting == *ts;
-                                            if ui.radio(selected, ts.label()).clicked() {
-                                                *turbo_setting = *ts; let cfg = Config { keybindings: keybindings.clone(), scale: self.scale, turbo: *turbo_setting, volume: *volume }; cfg.save(&config_path());
-                                                let _ = sender.send(GBEvent::UpdateTurbo(*ts));
-                                            }
+                                    if ui.button("Mute (M)").clicked() {
+                                        if let Some(restored) = pre_mute_volume.take() {
+                                            *volume = restored;
+                                        } else {
+                                            *pre_mute_volume = Some(*volume);
+                                            *volume = 0;
                                         }
-                                    });
-                                    ui.checkbox(turbo_toggle, "Turbo Enabled (T)");
+                                        let _ = sender.send(GBEvent::UpdateVolume(perceptual_to_linear(*volume)));
+                                        let v = *volume;
+                                        crate::config::update_config(|c| c.volume = v);
+                                    }
+                                    ui.separator();
                                     if ui.button("Keybindings...").clicked() { *show_keybindings_window = true; }
                                 });
                             });
                         });
                         menu_bar_height = top_panel.response.rect.height();
+
+                        if *fps_overlay {
+                            let fps = fps_meter.fps();
+                            egui::Area::new(egui::Id::new("fps_overlay"))
+                                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, menu_bar_height + 4.0))
+                                .show(ctx, |ui| {
+                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                        ui.label(format!("{:.0} FPS · {}", fps, turbo_setting.label()));
+                                        if *paused {
+                                            ui.colored_label(egui::Color32::LIGHT_YELLOW, "PAUSED");
+                                        }
+                                    });
+                                });
+                        }
 
                         if *show_keybindings_window {
                             egui::Window::new("Keybindings").open(show_keybindings_window).show(ctx, |ui| {
@@ -607,14 +933,16 @@ impl ApplicationHandler for RootApp {
 
                     if quit_requested {
                         event_loop.exit();
-                        return;
                     }
                 }
-                // Drain any queued frames and upload
+                // Drain any queued frames and upload (palette-mapped for DMG).
+                let palette_now = palette_for_preset(*dmg_palette_preset, dmg_palette_custom);
+                let needs_palette = !*is_color;
                 loop {
                     match receiver.try_recv() {
                         Ok(data) => {
-                            upload_screen(texture, &data);
+                            fps_meter.record();
+                            upload_frame_with_palette(texture, &data, needs_palette, &palette_now, palette_scratch);
                             *latest_frame = Some(data);
                         }
                         Err(TryRecvError::Empty) => break,
@@ -625,6 +953,36 @@ impl ApplicationHandler for RootApp {
                         }
                     }
                 }
+                // Apply deferred actions that need &mut self (scale change, fullscreen retoggle from menu).
+                if let Some(s) = new_scale {
+                    self.scale = s;
+                    crate::config::update_config(|c| c.scale = s);
+                    let fs = if let RootPhase::Running { fullscreen, .. } = &self.phase { *fullscreen } else { false };
+                    if let Some(win) = &self.window {
+                        apply_window_mode(win, s, fs);
+                    }
+                }
+                if apply_fullscreen_now {
+                    let fs = if let RootPhase::Running { fullscreen, .. } = &self.phase { *fullscreen } else { false };
+                    if let Some(win) = &self.window {
+                        apply_window_mode(win, self.scale, fs);
+                    }
+                }
+                if reset_clicked {
+                    self.pending_action = Some(PendingAction::Reset);
+                }
+                if let Some(p) = open_recent {
+                    self.pending_action = Some(PendingAction::LoadRom(p));
+                }
+            }
+            // Drag-and-drop a ROM onto the running emulator: tear down and load the new one.
+            (
+                RootPhase::Running { .. },
+                WindowEvent::DroppedFile(path),
+            ) => {
+                if rom_path_is_supported(&path) && path.is_file() {
+                    self.pending_action = Some(PendingAction::LoadRom(path));
+                }
             }
             _ => {
                 if let Some(w) = &self.window {
@@ -632,6 +990,8 @@ impl ApplicationHandler for RootApp {
                 }
             }
         }
+        // Process any deferred mutating actions queued during a phase borrow.
+        self.drain_pending_action();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -642,6 +1002,11 @@ impl ApplicationHandler for RootApp {
             latest_frame,
             texture,
             running,
+            fps_meter,
+            is_color,
+            dmg_palette_preset,
+            dmg_palette_custom,
+            palette_scratch,
             ..
         } = &mut self.phase
         {
@@ -649,9 +1014,12 @@ impl ApplicationHandler for RootApp {
                 return;
             }
             drain_gui_events(ui_receiver, save_slots);
+            let palette_now = palette_for_preset(*dmg_palette_preset, dmg_palette_custom);
+            let needs_palette = !*is_color;
             match receiver.try_recv() {
                 Ok(data) => {
-                    upload_screen(texture, &data);
+                    fps_meter.record();
+                    upload_frame_with_palette(texture, &data, needs_palette, &palette_now, palette_scratch);
                     *latest_frame = Some(data);
                     if let Some(w) = &self.window {
                         w.request_redraw();
@@ -957,6 +1325,25 @@ fn upload_screen(texture: &mut glium::texture::texture2d::Texture2d, datavec: &[
         },
         rawimage2d,
     );
+}
+
+/// If `apply` is true, remap the four DMG grayscale shades in `datavec` via `pal` using `scratch`
+/// as a reusable buffer; otherwise upload the bytes directly.
+fn upload_frame_with_palette(
+    texture: &mut glium::texture::texture2d::Texture2d,
+    datavec: &[u8],
+    apply: bool,
+    pal: &DmgPalette,
+    scratch: &mut Vec<u8>,
+) {
+    if apply {
+        scratch.clear();
+        scratch.extend_from_slice(datavec);
+        apply_dmg_palette(scratch, pal);
+        upload_screen(texture, scratch);
+    } else {
+        upload_screen(texture, datavec);
+    }
 }
 
 fn warn(message: &str) {

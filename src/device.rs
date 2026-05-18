@@ -577,6 +577,10 @@ impl Device {
         self.cpu.mmu.mbc.romname()
     }
 
+    pub fn is_cgb_mode(&self) -> bool {
+        self.cpu.mmu.gbmode == GbMode::Color
+    }
+
     pub fn loadram(&mut self, ramdata: &[u8]) -> StrResult<()> {
         self.cpu.mmu.mbc.loadram(ramdata)
     }

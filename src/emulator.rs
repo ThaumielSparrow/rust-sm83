@@ -20,6 +20,8 @@ pub enum GBEvent {
     LoadState(u8),
     UpdateTurbo(crate::config::TurboSetting),
     UpdateVolume(f32), // master volume 0.0-1.0
+    SetPaused(bool),
+    Shutdown,
 }
 
 pub enum GuiEvent {
@@ -27,15 +29,21 @@ pub enum GuiEvent {
     SaveStateFailed { slot: u8 },
 }
 
-pub fn construct_cpu_auto(filename: &str) -> Option<Box<Device>> {
+pub fn construct_cpu_auto(filename: &str) -> Option<(Box<Device>, bool)> {
     let rom_path = std::path::Path::new(filename);
     let save_state_path = rom_path.with_extension("state");
     let save_state_str = save_state_path.to_string_lossy().to_string();
     // Try CGB first, fallback to classic
     match Device::new_cgb(filename, false, Some(save_state_str.clone())) {
-        Ok(cpu) => Some(Box::new(cpu)),
+        Ok(cpu) => {
+            let is_color = cpu.is_cgb_mode();
+            Some((Box::new(cpu), is_color))
+        }
         Err(_) => match Device::new(filename, false, Some(save_state_str)) {
-            Ok(cpu) => Some(Box::new(cpu)),
+            Ok(cpu) => {
+                let is_color = cpu.is_cgb_mode();
+                Some((Box::new(cpu), is_color))
+            }
             Err(msg) => {
                 eprintln!("{}", msg);
                 None
@@ -57,6 +65,7 @@ pub fn run_cpu(
     // Will be updated from GUI shortly after thread spawn; start with Double as fallback
     let mut turbo_setting = crate::config::TurboSetting::Double;
     let mut last_frame_instant = Instant::now();
+    let mut paused = false;
 
     let base_waitticks = (4_194_304f64 / 1000.0 * 16.0).round() as u32; // ~16ms frame chunk
     let mut ticks = 0;
@@ -73,9 +82,9 @@ pub fn run_cpu(
     let mut next_fb = 0usize;
 
     'outer: loop {
-        // Always execute at least one frame worth of cycles.
+        // Always execute at least one frame worth of cycles (unless paused).
         let frame_target = base_waitticks;
-        while ticks < frame_target {
+        while !paused && ticks < frame_target {
             ticks += cpu.do_cycle();
             if cpu.check_and_reset_gpu_updated() {
                 // Try to find a free (uniquely owned) buffer to copy into.
@@ -99,18 +108,23 @@ pub fn run_cpu(
                 }
             }
         }
-        ticks -= frame_target;
-        frame_count += 1;
+        if !paused {
+            ticks -= frame_target;
+            frame_count += 1;
 
-        if cpu.check_and_reset_ram_updated() {
-            if cpu.save_battery_ram_silent().is_ok() {}
-            ram_needs_save = false;
-            last_ram_save_frame = frame_count;
-        }
-        if AUTO_SAVE_ENABLED && ram_needs_save && (frame_count - last_ram_save_frame) > 180 {
-            if cpu.save_battery_ram_silent().is_ok() {
+            if cpu.check_and_reset_ram_updated() {
+                if cpu.save_battery_ram_silent().is_ok() {}
                 ram_needs_save = false;
+                last_ram_save_frame = frame_count;
             }
+            if AUTO_SAVE_ENABLED && ram_needs_save && (frame_count - last_ram_save_frame) > 180 {
+                if cpu.save_battery_ram_silent().is_ok() {
+                    ram_needs_save = false;
+                }
+            }
+        } else {
+            // While paused, ensure we don't busy-loop or overflow tick budgeting.
+            ticks = 0;
         }
 
         'recv: loop {
@@ -148,6 +162,15 @@ pub fn run_cpu(
                     GBEvent::UpdateVolume(v) => {
                         cpu.set_master_volume(v);
                     }
+                    GBEvent::SetPaused(p) => {
+                        if p && !paused {
+                            cpu.sync_audio();
+                        }
+                        paused = p;
+                    }
+                    GBEvent::Shutdown => {
+                        break 'outer;
+                    }
                 },
                 Err(TryRecvError::Empty) => break 'recv,
                 Err(TryRecvError::Disconnected) => break 'outer,
@@ -155,7 +178,9 @@ pub fn run_cpu(
         }
 
         // Timing / pacing
-        let target_frame_ms = if limit_speed {
+        let target_frame_ms = if paused {
+            16.0 // keep checking events at ~60 Hz while paused
+        } else if limit_speed {
             16.0 // baseline ~60 FPS
         } else {
             match turbo_setting.multiplier() {

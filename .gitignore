@@ -1,7 +1,10 @@
+
 /target
 /roms
+/.claude/
 
 *.7z
 *groundtruth
 *.ppm
 *.log
+CLAUDE.md
