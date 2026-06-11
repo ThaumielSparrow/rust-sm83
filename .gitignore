@@ -2,6 +2,7 @@
 /target
 /roms
 /.claude/
+/docs
 
 *.7z
 *groundtruth
