@@ -6,7 +6,7 @@ pub struct Keypad {
     pub interrupt: u8,
 }
 
-#[derive(Copy, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum KeypadKey {
     Right,
     Left,

@@ -10,6 +10,7 @@ mod audio;
 mod emulator;
 mod config;
 mod input;
+mod gamepad;
 mod palette;
 
 use std::path::PathBuf;
