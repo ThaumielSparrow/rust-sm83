@@ -6,6 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use cpal::Stream;
+use gilrs::{Axis, EventType, Gilrs};
 use glium::Surface;
 use rust_gbe::device::{read_save_state_preview, SaveStatePreview};
 use time::{Month, OffsetDateTime, UtcOffset};
@@ -14,6 +15,9 @@ use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::ModifiersState;
 use winit::window::{Fullscreen, WindowId};
+
+use crate::config::GamepadBindings;
+use crate::gamepad::{BindTarget, BoundAction, DirectionMux, ResolvedBindings};
 
 pub const EXITCODE_SUCCESS: i32 = 0;
 pub const EXITCODE_CPULOADFAILS: i32 = 2;
@@ -157,6 +161,10 @@ enum RootPhase {
         dmg_palette_custom: [[u8; 3]; 4],
         // Scratch buffer reused across frames for host-side palette mapping in DMG mode.
         palette_scratch: Vec<u8>,
+        gamepad_bindings: GamepadBindings,
+        resolved_gamepad: ResolvedBindings,
+        gamepad_capturing: Option<BindTarget>,
+        direction_mux: DirectionMux,
     },
 }
 
@@ -176,6 +184,8 @@ pub struct RootApp {
     pending_rom: Option<PathBuf>,
     pending_action: Option<PendingAction>,
     pub exit_code: i32,
+    /// None if gamepad support failed to initialize (headless, missing driver).
+    gilrs: Option<Gilrs>,
 }
 
 impl RootApp {
@@ -196,6 +206,13 @@ impl RootApp {
             pending_rom,
             pending_action: None,
             exit_code: EXITCODE_SUCCESS,
+            gilrs: match Gilrs::new() {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    eprintln!("gamepad support unavailable: {}", e);
+                    None
+                }
+            },
         }
     }
 
@@ -298,6 +315,10 @@ impl RootApp {
                 dmg_palette_preset: cfg.dmg_palette_preset,
                 dmg_palette_custom: cfg.dmg_palette_custom,
                 palette_scratch: Vec::new(),
+                gamepad_bindings: cfg.gamepad.clone(),
+                resolved_gamepad: crate::gamepad::resolve(&cfg.gamepad),
+                gamepad_capturing: None,
+                direction_mux: DirectionMux::default(),
             };
             if let RootPhase::Running { sender, .. } = &self.phase {
                 let _ = sender.send(GBEvent::UpdateTurbo(cfg.turbo));
@@ -325,6 +346,126 @@ impl RootApp {
         };
         if let Some(h) = handle {
             let _ = h.join();
+        }
+    }
+
+    /// Drain all pending gilrs events. Runs every about_to_wait iteration
+    /// (the event loop is ControlFlow::Poll). Outside the Running phase events
+    /// are discarded so stale presses don't fire when a game starts.
+    fn poll_gamepad(&mut self) {
+        // Destructure self so phase fields and the other RootApp fields can be
+        // borrowed disjointly inside the loop.
+        let RootApp { gilrs, phase, window, scale, pending_action, .. } = self;
+        let Some(gilrs) = gilrs.as_mut() else {
+            return;
+        };
+        let mut transitions: Vec<(rust_gbe::KeypadKey, bool)> = Vec::new();
+        let mut any_activity = false;
+        while let Some(ev) = gilrs.next_event() {
+            let RootPhase::Running {
+                sender,
+                save_slots,
+                latest_frame,
+                renderoptions,
+                turbo_toggle,
+                turbo_held,
+                volume,
+                pre_mute_volume,
+                paused,
+                fullscreen,
+                fps_overlay,
+                gamepad_bindings,
+                resolved_gamepad,
+                gamepad_capturing,
+                direction_mux,
+                ..
+            } = &mut *phase
+            else {
+                continue;
+            };
+            // (button, pressed) pairs to dispatch; axis events fill `transitions`.
+            let mut hotkey: Option<(crate::gamepad::HotkeyAction, bool)> = None;
+            transitions.clear();
+            match ev.event {
+                EventType::ButtonPressed(btn, _) => {
+                    any_activity = true;
+                    if let Some(target) = gamepad_capturing.take() {
+                        crate::gamepad::bind(gamepad_bindings, target, btn);
+                        *resolved_gamepad = crate::gamepad::resolve(gamepad_bindings);
+                        let gb = gamepad_bindings.clone();
+                        crate::config::update_config(|c| c.gamepad = gb);
+                        continue;
+                    }
+                    match resolved_gamepad.lookup(btn) {
+                        Some(BoundAction::Gb(k)) => direction_mux.set_button(k, true, &mut transitions),
+                        Some(BoundAction::Hotkey(a)) => hotkey = Some((a, true)),
+                        None => {}
+                    }
+                }
+                EventType::ButtonReleased(btn, _) => {
+                    any_activity = true;
+                    if gamepad_capturing.is_some() {
+                        continue;
+                    }
+                    match resolved_gamepad.lookup(btn) {
+                        Some(BoundAction::Gb(k)) => direction_mux.set_button(k, false, &mut transitions),
+                        Some(BoundAction::Hotkey(a)) => hotkey = Some((a, false)),
+                        None => {}
+                    }
+                }
+                EventType::AxisChanged(Axis::LeftStickX, v, _) => {
+                    direction_mux.set_stick_x(v, &mut transitions);
+                    any_activity |= !transitions.is_empty();
+                }
+                EventType::AxisChanged(Axis::LeftStickY, v, _) => {
+                    direction_mux.set_stick_y(v, &mut transitions);
+                    any_activity |= !transitions.is_empty();
+                }
+                _ => {}
+            }
+            for (k, pressed) in &transitions {
+                let _ = sender.send(if *pressed {
+                    GBEvent::KeyDown(*k)
+                } else {
+                    GBEvent::KeyUp(*k)
+                });
+            }
+            if let Some((action, pressed)) = hotkey {
+                if let Some(sa) = action.to_system_action(pressed) {
+                    let outcome = handle_system_action(
+                        sa,
+                        &mut SysCtx {
+                            sender,
+                            save_slots,
+                            latest_frame,
+                            renderoptions,
+                            turbo_toggle,
+                            turbo_held,
+                            volume,
+                            pre_mute_volume,
+                            paused,
+                            fullscreen,
+                            fps_overlay,
+                        },
+                    );
+                    if outcome.apply_fullscreen {
+                        if let Some(win) = window.as_ref() {
+                            apply_window_mode(win, *scale, *fullscreen);
+                        }
+                    }
+                    if outcome.request_reset {
+                        *pending_action = Some(PendingAction::Reset);
+                    }
+                }
+            }
+        }
+        // Gamepad input arrives outside winit's event stream, so nothing else
+        // requests a repaint for UI changes it causes (pause overlay, capture
+        // label). One redraw per active poll is cheap.
+        if any_activity {
+            if let Some(w) = window.as_ref() {
+                w.request_redraw();
+            }
         }
     }
 }
@@ -955,6 +1096,7 @@ impl ApplicationHandler for RootApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_gamepad();
         if let RootPhase::Running {
             receiver,
             ui_receiver,
@@ -992,6 +1134,9 @@ impl ApplicationHandler for RootApp {
                 }
             }
         }
+        // Gamepad-triggered Reset is queued as a pending action; window_event's
+        // drain won't run until the next OS event, so drain here too.
+        self.drain_pending_action();
     }
 }
 
@@ -1016,7 +1161,7 @@ struct SysOutcome {
     apply_fullscreen: bool,
 }
 
-/// Mutable slices of the Running phase needed to execute a SystemAction.
+/// Borrowed `Running`-phase fields needed to execute a `SystemAction`.
 /// Shared by the keyboard path (window_event) and the gamepad path
 /// (poll_gamepad) so dispatch logic exists exactly once.
 struct SysCtx<'a> {
