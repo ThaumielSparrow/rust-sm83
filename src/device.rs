@@ -13,9 +13,8 @@ pub struct Device {
     save_state: Option<String>,
 }
 
-const SAVE_STATE_MAGIC_V1: &[u8; 8] = b"RGBEST01";
-const SAVE_STATE_MAGIC_V2: &[u8; 8] = b"RGBEST02";
-const SAVE_STATE_V2_HEADER_LEN: usize = 32;
+const SAVE_STATE_MAGIC: &[u8; 8] = b"RGBEST03";
+const SAVE_STATE_HEADER_LEN: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SaveStatePreview {
@@ -25,11 +24,11 @@ pub struct SaveStatePreview {
     pub thumbnail_rgb: Option<Vec<u8>>,
 }
 
-struct SaveStateV2Parts<'a> {
+struct SaveStateParts<'a> {
     cpu_payload: &'a [u8],
 }
 
-struct SaveStateV2Header {
+struct SaveStateHeader {
     saved_at_unix_secs: u64,
     thumbnail_width: u16,
     thumbnail_height: u16,
@@ -37,13 +36,27 @@ struct SaveStateV2Header {
     cpu_payload_len: usize,
 }
 
+fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension(match path.extension() {
+        Some(ext) => format!("{}.tmp", ext.to_string_lossy()),
+        None => "tmp".to_string(),
+    });
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        // Flush the temp file's contents to disk before the rename so a crash
+        // can't leave a renamed-but-empty file (rename is atomic, write isn't).
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn encode_cpu_state(cpu: &CPU) -> StrResult<Vec<u8>> {
-    let payload =
-        rkyv::to_bytes::<rkyv::rancor::Error>(cpu).map_err(|_| "Failed to serialize CPU state")?;
-    let mut data = Vec::with_capacity(SAVE_STATE_MAGIC_V1.len() + payload.len());
-    data.extend_from_slice(SAVE_STATE_MAGIC_V1);
-    data.extend_from_slice(&payload);
-    Ok(data)
+    // Auto-save uses the same on-disk format as slot saves, just without a
+    // thumbnail. One format keeps decode_cpu_state unambiguous.
+    encode_cpu_state_with_preview(cpu, None).map(|(data, _)| data)
 }
 
 fn encode_cpu_state_with_preview(
@@ -69,8 +82,8 @@ fn encode_cpu_state_with_preview(
         0
     };
 
-    let mut data = Vec::with_capacity(SAVE_STATE_V2_HEADER_LEN + thumbnail_len + payload.len());
-    data.extend_from_slice(SAVE_STATE_MAGIC_V2);
+    let mut data = Vec::with_capacity(SAVE_STATE_HEADER_LEN + thumbnail_len + payload.len());
+    data.extend_from_slice(SAVE_STATE_MAGIC);
     data.extend_from_slice(&saved_at_unix_secs.to_le_bytes());
     data.extend_from_slice(&thumbnail_width.to_le_bytes());
     data.extend_from_slice(&thumbnail_height.to_le_bytes());
@@ -92,15 +105,12 @@ fn encode_cpu_state_with_preview(
 }
 
 fn decode_cpu_state(data: &[u8]) -> StrResult<CPU> {
-    let payload = if let Some(payload) = data.strip_prefix(SAVE_STATE_MAGIC_V1) {
-        payload
-    } else if data.starts_with(SAVE_STATE_MAGIC_V2) {
-        parse_save_state_v2(data)
-            .ok_or("Failed to parse save state")?
-            .cpu_payload
-    } else {
+    if !data.starts_with(SAVE_STATE_MAGIC) {
         return Err("Unsupported save state format");
-    };
+    }
+    let payload = parse_save_state(data)
+        .ok_or("Failed to parse save state")?
+        .cpu_payload;
 
     rkyv::from_bytes::<CPU, rkyv::rancor::Error>(payload).map_err(|_| "Failed to parse save state")
 }
@@ -115,15 +125,6 @@ fn parent_dir(path: &str) -> Option<std::path::PathBuf> {
 fn current_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
-fn unix_secs_from_file_modified(path: &Path) -> u64 {
-    std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
 }
@@ -146,10 +147,10 @@ fn read_u64_le(data: &[u8], offset: usize) -> Option<u64> {
     ))
 }
 
-fn parse_save_state_v2(data: &[u8]) -> Option<SaveStateV2Parts<'_>> {
-    let header = parse_save_state_v2_header(data, data.len())?;
+fn parse_save_state(data: &[u8]) -> Option<SaveStateParts<'_>> {
+    let header = parse_save_state_header(data, data.len())?;
 
-    let thumbnail_start = SAVE_STATE_V2_HEADER_LEN;
+    let thumbnail_start = SAVE_STATE_HEADER_LEN;
     let thumbnail_end = thumbnail_start.checked_add(header.thumbnail_len)?;
     let cpu_payload_end = thumbnail_end.checked_add(header.cpu_payload_len)?;
 
@@ -158,11 +159,11 @@ fn parse_save_state_v2(data: &[u8]) -> Option<SaveStateV2Parts<'_>> {
     }
     let cpu_payload = data.get(thumbnail_end..cpu_payload_end)?;
 
-    Some(SaveStateV2Parts { cpu_payload })
+    Some(SaveStateParts { cpu_payload })
 }
 
-fn parse_save_state_v2_header(data: &[u8], total_len: usize) -> Option<SaveStateV2Header> {
-    if !data.starts_with(SAVE_STATE_MAGIC_V2) || data.len() < SAVE_STATE_V2_HEADER_LEN {
+fn parse_save_state_header(data: &[u8], total_len: usize) -> Option<SaveStateHeader> {
+    if !data.starts_with(SAVE_STATE_MAGIC) || data.len() < SAVE_STATE_HEADER_LEN {
         return None;
     }
 
@@ -180,23 +181,29 @@ fn parse_save_state_v2_header(data: &[u8], total_len: usize) -> Option<SaveState
             return None;
         }
     } else {
+        // Pin thumbnail dimensions to SCREEN_W x SCREEN_H. Any other dimensions are
+        // suspicious (truncated file, format drift, hostile file) and rejected.
+        if thumbnail_width as usize != crate::gpu::SCREEN_W
+            || thumbnail_height as usize != crate::gpu::SCREEN_H
+        {
+            return None;
+        }
         let expected_thumbnail_len = usize::from(thumbnail_width)
             .checked_mul(usize::from(thumbnail_height))?
             .checked_mul(3)?;
-        if thumbnail_width == 0 || thumbnail_height == 0 || thumbnail_len != expected_thumbnail_len
-        {
+        if thumbnail_len != expected_thumbnail_len {
             return None;
         }
     }
 
-    let expected_len = SAVE_STATE_V2_HEADER_LEN
+    let expected_len = SAVE_STATE_HEADER_LEN
         .checked_add(thumbnail_len)?
         .checked_add(cpu_payload_len)?;
     if total_len != expected_len {
         return None;
     }
 
-    Some(SaveStateV2Header {
+    Some(SaveStateHeader {
         saved_at_unix_secs,
         thumbnail_width,
         thumbnail_height,
@@ -211,25 +218,16 @@ pub fn read_save_state_preview(path: impl AsRef<Path>) -> Option<SaveStatePrevie
     let mut magic = [0; 8];
     file.read_exact(&mut magic).ok()?;
 
-    if &magic == SAVE_STATE_MAGIC_V1 {
-        return Some(SaveStatePreview {
-            saved_at_unix_secs: unix_secs_from_file_modified(path),
-            thumbnail_width: 0,
-            thumbnail_height: 0,
-            thumbnail_rgb: None,
-        });
-    }
-
-    if &magic != SAVE_STATE_MAGIC_V2 {
+    if &magic != SAVE_STATE_MAGIC {
         return None;
     }
 
     let total_len = usize::try_from(file.metadata().ok()?.len()).ok()?;
-    let mut header_data = [0; SAVE_STATE_V2_HEADER_LEN];
-    header_data[..SAVE_STATE_MAGIC_V2.len()].copy_from_slice(&magic);
-    file.read_exact(&mut header_data[SAVE_STATE_MAGIC_V2.len()..])
+    let mut header_data = [0; SAVE_STATE_HEADER_LEN];
+    header_data[..SAVE_STATE_MAGIC.len()].copy_from_slice(&magic);
+    file.read_exact(&mut header_data[SAVE_STATE_MAGIC.len()..])
         .ok()?;
-    let header = parse_save_state_v2_header(&header_data, total_len)?;
+    let header = parse_save_state_header(&header_data, total_len)?;
     let thumbnail_rgb = if header.thumbnail_len == 0 {
         None
     } else {
@@ -248,19 +246,26 @@ pub fn read_save_state_preview(path: impl AsRef<Path>) -> Option<SaveStatePrevie
 
 impl Drop for Device {
     fn drop(&mut self) {
-        if let Some(path) = &self.save_state {
-            let mut file = match std::fs::File::create(path) {
-                Ok(f) => f,
-                Err(_) => return,
-            };
-            use std::io::Write;
-            match encode_cpu_state(&self.cpu) {
-                Ok(data) => {
-                    let _ = file.write_all(&data);
-                }
-                Err(_) => return,
-            }
-        }
+        // No-op. Use Device::flush_to_disk() explicitly before drop.
+    }
+}
+
+impl Device {
+    /// Persist all durable state on shutdown: battery-backed cartridge RAM
+    /// (best-effort) and then the auto-save snapshot. Idempotent; safe to call
+    /// from non-Drop contexts. The battery save is best-effort because it is
+    /// already retried on every dirty frame by the emulator loop; only an
+    /// auto-save IO failure is surfaced as Err.
+    pub fn flush_to_disk(&self) -> StrResult<()> {
+        // No-op when the cart isn't battery-backed or has no save path.
+        let _ = self.save_battery_ram_silent();
+
+        let Some(path) = &self.save_state else {
+            return Ok(());
+        };
+        let data = encode_cpu_state(&self.cpu)?;
+        write_atomic(std::path::Path::new(path), &data)
+            .map_err(|_| "Failed to write auto-save state")
     }
 }
 
@@ -276,12 +281,37 @@ mod test {
     }
 
     #[test]
+    fn v3_magic_is_used_for_writes() {
+        let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
+        let cpu = CPU::new(cart, None).unwrap();
+        let data = encode_cpu_state(&cpu).unwrap();
+        assert!(data.starts_with(b"RGBEST03"), "writes must use V3 magic");
+    }
+
+    #[test]
+    fn v1_and_v2_saves_are_rejected() {
+        let mut fake_v1 = Vec::from(b"RGBEST01" as &[u8]);
+        fake_v1.extend_from_slice(&[0u8; 16]);
+        assert!(
+            decode_cpu_state(&fake_v1).is_err(),
+            "V1 saves must no longer load"
+        );
+
+        let mut fake_v2 = Vec::from(b"RGBEST02" as &[u8]);
+        fake_v2.extend_from_slice(&[0u8; 64]);
+        assert!(
+            decode_cpu_state(&fake_v2).is_err(),
+            "V2 saves must no longer load"
+        );
+    }
+
+    #[test]
     fn cpu_state_round_trips_with_rkyv_header() {
         let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
         let cpu = CPU::new(cart, None).unwrap();
 
         let data = encode_cpu_state(&cpu).unwrap();
-        assert!(data.starts_with(SAVE_STATE_MAGIC_V1));
+        assert!(data.starts_with(SAVE_STATE_MAGIC));
 
         let decoded = decode_cpu_state(&data).unwrap();
         assert_eq!(decoded.mmu.mbc.romname(), "RKYVTEST");
@@ -289,13 +319,13 @@ mod test {
     }
 
     #[test]
-    fn cpu_state_round_trips_with_v2_preview() {
+    fn cpu_state_round_trips_with_v3_preview() {
         let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
         let cpu = CPU::new(cart, None).unwrap();
         let thumbnail = vec![7; crate::gpu::SCREEN_W * crate::gpu::SCREEN_H * 3];
 
         let (data, preview) = encode_cpu_state_with_preview(&cpu, Some(&thumbnail)).unwrap();
-        assert!(data.starts_with(SAVE_STATE_MAGIC_V2));
+        assert!(data.starts_with(SAVE_STATE_MAGIC));
         assert_eq!(preview.thumbnail_width, crate::gpu::SCREEN_W as u16);
         assert_eq!(preview.thumbnail_height, crate::gpu::SCREEN_H as u16);
         assert_eq!(preview.thumbnail_rgb.as_deref(), Some(thumbnail.as_slice()));
@@ -315,7 +345,7 @@ mod test {
     }
 
     #[test]
-    fn slot_save_writes_v2_preview_file() {
+    fn slot_save_writes_v3_preview_file() {
         let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
         let cpu = CPU::new(cart, None).unwrap();
         let save_dir =
@@ -330,7 +360,7 @@ mod test {
         let preview = device.save_state_slot(4, Some(&thumbnail)).unwrap();
         let slot_path = save_dir.join("save_state_4.sav");
         let data = std::fs::read(&slot_path).unwrap();
-        assert!(data.starts_with(SAVE_STATE_MAGIC_V2));
+        assert!(data.starts_with(SAVE_STATE_MAGIC));
         assert_eq!(read_save_state_preview(&slot_path).unwrap(), preview);
         assert_eq!(preview.thumbnail_rgb.as_deref(), Some(thumbnail.as_slice()));
 
@@ -351,12 +381,12 @@ mod test {
     }
 
     #[test]
-    fn v1_preview_uses_file_modified_time_without_thumbnail() {
+    fn thumbnailless_save_preview_has_header_timestamp_and_no_thumbnail() {
         let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
         let cpu = CPU::new(cart, None).unwrap();
         let data = encode_cpu_state(&cpu).unwrap();
         let preview_path = std::env::temp_dir().join(format!(
-            "rust_gbe_v1_preview_test_{}.sav",
+            "rust_gbe_thumbnailless_preview_test_{}.sav",
             std::process::id()
         ));
         std::fs::write(&preview_path, &data).unwrap();
@@ -382,10 +412,10 @@ mod test {
             "rust_gbe_malformed_preview_test_{}.sav",
             std::process::id()
         ));
-        std::fs::write(&malformed_path, SAVE_STATE_MAGIC_V2).unwrap();
+        std::fs::write(&malformed_path, SAVE_STATE_MAGIC).unwrap();
         assert!(read_save_state_preview(&malformed_path).is_none());
         let err = match decode_cpu_state(&std::fs::read(&malformed_path).unwrap()) {
-            Ok(_) => panic!("malformed v2 data should not decode"),
+            Ok(_) => panic!("malformed v3 data should not decode"),
             Err(err) => err,
         };
         assert_eq!(err, "Failed to parse save state");
@@ -415,6 +445,32 @@ mod test {
 
         let _ = std::fs::remove_file(rom_path);
         let _ = std::fs::remove_file(expected_save_path);
+    }
+
+    #[test]
+    fn flush_to_disk_writes_auto_save_and_handles_battery_ram() {
+        let mut rom = vec![0; 0x8000];
+        rom[0x134..0x13C].copy_from_slice(b"FLUSHTST");
+        rom[0x147] = 0x03; // MBC1 + RAM + BATTERY
+        rom[0x149] = 0x02; // 8 KiB RAM
+        let cart = mbc::Cartridge::from_buffer(rom, true).unwrap();
+        let cpu = CPU::new(cart, None).unwrap();
+        let save_dir = std::env::temp_dir()
+            .join(format!("rust_gbe_flush_battery_test_{}", std::process::id()));
+        std::fs::create_dir_all(&save_dir).unwrap();
+        let state_path = save_dir.join("game.state");
+        let device = Device {
+            cpu,
+            save_state: Some(state_path.to_string_lossy().to_string()),
+        };
+
+        assert!(device.flush_to_disk().is_ok());
+        // The auto-save snapshot must exist and decode as V3.
+        let data = std::fs::read(&state_path).unwrap();
+        assert!(data.starts_with(SAVE_STATE_MAGIC));
+        assert!(decode_cpu_state(&data).is_ok());
+
+        let _ = std::fs::remove_dir_all(&save_dir);
     }
 
     #[test]
@@ -597,12 +653,6 @@ impl Device {
         self.cpu.mmu.mbc.check_and_reset_ram_updated()
     }
 
-    pub fn check_ram_updated_status(&self) -> bool {
-        // We need to add a method to check without resetting
-        // For now, let's add debug info to the save function
-        true // placeholder
-    }
-
     pub fn save_battery_ram(&self) -> StrResult<()> {
         self.save_battery_ram_with_message(true)
     }
@@ -612,52 +662,27 @@ impl Device {
     }
 
     fn save_battery_ram_with_message(&self, show_message: bool) -> StrResult<()> {
-        if self.cpu.mmu.mbc.is_battery_backed() {
-            let ram_data = self.cpu.mmu.mbc.dumpram();
-
-            if let Some(save_path) = self.cpu.mmu.mbc.get_save_path() {
-                if show_message {
-                    println!("DEBUG: Attempting to save to path: {}", save_path);
-                    println!("DEBUG: RAM data size: {} bytes", ram_data.len());
-
-                    // Show first 16 bytes of RAM for debugging
-                    if ram_data.len() > 0 {
-                        let preview: Vec<String> = ram_data
-                            .iter()
-                            .take(16)
-                            .map(|b| format!("{:02X}", b))
-                            .collect();
-                        println!("DEBUG: First 16 bytes of RAM: {}", preview.join(" "));
-                    }
-                }
-
-                // Make the save completely asynchronous to prevent hanging
-                std::thread::spawn(move || match std::fs::write(&save_path, &ram_data) {
-                    Ok(_) => {
-                        if show_message {
-                            println!(
-                                "Game save written to {} ({} bytes)",
-                                save_path,
-                                ram_data.len()
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to write game save to {}: {}", save_path, e);
-                    }
-                });
-                Ok(())
-            } else {
-                if show_message {
-                    eprintln!("DEBUG: No save path available from MBC");
-                }
-                Err("No save path available")
-            }
-        } else {
+        if !self.cpu.mmu.mbc.is_battery_backed() {
+            return Ok(());
+        }
+        let ram_data = self.cpu.mmu.mbc.dumpram();
+        let Some(save_path) = self.cpu.mmu.mbc.get_save_path() else {
             if show_message {
-                println!("DEBUG: MBC is not battery-backed, no save needed");
+                eprintln!("No save path available from MBC");
             }
-            Ok(()) // No battery-backed RAM, nothing to save
+            return Err("No save path available");
+        };
+        match write_atomic(std::path::Path::new(&save_path), &ram_data) {
+            Ok(_) => {
+                if show_message {
+                    println!("Game save written to {} ({} bytes)", save_path, ram_data.len());
+                }
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("Failed to write game save to {}: {}", save_path, e);
+                Err("Failed to write game save")
+            }
         }
     }
 
@@ -713,7 +738,7 @@ impl Device {
 
         let save_path = self.save_state_slot_path(slot);
 
-        match std::fs::write(&save_path, &serialized_data) {
+        match write_atomic(&save_path, &serialized_data) {
             Ok(_) => {
                 println!("State saved to slot {} ({})", slot, save_path.display());
                 Ok(preview)
