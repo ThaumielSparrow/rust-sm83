@@ -3,6 +3,7 @@
 //! the GUI drains gilrs and calls into this module so everything is testable.
 use gilrs::Button;
 use rust_gbe::KeypadKey;
+use std::collections::HashMap;
 
 /// Emulator hotkeys bindable to controller buttons. Mirrors
 /// `crate::input::SystemAction`, but without payloads baked into key chords —
@@ -265,6 +266,67 @@ impl DirectionMux {
     }
 }
 
+/// What a controller button is bound to.
+#[derive(Clone, Copy, Debug)]
+pub enum BoundAction {
+    Gb(KeypadKey),
+    Hotkey(HotkeyAction),
+}
+
+/// Capture target while the user is rebinding in the GUI.
+#[derive(Clone, Copy, Debug)]
+pub enum BindTarget {
+    Gb(KeypadKey),
+    Hotkey(HotkeyAction),
+}
+
+/// Bindings resolved from config strings into a direct gilrs-button lookup.
+/// Rebuilt whenever bindings change (rare); lookups happen per gamepad event.
+pub struct ResolvedBindings {
+    map: HashMap<Button, BoundAction>,
+}
+
+impl ResolvedBindings {
+    pub fn lookup(&self, b: Button) -> Option<BoundAction> {
+        self.map.get(&b).copied()
+    }
+}
+
+/// Unknown names are ignored (treated as unbound). If a corrupt config binds
+/// one button to both a GB key and a hotkey, the GB key wins (inserted last).
+pub fn resolve(b: &crate::config::GamepadBindings) -> ResolvedBindings {
+    let mut map = HashMap::new();
+    for (action, btn) in &b.hotkeys {
+        if let (Some(a), Some(bt)) = (HotkeyAction::from_name(action), button_from_name(btn)) {
+            map.insert(bt, BoundAction::Hotkey(a));
+        }
+    }
+    for (key, btn) in &b.buttons {
+        if let (Some(k), Some(bt)) = (keypad_key_from_name(key), button_from_name(btn)) {
+            map.insert(bt, BoundAction::Gb(k));
+        }
+    }
+    ResolvedBindings { map }
+}
+
+/// Bind `button` to `target`, removing any existing use of `button` in either
+/// map first so one physical button never triggers two actions.
+pub fn bind(b: &mut crate::config::GamepadBindings, target: BindTarget, button: Button) {
+    let Some(name) = button_name(button) else {
+        return; // unnamed button: not bindable
+    };
+    b.buttons.retain(|_, v| v != name);
+    b.hotkeys.retain(|_, v| v != name);
+    match target {
+        BindTarget::Gb(k) => {
+            b.buttons.insert(keypad_key_name(k).to_string(), name.to_string());
+        }
+        BindTarget::Hotkey(a) => {
+            b.hotkeys.insert(a.name().to_string(), name.to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +455,53 @@ mod tests {
         mux.set_button(KeypadKey::A, true, &mut out);
         mux.set_button(KeypadKey::A, false, &mut out);
         assert_eq!(out, vec![(KeypadKey::A, true), (KeypadKey::A, false)]);
+    }
+
+    #[test]
+    fn default_bindings_are_label_matching() {
+        let b = crate::config::GamepadBindings::default();
+        let r = resolve(&b);
+        assert!(matches!(r.lookup(Button::South), Some(BoundAction::Gb(KeypadKey::A))));
+        assert!(matches!(r.lookup(Button::East), Some(BoundAction::Gb(KeypadKey::B))));
+        assert!(matches!(r.lookup(Button::Start), Some(BoundAction::Gb(KeypadKey::Start))));
+        assert!(matches!(r.lookup(Button::Select), Some(BoundAction::Gb(KeypadKey::Select))));
+        assert!(matches!(r.lookup(Button::DPadUp), Some(BoundAction::Gb(KeypadKey::Up))));
+        assert!(matches!(r.lookup(Button::DPadDown), Some(BoundAction::Gb(KeypadKey::Down))));
+        assert!(matches!(r.lookup(Button::DPadLeft), Some(BoundAction::Gb(KeypadKey::Left))));
+        assert!(matches!(r.lookup(Button::DPadRight), Some(BoundAction::Gb(KeypadKey::Right))));
+        assert!(b.hotkeys.is_empty(), "hotkeys default unbound");
+        assert!(r.lookup(Button::North).is_none());
+    }
+
+    #[test]
+    fn resolve_ignores_unknown_names_and_gb_wins_conflicts() {
+        let mut b = crate::config::GamepadBindings::default();
+        b.buttons.insert("a".into(), "NotAButton".into()); // unknown button name
+        b.buttons.insert("zzz".into(), "North".into()); // unknown GB key name
+        // Corrupt config: hotkey on a button already used by a GB binding.
+        b.hotkeys.insert("pause".into(), "East".into());
+        let r = resolve(&b);
+        assert!(r.lookup(Button::South).is_none(), "a remapped to unknown -> unbound");
+        assert!(r.lookup(Button::North).is_none(), "unknown GB key ignored");
+        assert!(
+            matches!(r.lookup(Button::East), Some(BoundAction::Gb(KeypadKey::B))),
+            "GB binding wins over hotkey on the same button"
+        );
+    }
+
+    #[test]
+    fn bind_enforces_uniqueness_across_both_maps() {
+        let mut b = crate::config::GamepadBindings::default();
+        // Bind hotkey Pause to South, which currently holds GB A.
+        bind(&mut b, BindTarget::Hotkey(HotkeyAction::Pause), Button::South);
+        assert!(!b.buttons.contains_key("a"), "old GB binding removed");
+        assert_eq!(b.hotkeys.get("pause").map(String::as_str), Some("South"));
+        // Rebind GB A to North; Pause keeps South.
+        bind(&mut b, BindTarget::Gb(KeypadKey::A), Button::North);
+        assert_eq!(b.buttons.get("a").map(String::as_str), Some("North"));
+        assert_eq!(b.hotkeys.get("pause").map(String::as_str), Some("South"));
+        let r = resolve(&b);
+        assert!(matches!(r.lookup(Button::South), Some(BoundAction::Hotkey(HotkeyAction::Pause))));
+        assert!(matches!(r.lookup(Button::North), Some(BoundAction::Gb(KeypadKey::A))));
     }
 }

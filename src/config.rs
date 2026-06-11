@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -63,6 +64,39 @@ impl Default for KeyBindings {
         up: "ArrowUp".into(), down: "ArrowDown".into(), left: "ArrowLeft".into(), right: "ArrowRight".into() } }
 }
 
+/// Controller bindings, kept separate from keyboard bindings. Both maps store
+/// stable string names (see src/gamepad.rs) so the config file survives enum
+/// changes. `buttons`: GB button name -> gilrs button name. `hotkeys`:
+/// hotkey action name -> gilrs button name.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GamepadBindings {
+    #[serde(default)]
+    pub buttons: HashMap<String, String>,
+    #[serde(default)]
+    pub hotkeys: HashMap<String, String>,
+}
+
+impl Default for GamepadBindings {
+    fn default() -> Self {
+        // Label-matching layout: the button physically labeled A on an
+        // Xbox-style pad (gilrs South) maps to GB A, East (B) to GB B.
+        let buttons = [
+            ("a", "South"),
+            ("b", "East"),
+            ("start", "Start"),
+            ("select", "Select"),
+            ("up", "DPadUp"),
+            ("down", "DPadDown"),
+            ("left", "DPadLeft"),
+            ("right", "DPadRight"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        GamepadBindings { buttons, hotkeys: HashMap::new() }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub keybindings: KeyBindings,
@@ -74,6 +108,7 @@ pub struct Config {
     #[serde(default)] pub fullscreen: bool,
     #[serde(default)] pub dmg_palette_preset: DmgPalettePreset,
     #[serde(default="default_custom_palette")] pub dmg_palette_custom: [[u8; 3]; 4],
+    #[serde(default)] pub gamepad: GamepadBindings,
 }
 
 fn default_volume() -> u8 { 100 }
@@ -90,6 +125,7 @@ impl Default for Config {
             fullscreen: false,
             dmg_palette_preset: DmgPalettePreset::default(),
             dmg_palette_custom: default_custom_palette(),
+            gamepad: GamepadBindings::default(),
         }
     }
 }
@@ -152,3 +188,30 @@ pub fn binding_value(bindings: &KeyBindings, key: rust_gbe::KeypadKey) -> String
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_without_gamepad_field_gets_defaults() {
+        // Minimal pre-gamepad config.json: only fields without serde defaults.
+        let json = r#"{
+            "keybindings": {"a":"X","b":"Z","start":"Enter","select":"Space",
+                            "up":"ArrowUp","down":"ArrowDown","left":"ArrowLeft","right":"ArrowRight"},
+            "scale": 3
+        }"#;
+        let cfg: Config = serde_json::from_str(json).expect("parse");
+        assert_eq!(cfg.gamepad.buttons.get("a").map(String::as_str), Some("South"));
+        assert!(cfg.gamepad.hotkeys.is_empty());
+    }
+
+    #[test]
+    fn gamepad_bindings_round_trip() {
+        let mut cfg = Config::default();
+        cfg.gamepad.hotkeys.insert("pause".into(), "North".into());
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let back: Config = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back.gamepad.buttons, cfg.gamepad.buttons);
+        assert_eq!(back.gamepad.hotkeys.get("pause").map(String::as_str), Some("North"));
+    }
+}
