@@ -47,7 +47,7 @@ impl VolumeEnvelope {
                     | if self.goes_up { 0x08 } else { 0 }
                     | (self.period & 0x7)
             }
-            _ => unimplemented!(),
+            _ => 0xFF,
         }
     }
 
@@ -197,7 +197,7 @@ impl SquareChannel {
             0xFF12 | 0xFF17 => self.volume_envelope.rb(a),
             0xFF13 | 0xFF18 => 0xFF,
             0xFF14 | 0xFF19 => 0x80 | if self.length.enabled { 0x40 } else { 0 } | 0x3F,
-            _ => unimplemented!(),
+            _ => 0xFF,
         }
     }
 
@@ -395,7 +395,7 @@ impl WaveChannel {
                     }
                 }
             }
-            _ => unimplemented!(),
+            _ => 0xFF,
         }
     }
 
@@ -575,7 +575,7 @@ impl NoiseChannel {
             0xFF21 => self.volume_envelope.rb(a),
             0xFF22 => self.reg_ff22,
             0xFF23 => 0x80 | if self.length.enabled { 0x40 } else { 0 } | 0x3F,
-            _ => unimplemented!(),
+            _ => 0xFF,
         }
     }
 
@@ -602,7 +602,8 @@ impl NoiseChannel {
                 if v & 0x80 == 0x80 {
                     self.length.trigger(frame_step);
 
-                    self.state = 0xFF;
+                    // Pan Docs §Channel 4: all 15 bits of the LFSR set to 1 on trigger.
+                    self.state = 0x7FFF;
                     self.delay = 0;
 
                     if self.dac_enabled {
@@ -695,6 +696,27 @@ impl Sound {
         self.on = true;
     }
 
+    /// Reset the frame-sequencer phase (DIV-APU). Called by the MMU on writes
+    /// to FF04 (DIV), since the DIV-APU is clocked from a tap on the DIV
+    /// register. This resets the phase so games that reset DIV to resync music
+    /// don't get envelope/length/sweep drift. It does NOT replicate the obscure
+    /// "step immediately if the selected DIV bit was high before reset" Pan Docs
+    /// behaviour — that is rarely needed for game accuracy.
+    pub fn reset_div(&mut self) {
+        self.frame_step = 0;
+        self.next_time = self.time.wrapping_add(CLOCKS_PER_FRAME);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frame_step_for_test(&self) -> u8 {
+        self.frame_step
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_frame_step_for_test(&mut self, step: u8) {
+        self.frame_step = step;
+    }
+
     fn new_internal(player: Box<dyn AudioPlayer>, dmg_mode: bool) -> Sound {
         let blipbuf1 = create_blipbuf(player.samples_rate());
         let blipbuf2 = create_blipbuf(player.samples_rate());
@@ -738,7 +760,7 @@ impl Sound {
             0xFF16..=0xFF19 => self.channel2.rb(a),
             0xFF1A..=0xFF1E => self.channel3.rb(a),
             0xFF20..=0xFF23 => self.channel4.rb(a),
-            0xFF24 => ((self.volume_right & 7) << 4) | (self.volume_left & 7) | self.reg_vin_to_so,
+            0xFF24 => ((self.volume_left & 7) << 4) | (self.volume_right & 7) | self.reg_vin_to_so,
             0xFF25 => self.reg_ff25,
             0xFF26 => {
                 (if self.on { 0x80 } else { 0x00 }
@@ -778,16 +800,23 @@ impl Sound {
             0xFF1A..=0xFF1E => self.channel3.wb(a, v, self.frame_step),
             0xFF20..=0xFF23 => self.channel4.wb(a, v, self.frame_step),
             0xFF24 => {
-                self.volume_left = v & 0x7;
-                self.volume_right = (v >> 4) & 0x7;
+                // Pan Docs §FF24: bits 6-4 = Left volume (SO2), bits 2-0 = Right volume (SO1).
+                self.volume_left = (v >> 4) & 0x7;
+                self.volume_right = v & 0x7;
                 self.reg_vin_to_so = v & 0x88;
             }
             0xFF25 => self.reg_ff25 = v,
             0xFF26 => {
                 let turn_on = v & 0x80 == 0x80;
-                if self.on && turn_on == false {
-                    // Reset all registers to 0 when turning off
-                    for i in 0xFF10..=0xFF25 {
+                if self.on && !turn_on {
+                    // Reset all registers to 0 when turning off.
+                    // DMG quirk: NRx1 length counters are preserved across power-off
+                    // and remain writable while powered off. CGB clears them too.
+                    for i in 0xFF10..=0xFF25u16 {
+                        let is_length_reg = matches!(i, 0xFF11 | 0xFF16 | 0xFF1B | 0xFF20);
+                        if is_length_reg && self.dmg_mode {
+                            continue;
+                        }
                         self.wb(i, 0);
                     }
                 }
@@ -884,8 +913,9 @@ impl Sound {
 
         let mut outputted = 0;
 
-        let left_vol = (self.volume_left as f32 / 7.0) * (1.0 / 15.0) * 0.25;
-        let right_vol = (self.volume_right as f32 / 7.0) * (1.0 / 15.0) * 0.25;
+        // Pan Docs: volume step is (vol + 1) / 8; vol=0 -> 1/8 amplitude, vol=7 -> full.
+        let left_vol = ((self.volume_left as f32 + 1.0) / 8.0) * (1.0 / 15.0) * 0.25;
+        let right_vol = ((self.volume_right as f32 + 1.0) / 8.0) * (1.0 / 15.0) * 0.25;
 
         while outputted < sample_count {
             // Reset only the range we'll fill this iteration.
@@ -966,4 +996,41 @@ fn create_blipbuf(samples_rate: u32) -> BlipBuf {
     let mut blipbuf = BlipBuf::new((OUTPUT_SAMPLE_COUNT + 1) as u32);
     blipbuf.set_rates(CLOCKS_PER_SECOND as f64, samples_rate as f64);
     blipbuf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoopPlayer;
+    impl AudioPlayer for NoopPlayer {
+        fn play(&mut self, _: &[f32], _: &[f32]) {}
+        fn samples_rate(&self) -> u32 {
+            44_100
+        }
+        fn underflowed(&self) -> bool {
+            false
+        }
+    }
+
+    /// reset_div() (FF04 write) must clear the frame-sequencer phase and
+    /// reschedule the next step exactly one frame period after the current
+    /// APU time, regardless of the prior phase.
+    #[test]
+    fn reset_div_resets_frame_sequencer_phase() {
+        let mut s = Sound::new_dmg(Box::new(NoopPlayer));
+        // Simulate an advanced phase at a non-zero APU time.
+        s.time = 12_345;
+        s.frame_step = 5;
+        s.next_time = 1;
+
+        s.reset_div();
+
+        assert_eq!(s.frame_step, 0, "frame_step must reset to 0 after reset_div()");
+        assert_eq!(
+            s.next_time,
+            s.time.wrapping_add(CLOCKS_PER_FRAME),
+            "next frame-sequencer step must be one frame period after current time"
+        );
+    }
 }

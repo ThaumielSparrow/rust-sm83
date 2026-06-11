@@ -14,6 +14,10 @@ impl Serial {
                 if v & 0x81 == 0x81 {
                     // No link/printer; emulate instant transfer complete.
                     self.interrupt = 0x8;
+                    // No peer: bits shift in as 1s, leaving SB at 0xFF.
+                    self.data = 0xFF;
+                    // SC bit 7 (transfer-start) auto-clears on completion.
+                    self.control &= 0x7F;
                 }
             }
             _ => panic!("Serial does not handle address {:4X} (write)", a),

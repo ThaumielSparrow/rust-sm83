@@ -16,9 +16,10 @@ pub struct MBC3 {
     ram_on: bool,
     ram_updated: bool,
     has_battery: bool,
-    rtc_ram: [u8; 5],
+    pub(crate) rtc_ram: [u8; 5],
     rtc_ram_latch: [u8; 5],
-    rtc_zero: Option<u64>,
+    pub(crate) rtc_zero: Option<u64>,
+    latch_prev: u8,
 }
 
 impl MBC3 {
@@ -51,6 +52,7 @@ impl MBC3 {
             rtc_ram: [0u8; 5],
             rtc_ram_latch: [0u8; 5],
             rtc_zero: rtc,
+            latch_prev: 0xFF,
         };
 
         Ok(res)
@@ -68,7 +70,10 @@ impl MBC3 {
         }
 
         let tzero = match self.rtc_zero {
-            Some(t) => time::UNIX_EPOCH + time::Duration::from_secs(t),
+            Some(t) => match time::UNIX_EPOCH.checked_add(time::Duration::from_secs(t)) {
+                Some(st) => st,
+                None => return,
+            },
             None => return,
         };
 
@@ -97,15 +102,15 @@ impl MBC3 {
         if self.rtc_zero.is_none() {
             return None;
         }
-        let mut difftime = match time::SystemTime::now().duration_since(time::UNIX_EPOCH) {
-            Ok(t) => t.as_secs(),
-            Err(_) => panic!("System clock is set to a time before the unix epoch (1970-01-01)"),
-        };
-        difftime -= self.rtc_ram[0] as u64;
-        difftime -= (self.rtc_ram[1] as u64) * 60;
-        difftime -= (self.rtc_ram[2] as u64) * 3600;
+        let mut difftime = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        difftime = difftime.saturating_sub(self.rtc_ram[0] as u64);
+        difftime = difftime.saturating_sub((self.rtc_ram[1] as u64) * 60);
+        difftime = difftime.saturating_sub((self.rtc_ram[2] as u64) * 3600);
         let days = ((self.rtc_ram[4] as u64 & 0x1) << 8) | (self.rtc_ram[3] as u64);
-        difftime -= days * 3600 * 24;
+        difftime = difftime.saturating_sub(days * 3600 * 24);
         Some(difftime)
     }
 
@@ -148,8 +153,13 @@ impl MBC for MBC3 {
                 self.selectrtc = v & 0x8 == 0x8;
                 self.rambank = (v & 0x7) as usize;
             }
-            0x6000..=0x7FFF => self.latch_rtc_reg(),
-            _ => panic!("Could not write to {:04X} (MBC3)", a),
+            0x6000..=0x7FFF => {
+                if self.latch_prev == 0x00 && v == 0x01 {
+                    self.latch_rtc_reg();
+                }
+                self.latch_prev = v;
+            }
+            _ => (),
         }
     }
     fn writeram(&mut self, a: u16, v: u8) {
@@ -215,5 +225,27 @@ impl MBC for MBC3 {
         let result = self.ram_updated;
         self.ram_updated = false;
         result
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn rtc_compute_difftime_does_not_underflow_on_hostile_save() {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x147] = 0x10; // MBC3+RAM+Battery+Timer
+        rom[0x148] = 0x00;
+        rom[0x149] = 0x02; // 8 KiB RAM
+        let mut mbc = MBC3::new(rom).unwrap();
+
+        // Hostile encoded RTC: large values.
+        mbc.rtc_ram = [59, 59, 23, 0xFF, 0x01];
+        // Force rtc_zero into the future.
+        mbc.rtc_zero = Some(u64::MAX - 1000);
+
+        // Must not panic.
+        mbc.calc_rtc_reg();
     }
 }

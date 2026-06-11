@@ -12,18 +12,19 @@ pub struct MBC5 {
     has_battery: bool,
     rombanks: usize,
     rambanks: usize,
+    has_rumble: bool,
 }
 
 impl MBC5 {
     pub fn new(data: Vec<u8>) -> StrResult<MBC5> {
-        let subtype = data[0x147];
-        let has_battery = match subtype {
-            0x1B | 0x1E => true,
-            _ => false,
-        };
-        let rambanks = match subtype {
-            0x1A | 0x1B | 0x1D | 0x1E => ram_banks(data[0x149]),
-            _ => 0,
+        let (has_battery, has_rumble, rambanks) = match data[0x147] {
+            0x19 => (false, false, 0),
+            0x1A => (false, false, ram_banks(data[0x149])),
+            0x1B => (true,  false, ram_banks(data[0x149])),
+            0x1C => (false, true,  0),
+            0x1D => (false, true,  ram_banks(data[0x149])),
+            0x1E => (true,  true,  ram_banks(data[0x149])),
+            _    => (false, false, 0),
         };
         let ramsize = 0x2000 * rambanks;
         let rombanks = rom_banks(data[0x148]);
@@ -38,6 +39,7 @@ impl MBC5 {
             has_battery: has_battery,
             rombanks: rombanks,
             rambanks: rambanks,
+            has_rumble: has_rumble,
         };
 
         Ok(res)
@@ -54,10 +56,11 @@ impl MBC for MBC5 {
         *self.rom.get(idx).unwrap_or(&0)
     }
     fn readram(&self, a: u16) -> u8 {
-        if !self.ram_on {
-            return 0;
+        if !self.ram_on || self.ram.is_empty() {
+            return 0xFF;
         }
-        self.ram[self.rambank * 0x2000 | ((a as usize) & 0x1FFF)]
+        let idx = self.rambank * 0x2000 | ((a as usize) & 0x1FFF);
+        *self.ram.get(idx).unwrap_or(&0xFF)
     }
     fn writerom(&mut self, a: u16, v: u8) {
         match a {
@@ -69,17 +72,30 @@ impl MBC for MBC5 {
                 self.rombank =
                     ((self.rombank & 0x0FF) | (((v & 0x1) as usize) << 8)) % self.rombanks
             }
-            0x4000..=0x5FFF => self.rambank = ((v & 0x0F) as usize) % self.rambanks,
+            0x4000..=0x5FFF => {
+                if self.rambanks == 0 {
+                    return; // no RAM; rumble bit, if any, has no host effect
+                }
+                let bank_mask: usize = if self.has_rumble { 0x07 } else { 0x0F };
+                if self.rambanks > 1 {
+                    self.rambank = (v as usize) & bank_mask;
+                }
+                // Bit 3 on rumble carts drives the motor; we don't implement physical rumble,
+                // but it must NOT be routed into rambank.
+            }
             0x6000..=0x7FFF => { /* ? */ }
-            _ => panic!("Could not write to {:04X} (MBC5)", a),
+            _ => (),
         }
     }
     fn writeram(&mut self, a: u16, v: u8) {
-        if self.ram_on == false {
+        if !self.ram_on || self.ram.is_empty() {
             return;
         }
-        self.ram[self.rambank * 0x2000 | ((a as usize) & 0x1FFF)] = v;
-        self.ram_updated = true;
+        let idx = self.rambank * 0x2000 | ((a as usize) & 0x1FFF);
+        if idx < self.ram.len() {
+            self.ram[idx] = v;
+            self.ram_updated = true;
+        }
     }
 
     fn is_battery_backed(&self) -> bool {
@@ -104,5 +120,57 @@ impl MBC for MBC5 {
         let result = self.ram_updated;
         self.ram_updated = false;
         result
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::mbc::MBC;
+
+    fn rumble_cart_4_banks() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x40000];
+        rom[0x147] = 0x1D; // MBC5 + rumble + RAM, no battery
+        rom[0x148] = 0x00; // 32 KiB ROM
+        // 32 KiB RAM (4 banks)
+        rom[0x149] = 0x03;
+        rom
+    }
+
+    #[test]
+    fn mbc5_rumble_bit_does_not_affect_rambank() {
+        let mut mbc = MBC5::new(rumble_cart_4_banks()).unwrap();
+        // Enable RAM
+        mbc.writerom(0x0000, 0x0A);
+        // Select bank 2 with rumble bit set: v = 0x0A (bit3=1, bits0-2=010=2)
+        mbc.writerom(0x4000, 0x0A);
+        // Write a marker into bank 2
+        mbc.writeram(0xA000, 0x42);
+        // Toggle rumble off (v = 0x02)
+        mbc.writerom(0x4000, 0x02);
+        // Should still be reading bank 2, so the marker is visible
+        assert_eq!(mbc.readram(0xA000), 0x42,
+            "rumble bit must not switch RAM banks");
+    }
+
+    fn no_ram_mbc5_cart() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x147] = 0x19; // MBC5, no RAM
+        rom[0x148] = 0x00;
+        rom[0x149] = 0x00;
+        rom
+    }
+
+    #[test]
+    fn mbc5_no_ram_read_returns_0xff_no_panic() {
+        let mut mbc = MBC5::new(no_ram_mbc5_cart()).unwrap();
+        mbc.writerom(0x0000, 0x0A);
+        assert_eq!(mbc.readram(0xA000), 0xFF);
+    }
+
+    #[test]
+    fn mbc5_no_ram_bank_write_does_not_panic() {
+        let mut mbc = MBC5::new(no_ram_mbc5_cart()).unwrap();
+        mbc.writerom(0x4000, 0x02);
     }
 }

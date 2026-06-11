@@ -63,6 +63,7 @@ pub struct GPU {
     pub gbmode: GbMode,
     hblanking: bool,
     first_frame: bool,
+    prev_stat_signal: bool,
 }
 
 impl GPU {
@@ -113,11 +114,8 @@ impl GPU {
             vrambank: 0,
             hblanking: false,
             first_frame: false,
+            prev_stat_signal: false,
         }
-    }
-
-    pub fn new_cgb() -> GPU {
-        GPU::new()
     }
 
     pub fn do_cycle(&mut self, ticks: u32) {
@@ -137,7 +135,7 @@ impl GPU {
             if self.modeclock >= 456 {
                 self.modeclock -= 456;
                 self.line = (self.line + 1) % 154;
-                self.check_interrupt_lyc();
+                self.update_stat_signal();
 
                 // This is a VBlank line
                 if self.line >= 144 && self.mode != 1 {
@@ -166,20 +164,29 @@ impl GPU {
         }
     }
 
-    fn check_interrupt_lyc(&mut self) {
-        if self.lyc_inte && self.line == self.lyc {
+    fn update_stat_signal(&mut self) {
+        // Combined STAT line: OR of all enabled sources (Pan Docs §STAT register).
+        // The signal is forced low while the LCD is off, so no STAT IRQ can fire
+        // from register writes (FF41/FF45) during LCD-off, and a clean baseline
+        // is kept for the rising-edge check after re-enable.
+        let signal = self.lcd_on
+            && ((self.m0_inte && self.mode == 0)
+                || (self.m1_inte && self.mode == 1)
+                || (self.m2_inte && self.mode == 2)
+                || (self.lyc_inte && self.line == self.lyc));
+        if signal && !self.prev_stat_signal {
             self.interrupt |= 0x02;
         }
+        self.prev_stat_signal = signal;
     }
 
     fn change_mode(&mut self, mode: u8) {
         self.mode = mode;
 
-        if match self.mode {
+        match self.mode {
             0 => {
                 self.renderscan();
                 self.hblanking = true;
-                self.m0_inte
             }
             1 => {
                 // Vertical blank
@@ -189,20 +196,17 @@ impl GPU {
                 self.front ^= 1;
                 self.updated = true;
                 self.first_frame = false;
-                self.m1_inte
             }
-            2 => self.m2_inte,
+            2 => {}
             3 => {
-                if self.win_on && self.wy_trigger == false && self.line == self.winy {
+                if self.win_on && !self.wy_trigger && self.line == self.winy {
                     self.wy_trigger = true;
                     self.wy_pos = -1;
                 }
-                false
             }
-            _ => false,
-        } {
-            self.interrupt |= 0x02;
+            _ => {}
         }
+        self.update_stat_signal();
     }
 
     pub fn rb(&self, a: u16) -> u8 {
@@ -301,10 +305,23 @@ impl GPU {
                     self.wy_trigger = false;
                     self.first_frame = true;
                     self.clear_screen();
+                    // lcd_on is now false, so this forces prev_stat_signal low,
+                    // giving a clean rising-edge baseline for the next re-enable.
+                    self.update_stat_signal();
                 }
                 if !orig_lcd_on && self.lcd_on {
-                    self.change_mode(2);
+                    // Enter mode 0 silently — no STAT IRQ on LCD-enable (hardware behaviour).
+                    // Real hardware starts in mode 0 on enable before the first M2 scan;
+                    // firing a STAT IRQ here breaks Pokemon Crystal, DKC, and others.
+                    self.mode = 0;
                     self.modeclock = 4;
+                    self.line = 0;
+                    self.first_frame = true;
+                    // Set prev_stat_signal = true so that update_stat_signal() below
+                    // sees no rising edge (0→1) regardless of the current signal value,
+                    // suppressing any spurious IRQ on the enable transition.
+                    self.prev_stat_signal = true;
+                    self.update_stat_signal();
                 }
             }
             0xFF41 => {
@@ -312,15 +329,16 @@ impl GPU {
                 self.m2_inte = v & 0x20 == 0x20;
                 self.m1_inte = v & 0x10 == 0x10;
                 self.m0_inte = v & 0x08 == 0x08;
+                self.update_stat_signal();
             }
             0xFF42 => self.scy = v,
             0xFF43 => self.scx = v,
             0xFF44 => {} // Read-only
             0xFF45 => {
                 self.lyc = v;
-                self.check_interrupt_lyc();
+                self.update_stat_signal();
             }
-            0xFF46 => panic!("0xFF46 should be handled by MMU"),
+            0xFF46 => debug_assert!(false, "0xFF46 should be handled by MMU, not GPU"),
             0xFF47 => {
                 self.palbr = v;
                 self.update_pal();
@@ -379,14 +397,17 @@ impl GPU {
                     self.csprit_ind = (self.csprit_ind + 1) & 0x3F;
                 };
             }
-            _ => panic!("GPU does not handle write {:04X}", a),
+            _ => debug_assert!(false, "GPU wb called with unhandled address {:04X}", a),
         }
     }
 
     fn clear_screen(&mut self) {
-    let buf = &mut self.frame_buffers[self.front ^ 1];
-    for v in buf.iter_mut() {
-            *v = 255;
+        // LCD off shows white. Fill both buffers so the next front_buffer() read
+        // (which the GUI uses) sees the cleared frame regardless of swap timing.
+        for buf in self.frame_buffers.iter_mut() {
+            for v in buf.iter_mut() {
+                *v = 255;
+            }
         }
         self.updated = true;
     }
@@ -400,7 +421,7 @@ impl GPU {
     }
 
     fn get_monochrome_pal_val(value: u8, index: usize) -> u8 {
-        match (value >> 2 * index) & 0x03 {
+        match (value >> (2 * index)) & 0x03 {
             0 => 255,
             1 => 192,
             2 => 96,
@@ -457,7 +478,7 @@ impl GPU {
             -1
         };
 
-        if winy < 0 && drawbg == false {
+        if winy < 0 && !drawbg {
             return;
         }
 
@@ -559,12 +580,12 @@ impl GPU {
         let mut sprites_to_draw = [(0, 0, 0); 10];
         let mut sidx = 0;
         for index in 0..40 {
-            let spriteaddr = 0xFE00 + (index as u16) * 4;
-            let spritey = self.rb(spriteaddr + 0) as u16 as i32 - 16;
+            let base = (index as usize) * 4;
+            let spritey = self.voam[base] as i32 - 16;
             if line < spritey || line >= spritey + sprite_size {
                 continue;
             }
-            let spritex = self.rb(spriteaddr + 1) as u16 as i32 - 8;
+            let spritex = self.voam[base + 1] as i32 - 8;
             sprites_to_draw[sidx] = (spritex, spritey, index);
             sidx += 1;
             if sidx >= 10 {
@@ -582,11 +603,11 @@ impl GPU {
                 continue;
             }
 
-            let spriteaddr = 0xFE00 + (i as u16) * 4;
-            let tilenum = (self.rb(spriteaddr + 2)
+            let base = (i as usize) * 4;
+            let tilenum = (self.voam[base + 2]
                 & (if self.sprite_size == 16 { 0xFE } else { 0xFF }))
                 as u16;
-            let flags = self.rb(spriteaddr + 3) as usize;
+            let flags = self.voam[base + 3] as usize;
             let usepal1: bool = flags & (1 << 4) != 0;
             let xflip: bool = flags & (1 << 5) != 0;
             let yflip: bool = flags & (1 << 6) != 0;
@@ -668,4 +689,42 @@ fn dmg_sprite_order(a: &(i32, i32, u8), b: &(i32, i32, u8)) -> Ordering {
 fn cgb_sprite_order(a: &(i32, i32, u8), b: &(i32, i32, u8)) -> Ordering {
     // CGB order: only prioritize based on OAM position.
     return b.2.cmp(&a.2);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// While the LCD is off, writes to STAT (FF41) or LYC (FF45) must NOT
+    /// generate a STAT IRQ — even when lyc_inte && line == lyc holds.
+    #[test]
+    fn stat_irq_does_not_fire_while_lcd_off() {
+        let mut gpu = GPU::new();
+        // Reaffirm LCD off (no-op since both orig and new are off).
+        gpu.wb(0xFF40, 0x00);
+        assert_eq!(gpu.interrupt, 0, "no IRQ from disabling LCD");
+        // line and lyc both start at 0; enable LYC interrupt, then set LYC=0.
+        gpu.wb(0xFF41, 0x40); // bit 6 = lyc_inte
+        gpu.wb(0xFF45, 0x00); // LYC = 0
+        assert_eq!(
+            gpu.interrupt & 0x02,
+            0,
+            "STAT IRQ must not fire while LCD is off, even with lyc_inte && line==lyc"
+        );
+    }
+
+    /// On LCD disable, prev_stat_signal must reset to false so a fresh signal
+    /// after re-enable computes its rising edge from a clean baseline.
+    #[test]
+    fn lcd_disable_resets_prev_stat_signal() {
+        let mut gpu = GPU::new();
+        gpu.wb(0xFF40, 0x80); // LCD on
+        gpu.wb(0xFF41, 0x08); // m0_inte; mode starts at 0 → signal high, prev=true
+        assert!(gpu.prev_stat_signal, "signal should be latched high while on");
+        gpu.wb(0xFF40, 0x00); // LCD off
+        assert!(
+            !gpu.prev_stat_signal,
+            "LCD disable must reset prev_stat_signal"
+        );
+    }
 }

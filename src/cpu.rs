@@ -81,9 +81,9 @@ impl CPU {
     }
 
     fn fetchword(&mut self) -> u16 {
-        let w = self.mmu.rw(self.reg.pc);
-        self.reg.pc += 2;
-        w
+        let lo = self.fetchbyte() as u16;
+        let hi = self.fetchbyte() as u16;
+        (hi << 8) | lo
     }
 
     fn updateime(&mut self) {
@@ -106,7 +106,7 @@ impl CPU {
     }
 
     fn handleinterrupt(&mut self) -> u32 {
-        if self.ime == false && self.halted == false {
+        if !self.ime && !self.halted {
             return 0;
         }
 
@@ -116,7 +116,7 @@ impl CPU {
         }
 
         self.halted = false;
-        if self.ime == false {
+        if !self.ime {
             return 0;
         }
         self.ime = false;
@@ -130,7 +130,8 @@ impl CPU {
         self.pushstack(pc);
         self.reg.pc = 0x0040 | ((n as u16) << 3);
 
-        4
+        // Hardware spec: 5 M-cycles (2 NOPs, PUSH PC, vector load).
+        5
     }
 
     fn pushstack(&mut self, value: u16) {
@@ -331,7 +332,18 @@ type OpHandler = fn(&mut CPU, u8) -> u32;
 
 // Plain functions (initial subset) to avoid macro complexity / compile errors.
 fn op_00(_cpu: &mut CPU, _op: u8) -> u32 { 1 }
-fn op_76(cpu: &mut CPU, _op: u8) -> u32 { cpu.halted = true; cpu.halt_bug = cpu.mmu.intf & cpu.mmu.inte & 0x1F != 0; 1 }
+fn op_76(cpu: &mut CPU, _op: u8) -> u32 {
+    let pending = cpu.mmu.intf & cpu.mmu.inte & 0x1F != 0;
+    if !cpu.ime && pending {
+        // HALT bug: do not enter halt; the next fetchbyte will read PC without advancing.
+        cpu.halt_bug = true;
+        cpu.halted = false;
+    } else {
+        cpu.halted = true;
+        cpu.halt_bug = false;
+    }
+    1
+}
 
 fn op_ld_rr_d16(cpu: &mut CPU, op: u8) -> u32 {
     let val = cpu.fetchword();
@@ -531,7 +543,15 @@ fn op_ret(cpu: &mut CPU, op: u8) -> u32 {
 fn op_rst(cpu: &mut CPU, op: u8) -> u32 { let target = match op { 0xC7 => 0x00, 0xCF => 0x08, 0xD7 => 0x10, 0xDF => 0x18, 0xE7 => 0x20, 0xEF => 0x28, 0xF7 => 0x30, 0xFF => 0x38, _ => unreachable!() }; let pc = cpu.reg.pc; cpu.reg.sp = cpu.reg.sp.wrapping_sub(1); cpu.mmu.wb(cpu.reg.sp, (pc >> 8) as u8); cpu.reg.sp = cpu.reg.sp.wrapping_sub(1); cpu.mmu.wb(cpu.reg.sp, pc as u8); cpu.reg.pc = target; 4 }
 
 // Misc single opcodes: DAA(0x27), CPL(0x2F), SCF(0x37), CCF(0x3F), DI(0xF3), EI(0xFB), STOP(0x10)
-fn op_misc(cpu: &mut CPU, op: u8) -> u32 { match op { 0x27 => { cpu.alu_daa(); 1 }, 0x2F => { cpu.reg.a = !cpu.reg.a; cpu.reg.flag(H,true); cpu.reg.flag(N,true); 1 }, 0x37 => { cpu.reg.flag(C,true); cpu.reg.flag(H,false); cpu.reg.flag(N,false); 1 }, 0x3F => { let c = cpu.reg.getflag(C); cpu.reg.flag(C,!c); cpu.reg.flag(H,false); cpu.reg.flag(N,false); 1 }, 0xF3 => { cpu.ime = false; 1 }, 0xFB => { cpu.setei = 2; 1 }, 0x10 => { cpu.mmu.switch_speed(); 1 }, _ => unreachable!() } }
+fn op_misc(cpu: &mut CPU, op: u8) -> u32 { match op { 0x27 => { cpu.alu_daa(); 1 }, 0x2F => { cpu.reg.a = !cpu.reg.a; cpu.reg.flag(H,true); cpu.reg.flag(N,true); 1 }, 0x37 => { cpu.reg.flag(C,true); cpu.reg.flag(H,false); cpu.reg.flag(N,false); 1 }, 0x3F => { let c = cpu.reg.getflag(C); cpu.reg.flag(C,!c); cpu.reg.flag(H,false); cpu.reg.flag(N,false); 1 }, 0xF3 => { cpu.ime = false; 1 }, 0xFB => { cpu.setei = 2; 1 }, 0x10 => {
+    // STOP is a two-byte opcode (10 00). Consume the operand.
+    let _ = cpu.fetchbyte();
+    // Speed switch only applies on CGB when KEY1 bit 0 is set.
+    // For now, preserve previous behavior of calling switch_speed unconditionally;
+    // gating on CGB mode is a separate fix.
+    cpu.mmu.switch_speed();
+    1
+}, _ => unreachable!() } }
 
 // Simple LD A,(rr) and LD (rr),A for BC/DE plus HL +/- (0x0A,0x1A,0x02,0x12,0x22,0x2A,0x32,0x3A)
 fn op_ld_a_rr_ind(cpu: &mut CPU, op:u8) -> u32 { match op { 0x0A => cpu.reg.a = cpu.mmu.rb(cpu.reg.bc()), 0x1A => cpu.reg.a = cpu.mmu.rb(cpu.reg.de()), _=> unreachable!()}; 2 }
@@ -550,10 +570,9 @@ fn cb_set(cpu:&mut CPU, op:u8)->u32 { let bit = (op>>3)&0x07; let mask = 1<<bit;
 static CB_TABLE: [CbHandler;256] = { let mut t:[CbHandler;256] = [cb_rot;256]; let mut i=0; while i<256 { t[i]= if i<0x40 { cb_rot } else if i<0x80 { cb_bit } else if i<0xC0 { cb_res } else { cb_set }; i+=1;} t };
 fn op_cb(cpu:&mut CPU,_:u8)->u32 { let opc = cpu.fetchbyte(); CB_TABLE[opc as usize](cpu, opc) }
 
-fn op_fallback(_cpu: &mut CPU, op: u8) -> u32 { panic!("Unimplemented opcode {:02X}", op); }
+fn op_fallback(cpu: &mut CPU, _op: u8) -> u32 { cpu.halted = true; 1 }
 
 // Opcode table
-#[allow(non_upper_case_globals)]
 static OPCODE_TABLE: [OpHandler; 256] = {
     let mut table: [OpHandler; 256] = [op_fallback; 256];
     table[0x00] = op_00;
@@ -725,8 +744,37 @@ mod test {
             }
         }
         assert!(
-            sum_color == TIMING_COLOR_CHECKSUM, 
+            sum_color == TIMING_COLOR_CHECKSUM,
             "Color mode instruction timing test failed"
         );
+    }
+
+    #[test]
+    fn undefined_opcode_halts_instead_of_panicking() {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x100] = 0xD3; // undefined opcode
+        rom[0x147] = 0x00; // MBC0
+        let cart = mbc::Cartridge::from_buffer(rom, true).unwrap();
+        let mut cpu = CPU::new(cart, None).unwrap();
+        cpu.reg.pc = 0x100;
+        // Should NOT panic; CPU should be halted (or stuck) instead.
+        let _cycles = cpu.do_cycle();
+        assert!(cpu.halted, "CPU should be halted after undefined opcode");
+    }
+
+    #[test]
+    fn stop_consumes_operand_byte() {
+        use crate::mbc::Cartridge;
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x100] = 0x10; // STOP
+        rom[0x101] = 0x00; // mandatory STOP operand
+        rom[0x102] = 0x3C; // INC A -- should be the NEXT instruction
+        rom[0x147] = 0x00; // MBC0
+        let cart = Cartridge::from_buffer(rom, true).unwrap();
+        let mut cpu = CPU::new(cart, None).unwrap();
+        cpu.reg.pc = 0x100;
+        let _ = cpu.do_cycle(); // executes STOP
+        assert_eq!(cpu.reg.pc, 0x102,
+            "STOP must advance PC by 2 (opcode + operand), got {:04X}", cpu.reg.pc);
     }
 }

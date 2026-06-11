@@ -79,12 +79,12 @@ impl Registers {
     }
     pub fn hld(&mut self) -> u16 {
         let res = self.hl();
-        self.sethl(res - 1);
+        self.sethl(res.wrapping_sub(1));
         res
     }
     pub fn hli(&mut self) -> u16 {
         let res = self.hl();
-        self.sethl(res + 1);
+        self.sethl(res.wrapping_add(1));
         res
     }
 

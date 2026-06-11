@@ -40,6 +40,7 @@ pub struct MMU {
     gbspeed: GbSpeed,
     speed_switch_req: bool,
     undocumented_cgb_regs: [u8; 3], // 0xFF72, 0xFF73, 0xFF75
+    oam_dma_source: u8,
 }
 
 fn fill_random(slice: &mut [u8], start: u32) {
@@ -82,6 +83,7 @@ impl MMU {
             hdma_status: DMAType::NoDMA,
             hdma_len: 0xFF,
             undocumented_cgb_regs: [0; 3],
+            oam_dma_source: 0xFF,
         };
         fill_random(&mut res.wram, 42);
         if res.rb(0x0143) == 0xC0 {
@@ -106,7 +108,7 @@ impl MMU {
             serial: serial,
             timer: Timer::new(),
             keypad: Keypad::new(),
-            gpu: GPU::new_cgb(),
+            gpu: GPU::new(),
             sound: None,
             mbc: cart,
             gbmode: GbMode::Color,
@@ -117,6 +119,7 @@ impl MMU {
             hdma_status: DMAType::NoDMA,
             hdma_len: 0xFF,
             undocumented_cgb_regs: [0; 3],
+            oam_dma_source: 0xFF,
         };
         fill_random(&mut res.wram, 42);
         res.determine_mode();
@@ -132,7 +135,6 @@ impl MMU {
         self.wb(0xFF11, 0xBF);
         self.wb(0xFF12, 0xF3);
         self.wb(0xFF14, 0xBF);
-        self.wb(0xFF16, 0x3F);
         self.wb(0xFF16, 0x3F);
         self.wb(0xFF17, 0);
         self.wb(0xFF19, 0xBF);
@@ -220,6 +222,7 @@ impl MMU {
                     })
                     | (if self.speed_switch_req { 1 } else { 0 })
             }
+            0xFF46 => self.oam_dma_source,
             0xFF40..=0xFF4F => self.gpu.rb(address),
             0xFF51..=0xFF55 => self.hdma_read(address),
             0xFF68..=0xFF6B => self.gpu.rb(address),
@@ -234,7 +237,7 @@ impl MMU {
     }
 
     pub fn rw(&mut self, address: u16) -> u16 {
-        (self.rb(address) as u16) | ((self.rb(address + 1) as u16) << 8)
+        (self.rb(address) as u16) | ((self.rb(address.wrapping_add(1)) as u16) << 8)
     }
 
     pub fn wb(&mut self, address: u16, value: u8) {
@@ -249,7 +252,15 @@ impl MMU {
             0xFE00..=0xFE9F => self.gpu.wb(address, value),
             0xFF00 => self.keypad.wb(value),
             0xFF01..=0xFF02 => self.serial.wb(address, value),
-            0xFF04..=0xFF07 => self.timer.wb(address, value),
+            0xFF04 => {
+                self.timer.wb(address, value);
+                // The DIV-APU frame sequencer is tapped off DIV; resetting DIV
+                // must reset the APU's frame-sequencer phase too.
+                if let Some(s) = self.sound.as_mut() {
+                    s.reset_div();
+                }
+            }
+            0xFF05..=0xFF07 => self.timer.wb(address, value),
             0xFF10..=0xFF3F => self.sound.as_mut().map_or((), |s| s.wb(address, value)),
             0xFF46 => self.oamdma(value),
             0xFF4D | 0xFF4F | 0xFF51..=0xFF55 | 0xFF6C | 0xFF70 | 0xFF76..=0xFF77
@@ -280,7 +291,7 @@ impl MMU {
 
     pub fn ww(&mut self, address: u16, value: u16) {
         self.wb(address, (value & 0xFF) as u8);
-        self.wb(address + 1, (value >> 8) as u8);
+        self.wb(address.wrapping_add(1), (value >> 8) as u8);
     }
 
     pub fn switch_speed(&mut self) {
@@ -295,6 +306,7 @@ impl MMU {
     }
 
     fn oamdma(&mut self, value: u8) {
+        self.oam_dma_source = value;
         let base = (value as u16) << 8;
         for i in 0..0xA0 {
             let b = self.rb(base + i);
@@ -313,7 +325,10 @@ impl MMU {
                         0
                     }
             }
-            _ => panic!("The address {:04X} should not be handled by hdma_read", a),
+            _ => {
+                debug_assert!(false, "hdma_read called with unhandled address {:04X}", a);
+                0xFF
+            }
         }
     }
 
@@ -324,17 +339,18 @@ impl MMU {
             0xFF53 => self.hdma[2] = v & 0x1F,
             0xFF54 => self.hdma[3] = v & 0xF0,
             0xFF55 => {
-                if self.hdma_status == DMAType::HDMA {
-                    if v & 0x80 == 0 {
-                        self.hdma_status = DMAType::NoDMA;
-                    };
+                if self.hdma_status == DMAType::HDMA && v & 0x80 == 0 {
+                    // Pan Docs: writing bit 7 = 0 during HDMA stops it.
+                    self.hdma_status = DMAType::NoDMA;
                     return;
                 }
+                // If bit 7 = 1, fall through and (re)start a new transfer with new
+                // parameters regardless of current status.
                 let src = ((self.hdma[0] as u16) << 8) | (self.hdma[1] as u16);
                 let dst = ((self.hdma[2] as u16) << 8) | (self.hdma[3] as u16) | 0x8000;
-                if !(src <= 0x7FF0 || (src >= 0xA000 && src <= 0xDFF0)) {
-                    panic!("HDMA transfer with illegal start address {:04X}", src);
-                }
+                // Real hardware doesn't crash on illegal HDMA source; the transfer reads
+                // open bus (0xFF). Our self.rb() already returns 0xFF for unmapped ranges,
+                // so just let the transfer proceed.
 
                 self.hdma_src = src;
                 self.hdma_dst = dst;
@@ -346,7 +362,7 @@ impl MMU {
                     DMAType::GDMA
                 };
             }
-            _ => panic!("The address {:04X} should not be handled by hdma_write", a),
+            _ => debug_assert!(false, "hdma_write called with unhandled address {:04X}", a),
         };
     }
 
@@ -359,7 +375,7 @@ impl MMU {
     }
 
     fn perform_hdma(&mut self) -> u32 {
-        if self.gpu.may_hdma() == false {
+        if !self.gpu.may_hdma() {
             return 0;
         }
 
@@ -384,16 +400,53 @@ impl MMU {
     fn perform_vramdma_row(&mut self) {
         let mmu_src = self.hdma_src;
         for j in 0..0x10 {
-            let b: u8 = self.rb(mmu_src + j);
-            self.gpu.wb(self.hdma_dst + j, b);
+            let b: u8 = self.rb(mmu_src.wrapping_add(j));
+            self.gpu.wb(self.hdma_dst.wrapping_add(j), b);
         }
-        self.hdma_src += 0x10;
-        self.hdma_dst += 0x10;
+        self.hdma_src = self.hdma_src.wrapping_add(0x10);
+        // Pan Docs: destination upper 3 bits forced to 100b, low 4 bits ignored,
+        // bits 12-4 respected -- so wrap into 0x8000..=0x9FFF.
+        self.hdma_dst = 0x8000 | (self.hdma_dst.wrapping_add(0x10) & 0x1FF0);
 
         if self.hdma_len == 0 {
             self.hdma_len = 0x7F;
         } else {
             self.hdma_len -= 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::apu::AudioPlayer;
+
+    struct NoopPlayer;
+    impl AudioPlayer for NoopPlayer {
+        fn play(&mut self, _: &[f32], _: &[f32]) {}
+        fn samples_rate(&self) -> u32 {
+            44_100
+        }
+        fn underflowed(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn mmu_wb_ff04_resets_apu_frame_sequencer() {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x147] = 0x00; // ROM-only, MBC0
+        let cart = mbc::Cartridge::from_buffer(rom, true).unwrap();
+        let mut mmu = MMU::new(cart, None).unwrap();
+        mmu.sound = Some(Sound::new_dmg(Box::new(NoopPlayer)));
+        mmu.sound.as_mut().unwrap().set_frame_step_for_test(5);
+
+        mmu.wb(0xFF04, 0x00);
+
+        assert_eq!(
+            mmu.sound.as_ref().unwrap().frame_step_for_test(),
+            0,
+            "FF04 (DIV) write must reset the APU frame sequencer phase"
+        );
     }
 }

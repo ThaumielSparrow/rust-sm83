@@ -57,7 +57,7 @@ impl MBC for MBC1 {
         *self.rom.get(idx).unwrap_or(&0xFF)
     }
     fn readram(&self, a: u16) -> u8 {
-        if !self.ram_on {
+        if !self.ram_on || self.ram.is_empty() {
             return 0xFF;
         }
         let rambank = if self.banking_mode == 1 {
@@ -65,7 +65,8 @@ impl MBC for MBC1 {
         } else {
             0
         };
-        self.ram[(rambank * 0x2000) | ((a & 0x1FFF) as usize)]
+        let idx = (rambank * 0x2000) | ((a & 0x1FFF) as usize);
+        *self.ram.get(idx).unwrap_or(&0xFF)
     }
 
     fn writerom(&mut self, a: u16, v: u8) {
@@ -92,12 +93,12 @@ impl MBC for MBC1 {
             0x6000..=0x7FFF => {
                 self.banking_mode = v & 0x01;
             }
-            _ => panic!("Could not write to {:04X} (MBC1)", a),
+            _ => (),
         }
     }
 
     fn writeram(&mut self, a: u16, v: u8) {
-        if !self.ram_on {
+        if !self.ram_on || self.ram.is_empty() {
             return;
         }
         let rambank = if self.banking_mode == 1 {
@@ -134,5 +135,33 @@ impl MBC for MBC1 {
         let result = self.ram_updated;
         self.ram_updated = false;
         result
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::mbc::MBC;
+
+    fn no_ram_cart() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x147] = 0x01; // MBC1, no RAM
+        rom[0x148] = 0x00;
+        rom[0x149] = 0x00;
+        rom
+    }
+
+    #[test]
+    fn mbc1_no_ram_read_returns_0xff_no_panic() {
+        let mut mbc = MBC1::new(no_ram_cart()).unwrap();
+        mbc.writerom(0x0000, 0x0A);
+        assert_eq!(mbc.readram(0xA000), 0xFF);
+    }
+
+    #[test]
+    fn mbc1_no_ram_write_does_not_panic() {
+        let mut mbc = MBC1::new(no_ram_cart()).unwrap();
+        mbc.writerom(0x0000, 0x0A);
+        mbc.writeram(0xA000, 0x42);
     }
 }
