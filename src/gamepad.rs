@@ -176,6 +176,95 @@ pub fn keypad_key_from_name(s: &str) -> Option<KeypadKey> {
     })
 }
 
+/// Left-stick press/release thresholds with hysteresis (spec: press past 0.5,
+/// release below 0.35) so values jittering near the threshold don't chatter.
+pub const STICK_PRESS: f32 = 0.5;
+pub const STICK_RELEASE: f32 = 0.35;
+
+const DIR_UP: usize = 0;
+const DIR_DOWN: usize = 1;
+const DIR_LEFT: usize = 2;
+const DIR_RIGHT: usize = 3;
+const DIRS: [KeypadKey; 4] = [KeypadKey::Up, KeypadKey::Down, KeypadKey::Left, KeypadKey::Right];
+
+fn dir_index(k: KeypadKey) -> Option<usize> {
+    match k {
+        KeypadKey::Up => Some(DIR_UP),
+        KeypadKey::Down => Some(DIR_DOWN),
+        KeypadKey::Left => Some(DIR_LEFT),
+        KeypadKey::Right => Some(DIR_RIGHT),
+        _ => None,
+    }
+}
+
+/// `magnitude` is the axis deflection *toward* the direction (always >= 0 when
+/// the stick points that way).
+fn hysteresis(held: bool, magnitude: f32) -> bool {
+    if magnitude > STICK_PRESS {
+        true
+    } else if magnitude < STICK_RELEASE {
+        false
+    } else {
+        held
+    }
+}
+
+/// Tracks stick-derived and button-derived direction state separately and
+/// emits a press/release transition only when the OR of the two changes.
+/// Non-direction GB buttons pass through `set_button` untouched.
+#[derive(Default)]
+pub struct DirectionMux {
+    stick: [bool; 4],
+    button: [bool; 4],
+}
+
+impl DirectionMux {
+    fn combined(&self, i: usize) -> bool {
+        self.stick[i] || self.button[i]
+    }
+
+    fn update_axis_pair(
+        &mut self,
+        neg_dir: usize,
+        pos_dir: usize,
+        v: f32,
+        out: &mut Vec<(KeypadKey, bool)>,
+    ) {
+        let before = [self.combined(neg_dir), self.combined(pos_dir)];
+        self.stick[neg_dir] = hysteresis(self.stick[neg_dir], -v);
+        self.stick[pos_dir] = hysteresis(self.stick[pos_dir], v);
+        let after = [self.combined(neg_dir), self.combined(pos_dir)];
+        if before[0] != after[0] {
+            out.push((DIRS[neg_dir], after[0]));
+        }
+        if before[1] != after[1] {
+            out.push((DIRS[pos_dir], after[1]));
+        }
+    }
+
+    pub fn set_stick_x(&mut self, v: f32, out: &mut Vec<(KeypadKey, bool)>) {
+        self.update_axis_pair(DIR_LEFT, DIR_RIGHT, v, out);
+    }
+
+    /// gilrs convention: positive LeftStickY is up.
+    pub fn set_stick_y(&mut self, v: f32, out: &mut Vec<(KeypadKey, bool)>) {
+        self.update_axis_pair(DIR_DOWN, DIR_UP, v, out);
+    }
+
+    pub fn set_button(&mut self, k: KeypadKey, pressed: bool, out: &mut Vec<(KeypadKey, bool)>) {
+        let Some(i) = dir_index(k) else {
+            out.push((k, pressed));
+            return;
+        };
+        let before = self.combined(i);
+        self.button[i] = pressed;
+        let after = self.combined(i);
+        if before != after {
+            out.push((DIRS[i], after));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +329,69 @@ mod tests {
             HotkeyAction::SaveState(3).to_system_action(true),
             Some(SystemAction::SaveState(3))
         ));
+    }
+
+    #[test]
+    fn stick_hysteresis_press_hold_release() {
+        let mut mux = DirectionMux::default();
+        let mut out = Vec::new();
+
+        mux.set_stick_x(-0.6, &mut out); // past press threshold
+        assert_eq!(out, vec![(KeypadKey::Left, true)]);
+
+        out.clear();
+        mux.set_stick_x(-0.4, &mut out); // in hysteresis band: still held
+        assert_eq!(out, vec![]);
+
+        out.clear();
+        mux.set_stick_x(-0.3, &mut out); // below release threshold
+        assert_eq!(out, vec![(KeypadKey::Left, false)]);
+
+        out.clear();
+        mux.set_stick_x(-0.45, &mut out); // band entered from below: NOT pressed
+        assert_eq!(out, vec![]);
+    }
+
+    #[test]
+    fn stick_y_positive_is_up() {
+        let mut mux = DirectionMux::default();
+        let mut out = Vec::new();
+        mux.set_stick_y(0.8, &mut out);
+        assert_eq!(out, vec![(KeypadKey::Up, true)]);
+        out.clear();
+        mux.set_stick_y(-0.8, &mut out);
+        // Up releases and Down presses.
+        assert!(out.contains(&(KeypadKey::Up, false)));
+        assert!(out.contains(&(KeypadKey::Down, true)));
+    }
+
+    #[test]
+    fn stick_and_dpad_or_together() {
+        let mut mux = DirectionMux::default();
+        let mut out = Vec::new();
+
+        mux.set_stick_x(0.9, &mut out); // stick holds Right
+        assert_eq!(out, vec![(KeypadKey::Right, true)]);
+
+        out.clear();
+        mux.set_button(KeypadKey::Right, true, &mut out); // d-pad also Right
+        assert_eq!(out, vec![], "already held: no duplicate press");
+
+        out.clear();
+        mux.set_button(KeypadKey::Right, false, &mut out); // d-pad released
+        assert_eq!(out, vec![], "stick still holds it: no release");
+
+        out.clear();
+        mux.set_stick_x(0.0, &mut out); // stick released too
+        assert_eq!(out, vec![(KeypadKey::Right, false)]);
+    }
+
+    #[test]
+    fn non_direction_buttons_pass_through() {
+        let mut mux = DirectionMux::default();
+        let mut out = Vec::new();
+        mux.set_button(KeypadKey::A, true, &mut out);
+        mux.set_button(KeypadKey::A, false, &mut out);
+        assert_eq!(out, vec![(KeypadKey::A, true), (KeypadKey::A, false)]);
     }
 }
