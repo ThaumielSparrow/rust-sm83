@@ -569,84 +569,34 @@ impl ApplicationHandler for RootApp {
                     }
                     return; // don't treat as game input
                 }
-                // System action dispatch. Reset and ToggleFullscreen need post-match handling
-                // (a method call or window mutation) once the &mut self.phase borrow is released.
-                let mut request_reset = false;
-                let mut apply_fs_now = false;
-                if let Some(action) = crate::input::system_action_for(&logical.as_ref(), state, *modifiers) {
-                    use crate::input::SystemAction;
-                    match action {
-                        SystemAction::SaveState(s) => {
-                            request_save_state(sender, save_slots, s, latest_frame);
-                        }
-                        SystemAction::LoadState(s) => {
-                            let _ = sender.send(GBEvent::LoadState(s));
-                        }
-                        SystemAction::TurboHold(press) => {
-                            if press {
-                                if !*turbo_toggle && !*turbo_held {
-                                    let _ = sender.send(GBEvent::SpeedUp);
-                                }
-                                *turbo_held = true;
-                            } else {
-                                *turbo_held = false;
-                                if !*turbo_toggle {
-                                    let _ = sender.send(GBEvent::SpeedDown);
-                                }
-                            }
-                        }
-                        SystemAction::TurboToggle => {
-                            *turbo_toggle = !*turbo_toggle;
-                            if *turbo_toggle {
-                                if !*turbo_held {
-                                    let _ = sender.send(GBEvent::SpeedUp);
-                                }
-                            } else if !*turbo_held {
-                                let _ = sender.send(GBEvent::SpeedDown);
-                            }
-                        }
-                        SystemAction::ToggleInterpolation => {
-                            renderoptions.linear_interpolation = !renderoptions.linear_interpolation;
-                        }
-                        SystemAction::TogglePause => {
-                            *paused = !*paused;
-                            let _ = sender.send(GBEvent::SetPaused(*paused));
-                        }
-                        SystemAction::Reset => {
-                            request_reset = true;
-                        }
-                        SystemAction::ToggleFullscreen => {
-                            *fullscreen = !*fullscreen;
-                            let fs = *fullscreen;
-                            crate::config::update_config(|c| c.fullscreen = fs);
-                            apply_fs_now = true;
-                        }
-                        SystemAction::ToggleMute => {
-                            if let Some(restored) = pre_mute_volume.take() {
-                                *volume = restored;
-                            } else {
-                                *pre_mute_volume = Some(*volume);
-                                *volume = 0;
-                            }
-                            let _ = sender.send(GBEvent::UpdateVolume(perceptual_to_linear(*volume)));
-                            let v = *volume;
-                            crate::config::update_config(|c| c.volume = v);
-                        }
-                        SystemAction::ToggleFpsOverlay => {
-                            *fps_overlay = !*fps_overlay;
-                            let on = *fps_overlay;
-                            crate::config::update_config(|c| c.fps_overlay = on);
-                        }
-                    }
+                if let Some(action) =
+                    crate::input::system_action_for(&logical.as_ref(), state, *modifiers)
+                {
+                    let outcome = handle_system_action(
+                        action,
+                        &mut SysCtx {
+                            sender,
+                            save_slots,
+                            latest_frame,
+                            renderoptions,
+                            turbo_toggle,
+                            turbo_held,
+                            volume,
+                            pre_mute_volume,
+                            paused,
+                            fullscreen,
+                            fps_overlay,
+                        },
+                    );
                     // Snapshot values we'll need outside the phase borrow.
                     let fs = *fullscreen;
                     let sc = self.scale;
-                    if apply_fs_now {
+                    if outcome.apply_fullscreen {
                         if let Some(win) = &self.window {
                             apply_window_mode(win, sc, fs);
                         }
                     }
-                    if request_reset {
+                    if outcome.request_reset {
                         self.pending_action = Some(PendingAction::Reset);
                     }
                     return;
@@ -1056,6 +1006,100 @@ fn request_save_state(
     if sender.send(GBEvent::SaveState { slot, thumbnail }).is_err() {
         save_slots.mark_failed(slot);
     }
+}
+
+/// Side effects of a system action that can't run while `self.phase` is
+/// mutably borrowed; the caller applies them after the borrow ends.
+#[derive(Default)]
+struct SysOutcome {
+    request_reset: bool,
+    apply_fullscreen: bool,
+}
+
+/// Mutable slices of the Running phase needed to execute a SystemAction.
+/// Shared by the keyboard path (window_event) and the gamepad path
+/// (poll_gamepad) so dispatch logic exists exactly once.
+struct SysCtx<'a> {
+    sender: &'a mpsc::Sender<GBEvent>,
+    save_slots: &'a mut SaveSlotCache,
+    latest_frame: &'a Option<Arc<Vec<u8>>>,
+    renderoptions: &'a mut RenderOptions,
+    turbo_toggle: &'a mut bool,
+    turbo_held: &'a mut bool,
+    volume: &'a mut u8,
+    pre_mute_volume: &'a mut Option<u8>,
+    paused: &'a mut bool,
+    fullscreen: &'a mut bool,
+    fps_overlay: &'a mut bool,
+}
+
+fn handle_system_action(action: crate::input::SystemAction, ctx: &mut SysCtx) -> SysOutcome {
+    use crate::input::SystemAction;
+    let mut outcome = SysOutcome::default();
+    match action {
+        SystemAction::SaveState(s) => {
+            request_save_state(ctx.sender, ctx.save_slots, s, ctx.latest_frame);
+        }
+        SystemAction::LoadState(s) => {
+            let _ = ctx.sender.send(GBEvent::LoadState(s));
+        }
+        SystemAction::TurboHold(press) => {
+            if press {
+                if !*ctx.turbo_toggle && !*ctx.turbo_held {
+                    let _ = ctx.sender.send(GBEvent::SpeedUp);
+                }
+                *ctx.turbo_held = true;
+            } else {
+                *ctx.turbo_held = false;
+                if !*ctx.turbo_toggle {
+                    let _ = ctx.sender.send(GBEvent::SpeedDown);
+                }
+            }
+        }
+        SystemAction::TurboToggle => {
+            *ctx.turbo_toggle = !*ctx.turbo_toggle;
+            if *ctx.turbo_toggle {
+                if !*ctx.turbo_held {
+                    let _ = ctx.sender.send(GBEvent::SpeedUp);
+                }
+            } else if !*ctx.turbo_held {
+                let _ = ctx.sender.send(GBEvent::SpeedDown);
+            }
+        }
+        SystemAction::ToggleInterpolation => {
+            ctx.renderoptions.linear_interpolation = !ctx.renderoptions.linear_interpolation;
+        }
+        SystemAction::TogglePause => {
+            *ctx.paused = !*ctx.paused;
+            let _ = ctx.sender.send(GBEvent::SetPaused(*ctx.paused));
+        }
+        SystemAction::Reset => {
+            outcome.request_reset = true;
+        }
+        SystemAction::ToggleFullscreen => {
+            *ctx.fullscreen = !*ctx.fullscreen;
+            let fs = *ctx.fullscreen;
+            crate::config::update_config(|c| c.fullscreen = fs);
+            outcome.apply_fullscreen = true;
+        }
+        SystemAction::ToggleMute => {
+            if let Some(restored) = ctx.pre_mute_volume.take() {
+                *ctx.volume = restored;
+            } else {
+                *ctx.pre_mute_volume = Some(*ctx.volume);
+                *ctx.volume = 0;
+            }
+            let _ = ctx.sender.send(GBEvent::UpdateVolume(perceptual_to_linear(*ctx.volume)));
+            let v = *ctx.volume;
+            crate::config::update_config(|c| c.volume = v);
+        }
+        SystemAction::ToggleFpsOverlay => {
+            *ctx.fps_overlay = !*ctx.fps_overlay;
+            let on = *ctx.fps_overlay;
+            crate::config::update_config(|c| c.fps_overlay = on);
+        }
+    }
+    outcome
 }
 
 fn drain_gui_events(receiver: &Receiver<GuiEvent>, save_slots: &mut SaveSlotCache) {
