@@ -5,9 +5,6 @@ use std::time::{Duration, Instant};
 
 use rust_gbe::device::{Device, SaveStatePreview};
 
-// Global setting for additional periodic auto-save functionality
-static AUTO_SAVE_ENABLED: bool = false;
-
 pub enum GBEvent {
     KeyUp(rust_gbe::KeypadKey),
     KeyDown(rust_gbe::KeypadKey),
@@ -27,6 +24,30 @@ pub enum GBEvent {
 pub enum GuiEvent {
     SaveStateSaved { slot: u8, preview: SaveStatePreview },
     SaveStateFailed { slot: u8 },
+}
+
+/// Number of emulated frames between background battery-RAM saves. At ~60 fps
+/// this is roughly one second; the exit-flush path catches any pending dirty
+/// state, so this is purely a write-rate throttle to avoid hammering the disk
+/// when a game touches SRAM many times per second.
+const RAM_SAVE_DEBOUNCE_FRAMES: u64 = 60;
+
+/// Pure debounce predicate for battery-RAM autosave. Returns true when a disk
+/// write should happen on this frame: only when dirty, and only once the
+/// throttle interval has elapsed since the last save (or no save yet).
+fn should_save_ram(
+    dirty: bool,
+    last_save_frame: Option<u64>,
+    current_frame: u64,
+    threshold: u64,
+) -> bool {
+    if !dirty {
+        return false;
+    }
+    match last_save_frame {
+        None => true,
+        Some(last) => current_frame.saturating_sub(last) >= threshold,
+    }
 }
 
 pub fn construct_cpu_auto(filename: &str) -> Option<(Box<Device>, bool)> {
@@ -69,9 +90,13 @@ pub fn run_cpu(
 
     let base_waitticks = (4_194_304f64 / 1000.0 * 16.0).round() as u32; // ~16ms frame chunk
     let mut ticks = 0;
-    let mut frame_count = 0;
-    let mut last_ram_save_frame = 0;
-    let mut ram_needs_save = false;
+    let mut frame_count: u64 = 0;
+
+    // Battery-RAM autosave throttle: mark dirty when the cart touches SRAM, but
+    // only write to disk every RAM_SAVE_DEBOUNCE_FRAMES frames. Exit paths flush
+    // any pending dirty state so nothing is lost on quit.
+    let mut ram_dirty = false;
+    let mut last_ram_save_frame: Option<u64> = None;
 
     // Two reusable frame buffers; we only write to a buffer if it is uniquely held (strong_count==1).
     let frame_len = cpu.get_gpu_data().len();
@@ -99,6 +124,9 @@ pub fn run_cpu(
                                 next_fb = (idx + 1) % frame_buffers.len();
                             }
                             Err(TrySendError::Disconnected(..)) => {
+                                if let Err(e) = cpu.flush_to_disk() {
+                                    eprintln!("flush_to_disk failed: {}", e);
+                                }
                                 break 'outer;
                             }
                             Err(TrySendError::Full(_)) => { /* Drop frame if receiver busy */ }
@@ -113,14 +141,13 @@ pub fn run_cpu(
             frame_count += 1;
 
             if cpu.check_and_reset_ram_updated() {
-                if cpu.save_battery_ram_silent().is_ok() {}
-                ram_needs_save = false;
-                last_ram_save_frame = frame_count;
+                ram_dirty = true;
             }
-            if AUTO_SAVE_ENABLED && ram_needs_save && (frame_count - last_ram_save_frame) > 180 {
-                if cpu.save_battery_ram_silent().is_ok() {
-                    ram_needs_save = false;
-                }
+            if should_save_ram(ram_dirty, last_ram_save_frame, frame_count, RAM_SAVE_DEBOUNCE_FRAMES)
+            {
+                let _ = cpu.save_battery_ram_silent();
+                ram_dirty = false;
+                last_ram_save_frame = Some(frame_count);
             }
         } else {
             // While paused, ensure we don't busy-loop or overflow tick budgeting.
@@ -169,11 +196,19 @@ pub fn run_cpu(
                         paused = p;
                     }
                     GBEvent::Shutdown => {
+                        if let Err(e) = cpu.flush_to_disk() {
+                            eprintln!("flush_to_disk failed: {}", e);
+                        }
                         break 'outer;
                     }
                 },
                 Err(TryRecvError::Empty) => break 'recv,
-                Err(TryRecvError::Disconnected) => break 'outer,
+                Err(TryRecvError::Disconnected) => {
+                    if let Err(e) = cpu.flush_to_disk() {
+                        eprintln!("flush_to_disk failed: {}", e);
+                    }
+                    break 'outer;
+                }
             }
         }
 
@@ -203,5 +238,22 @@ pub fn run_cpu(
             }
         }
         last_frame_instant = Instant::now();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debounce_blocks_writes_until_threshold() {
+        // First dirty frame with no prior save → save now.
+        assert!(should_save_ram(true, None, 100, 60));
+        // 59 frames since last save → still throttled.
+        assert!(!should_save_ram(true, Some(100), 159, 60));
+        // Exactly threshold reached → save.
+        assert!(should_save_ram(true, Some(100), 160, 60));
+        // Clean state never saves.
+        assert!(!should_save_ram(false, Some(100), 1000, 60));
     }
 }

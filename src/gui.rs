@@ -184,7 +184,6 @@ impl RootApp {
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_string_lossy().to_string()))
             .unwrap_or_else(|| ".".to_string());
-        let _cfg = Config::load(&config_path());
         RootApp {
             window: None,
             display: None,
@@ -252,8 +251,7 @@ impl RootApp {
         let (sender, recv_events) = mpsc::channel();
         let (frame_sender, frame_receiver) = mpsc::sync_channel(1);
         let (ui_sender, ui_receiver) = mpsc::channel();
-        let frame_sender_clone = frame_sender.clone();
-        let emu_thread = thread::spawn(move || run_cpu(cpu, frame_sender_clone, recv_events, ui_sender));
+        let emu_thread = thread::spawn(move || run_cpu(cpu, frame_sender, recv_events, ui_sender));
         if let Some(display) = &self.display {
             let texture = glium::texture::texture2d::Texture2d::empty_with_format(
                 display,
@@ -369,6 +367,13 @@ impl ApplicationHandler for RootApp {
         }
     }
 
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Belt-and-suspenders: runs once when the event loop is destroyed,
+        // catching any exit path that calls event_loop.exit() without first
+        // going through CloseRequested. Idempotent — a no-op if already stopped.
+        self.stop_emulator();
+    }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -393,6 +398,11 @@ impl ApplicationHandler for RootApp {
 
         match (&mut self.phase, event) {
             (_, WindowEvent::CloseRequested) => {
+                // Join the emulator thread so its flush_to_disk / battery-RAM
+                // save runs before we tear down the event loop. Without this,
+                // the most common quit path (OS close button) races process
+                // exit and can drop the latest SRAM / auto-save.
+                self.stop_emulator();
                 event_loop.exit();
             }
             (
@@ -486,7 +496,7 @@ impl ApplicationHandler for RootApp {
                     self.start_game_from_path(p);
                 }
                 if quit_requested {
-                    self.exit_code = EXITCODE_CPULOADFAILS;
+                    self.exit_code = EXITCODE_SUCCESS;
                     event_loop.exit();
                 }
             }
@@ -1376,43 +1386,20 @@ fn dynamic_winit_to_keypad(
     key: winit::keyboard::Key<&str>,
     bindings: &KeyBindings,
 ) -> Option<rust_gbe::KeypadKey> {
-    use winit::keyboard::{Key, NamedKey};
-    match key {
-        Key::Character(c) => {
-            let upc = c.to_uppercase();
-            if upc == bindings.a {
-                Some(rust_gbe::KeypadKey::A)
-            } else if upc == bindings.b {
-                Some(rust_gbe::KeypadKey::B)
-            } else if upc == bindings.start {
-                Some(rust_gbe::KeypadKey::Start)
-            } else if upc == bindings.select {
-                Some(rust_gbe::KeypadKey::Select)
-            } else if upc == bindings.up {
-                Some(rust_gbe::KeypadKey::Up)
-            } else if upc == bindings.down {
-                Some(rust_gbe::KeypadKey::Down)
-            } else if upc == bindings.left {
-                Some(rust_gbe::KeypadKey::Left)
-            } else if upc == bindings.right {
-                Some(rust_gbe::KeypadKey::Right)
-            } else {
-                None
-            }
-        }
-        Key::Named(named) => match named {
-            NamedKey::ArrowUp if bindings.up == "ArrowUp" => Some(rust_gbe::KeypadKey::Up),
-            NamedKey::ArrowDown if bindings.down == "ArrowDown" => Some(rust_gbe::KeypadKey::Down),
-            NamedKey::ArrowLeft if bindings.left == "ArrowLeft" => Some(rust_gbe::KeypadKey::Left),
-            NamedKey::ArrowRight if bindings.right == "ArrowRight" => {
-                Some(rust_gbe::KeypadKey::Right)
-            }
-            NamedKey::Space if bindings.select == "Space" => Some(rust_gbe::KeypadKey::Select),
-            NamedKey::Enter if bindings.start == "Enter" => Some(rust_gbe::KeypadKey::Start),
-            _ => None,
-        },
-        _ => None,
-    }
+    // Single lookup path: render the key to its string form and compare against
+    // each binding. This lets a user bind A to "ArrowUp" or Up to "X" without
+    // duplicating per-NamedKey checks.
+    let key_str = key_to_string(&key);
+    let key_upper = key_str.to_uppercase();
+    if key_upper == bindings.a.to_uppercase() { return Some(rust_gbe::KeypadKey::A); }
+    if key_upper == bindings.b.to_uppercase() { return Some(rust_gbe::KeypadKey::B); }
+    if key_upper == bindings.start.to_uppercase() { return Some(rust_gbe::KeypadKey::Start); }
+    if key_upper == bindings.select.to_uppercase() { return Some(rust_gbe::KeypadKey::Select); }
+    if key_upper == bindings.up.to_uppercase() { return Some(rust_gbe::KeypadKey::Up); }
+    if key_upper == bindings.down.to_uppercase() { return Some(rust_gbe::KeypadKey::Down); }
+    if key_upper == bindings.left.to_uppercase() { return Some(rust_gbe::KeypadKey::Left); }
+    if key_upper == bindings.right.to_uppercase() { return Some(rust_gbe::KeypadKey::Right); }
+    None
 }
 
 fn key_to_string(key: &winit::keyboard::Key<&str>) -> String {

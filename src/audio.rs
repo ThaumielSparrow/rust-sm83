@@ -54,7 +54,16 @@ impl CpalPlayer {
 }
 
 fn cpal_thread<T: Sample + FromSample<f32>>(outbuffer: &mut [T], audio_buffer: &Arc<Mutex<Vec<(f32, f32)>>>) {
-    let mut inbuffer = audio_buffer.lock().unwrap();
+    let mut inbuffer = match audio_buffer.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            // Contention or poison: fill with silence and skip this callback.
+            for sample in outbuffer.iter_mut() {
+                *sample = T::from_sample(0.0f32);
+            }
+            return;
+        }
+    };
     let outlen = ::std::cmp::min(outbuffer.len()/2, inbuffer.len());
     for (i, (l,r)) in inbuffer.drain(..outlen).enumerate() {
         outbuffer[i*2] = T::from_sample(l);
@@ -65,14 +74,28 @@ fn cpal_thread<T: Sample + FromSample<f32>>(outbuffer: &mut [T], audio_buffer: &
 impl rust_gbe::AudioPlayer for CpalPlayer {
     fn play(&mut self, left: &[f32], right: &[f32]) {
         debug_assert_eq!(left.len(), right.len());
-        let mut buf = self.buffer.lock().unwrap();
-        for (&l,&r) in left.iter().zip(right) {
-            if buf.len() > self.sample_rate as usize { return; } // cap ~1s buffered
-            buf.push((l,r));
+        let mut buf = match self.buffer.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let cap = self.sample_rate as usize;
+        let incoming = left.len(); // each element is a stereo pair (l, r)
+        if buf.len() + incoming > cap {
+            let excess = buf.len() + incoming - cap;
+            let drop_n = excess.min(buf.len());
+            buf.drain(0..drop_n);
+        }
+        for (&l, &r) in left.iter().zip(right) {
+            buf.push((l, r));
         }
     }
     fn samples_rate(&self) -> u32 { self.sample_rate }
-    fn underflowed(&self) -> bool { self.buffer.lock().unwrap().is_empty() }
+    fn underflowed(&self) -> bool {
+        match self.buffer.lock() {
+            Ok(g) => g.is_empty(),
+            Err(poisoned) => poisoned.into_inner().is_empty(),
+        }
+    }
 }
 
 /// Initialize audio output, returning a boxed `AudioPlayer` and the live stream.

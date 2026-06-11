@@ -99,7 +99,21 @@ impl Config {
         if let Ok(data) = fs::read_to_string(path) { if let Ok(cfg) = serde_json::from_str::<Config>(&data) { return cfg; } }
         Config::default()
     }
-    pub fn save(&self, path: &PathBuf) { if let Ok(data) = serde_json::to_string_pretty(self) { let _ = fs::write(path, data); } }
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let data = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("config serialize: {}", e))?;
+        let tmp = path.with_extension("json.tmp");
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&tmp).map_err(|e| format!("config create tmp: {}", e))?;
+            f.write_all(data.as_bytes())
+                .map_err(|e| format!("config write tmp: {}", e))?;
+            // fsync before rename so a crash can't leave a renamed-but-empty config.
+            f.sync_all().map_err(|e| format!("config sync tmp: {}", e))?;
+        }
+        fs::rename(&tmp, path).map_err(|e| format!("config rename: {}", e))?;
+        Ok(())
+    }
 
     /// Insert `p` at the front of recent_roms, deduplicating and truncating to 8.
     pub fn push_recent(&mut self, p: &Path) {
@@ -115,7 +129,9 @@ impl Config {
 pub fn update_config<F: FnOnce(&mut Config)>(f: F) {
     let mut cfg = Config::load(&config_path());
     f(&mut cfg);
-    cfg.save(&config_path());
+    if let Err(e) = cfg.save(&config_path()) {
+        eprintln!("config save failed: {}", e);
+    }
 }
 
 pub fn config_path() -> PathBuf {
