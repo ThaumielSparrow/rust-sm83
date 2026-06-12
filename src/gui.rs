@@ -121,8 +121,7 @@ impl FpsMeter {
     }
 }
 
-/// Which tab of the Keybindings window is visible. Tabs keep the window short
-/// enough to fit small game windows (e.g. 3x scale); a scroll bar catches the rest.
+/// Which tab of the Keybindings window is visible.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BindTab {
     Keyboard,
@@ -131,6 +130,16 @@ enum BindTab {
 
 /// Uniform width for binding-value buttons so rows in the keybindings grids line up.
 const BIND_BUTTON_WIDTH: f32 = 130.0;
+
+/// The keybindings editor lives in its own OS window (with its own GL context
+/// and egui instance) so it never has to fit inside the game window at small scales.
+struct BindWindow {
+    window: winit::window::Window,
+    display: glium::Display<glium::glutin::surface::WindowSurface>,
+    egui_glium: egui_glium::EguiGlium,
+    /// Last (w, h) requested to fit content; avoids re-requesting every frame.
+    requested_size: Option<(f32, f32)>,
+}
 
 // Unified state machine for ROM selection and emulator run to ensure a single EventLoop
 enum RootPhase {
@@ -153,7 +162,6 @@ enum RootPhase {
         keybindings: KeyBindings,
         capturing: Option<rust_gbe::KeypadKey>,
         _audio: Option<Stream>,
-        show_keybindings_window: bool,
         // Timestamp of last Escape press. A single press will set this; a second press
         // within ESC_DOUBLE_PRESS_MS will trigger emulator exit. Kept here so the state
         // survives between key events.
@@ -201,6 +209,8 @@ pub struct RootApp {
     pub exit_code: i32,
     /// None if gamepad support failed to initialize (headless, missing driver).
     gilrs: Option<Gilrs>,
+    /// Some while the keybindings window is open.
+    bind_window: Option<BindWindow>,
 }
 
 impl RootApp {
@@ -229,6 +239,85 @@ impl RootApp {
                     None
                 }
             },
+            bind_window: None,
+        }
+    }
+
+    /// Opens the keybindings window, or focuses it if already open.
+    fn open_bind_window(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(bw) = &self.bind_window {
+            bw.window.focus_window();
+            return;
+        }
+        let (window, display) = glium::backend::glutin::SimpleWindowBuilder::new()
+            .with_title("Keybindings")
+            .with_inner_size(320, 320)
+            .build(event_loop);
+        let egui_glium =
+            egui_glium::EguiGlium::new(egui::ViewportId::ROOT, &display, &window, &event_loop);
+        window.request_redraw();
+        self.bind_window = Some(BindWindow {
+            window,
+            display,
+            egui_glium,
+            requested_size: None,
+        });
+    }
+
+    /// Handles winit events addressed to the keybindings window. Keyboard
+    /// capture is processed here (the bind window has focus while rebinding);
+    /// Esc cancels an active capture, or closes the window if none is active.
+    fn bind_window_event(&mut self, event: WindowEvent) {
+        use winit::keyboard::{Key, NamedKey};
+        let RootApp { bind_window, phase, gilrs, .. } = self;
+        let Some(bw) = bind_window.as_mut() else { return };
+        let mut close = false;
+        let resp = bw.egui_glium.on_event(&bw.window, &event);
+        if resp.repaint {
+            bw.window.request_redraw();
+        }
+        if !resp.consumed {
+            match &event {
+                WindowEvent::CloseRequested => close = true,
+                WindowEvent::Resized(ps) => bw.display.resize((*ps).into()),
+                WindowEvent::RedrawRequested => draw_bind_window(bw, phase, gilrs.as_ref()),
+                WindowEvent::KeyboardInput { event: keyevent, .. }
+                    if keyevent.state == winit::event::ElementState::Pressed =>
+                {
+                    if let RootPhase::Running { keybindings, capturing, gamepad_capturing, .. } = phase {
+                        let logical = keyevent.logical_key.clone();
+                        if let Key::Named(NamedKey::Escape) = logical.as_ref() {
+                            if gamepad_capturing.is_some() {
+                                *gamepad_capturing = None;
+                            } else if capturing.is_some() {
+                                *capturing = None;
+                            } else {
+                                close = true;
+                            }
+                        } else if let Some(kp) = *capturing {
+                            let value = key_to_string(&logical.as_ref());
+                            match kp {
+                                rust_gbe::KeypadKey::A => keybindings.a = value.clone(),
+                                rust_gbe::KeypadKey::B => keybindings.b = value.clone(),
+                                rust_gbe::KeypadKey::Start => keybindings.start = value.clone(),
+                                rust_gbe::KeypadKey::Select => keybindings.select = value.clone(),
+                                rust_gbe::KeypadKey::Up => keybindings.up = value.clone(),
+                                rust_gbe::KeypadKey::Down => keybindings.down = value.clone(),
+                                rust_gbe::KeypadKey::Left => keybindings.left = value.clone(),
+                                rust_gbe::KeypadKey::Right => keybindings.right = value.clone(),
+                            }
+                            *capturing = None;
+                            let bindings_clone = keybindings.clone();
+                            crate::config::update_config(|c| c.keybindings = bindings_clone);
+                        }
+                        bw.window.request_redraw();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if close {
+            *bind_window = None;
         }
     }
 
@@ -313,7 +402,6 @@ impl RootApp {
                 keybindings: cfg.keybindings.clone(),
                 capturing: None,
                 _audio: audio_stream,
-                show_keybindings_window: false,
                 last_escape: None,
                 turbo_toggle: false,
                 turbo_held: false,
@@ -372,7 +460,7 @@ impl RootApp {
     fn poll_gamepad(&mut self) {
         // Destructure self so phase fields and the other RootApp fields can be
         // borrowed disjointly inside the loop.
-        let RootApp { gilrs, phase, window, scale, pending_action, .. } = self;
+        let RootApp { gilrs, phase, window, scale, pending_action, bind_window, .. } = self;
         let Some(gilrs) = gilrs.as_mut() else {
             return;
         };
@@ -475,8 +563,14 @@ impl RootApp {
         }
         // Gamepad input arrives outside winit's event stream, so nothing else
         // requests a repaint after it. One redraw per poll that saw input is cheap.
-        if any_activity && let Some(w) = window.as_ref() {
-            w.request_redraw();
+        if any_activity {
+            if let Some(w) = window.as_ref() {
+                w.request_redraw();
+            }
+            // Capture completions change binding rows shown in the bind window.
+            if let Some(bw) = bind_window.as_ref() {
+                bw.window.request_redraw();
+            }
         }
     }
 }
@@ -487,6 +581,149 @@ fn apply_window_mode(window: &winit::window::Window, scale: u32, fullscreen: boo
     } else {
         window.set_fullscreen(None);
         set_window_size(window, scale);
+    }
+}
+
+/// Renders the keybindings UI into its own OS window and resizes the window
+/// to fit the active tab's content.
+fn draw_bind_window(bw: &mut BindWindow, phase: &mut RootPhase, gilrs: Option<&Gilrs>) {
+    use glium::Surface;
+    let RootPhase::Running {
+        keybindings,
+        capturing,
+        gamepad_bindings,
+        resolved_gamepad,
+        gamepad_capturing,
+        bind_tab,
+        ..
+    } = phase
+    else {
+        return;
+    };
+    let gilrs_available = gilrs.is_some();
+    let pad_name: Option<String> =
+        gilrs.and_then(|g| g.gamepads().next().map(|(_, p)| p.name().to_string()));
+    let mut content_size = egui::Vec2::ZERO;
+    bw.egui_glium.run(&bw.window, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // CentralPanel expands to fill the window; measure a child scope
+            // (like the loader screen) so the resize below tracks content.
+            let content = ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(bind_tab, BindTab::Keyboard, "Keyboard");
+                    ui.selectable_value(bind_tab, BindTab::Controller, "Controller");
+                });
+                ui.separator();
+                let keys = [rust_gbe::KeypadKey::A, rust_gbe::KeypadKey::B, rust_gbe::KeypadKey::Start, rust_gbe::KeypadKey::Select,
+                    rust_gbe::KeypadKey::Up, rust_gbe::KeypadKey::Down, rust_gbe::KeypadKey::Left, rust_gbe::KeypadKey::Right];
+                let key_label = |k: rust_gbe::KeypadKey| match k { rust_gbe::KeypadKey::A=>"A", rust_gbe::KeypadKey::B=>"B", rust_gbe::KeypadKey::Start=>"Start", rust_gbe::KeypadKey::Select=>"Select", rust_gbe::KeypadKey::Up=>"Up", rust_gbe::KeypadKey::Down=>"Down", rust_gbe::KeypadKey::Left=>"Left", rust_gbe::KeypadKey::Right=>"Right" };
+                match *bind_tab {
+                    BindTab::Keyboard => {
+                        ui.label("Click a binding, then press a key (Esc to cancel capture). Reserved keys can't be used.");
+                        ui.add_space(4.0);
+                        egui::Grid::new("kb_bind_grid").num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
+                            for k in keys {
+                                ui.label(key_label(k));
+                                let active = matches_capturing(*capturing, k);
+                                let val = binding_value(keybindings, k);
+                                let conflict = is_reserved_key_name(&val);
+                                let label = if active { "(press key)".to_string() } else { val.clone() };
+                                let mut button = egui::Button::new(label).min_size(egui::vec2(BIND_BUTTON_WIDTH, 0.0));
+                                if conflict {
+                                    button = button.fill(egui::Color32::from_rgb(100,0,0));
+                                }
+                                if ui.add(button).clicked() {
+                                    *capturing = Some(k);
+                                    *gamepad_capturing = None; // keyboard capture replaces any gamepad capture
+                                }
+                                if conflict {
+                                    ui.colored_label(egui::Color32::RED, "Conflicts with system keybind");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                        if capturing.is_some() && ui.button("Cancel Capture").clicked() { *capturing=None; }
+                    }
+                    BindTab::Controller => {
+                        match (&pad_name, gilrs_available) {
+                            (Some(n), _) => { ui.label(format!("Connected: {}", n)); }
+                            (None, true) => { ui.colored_label(egui::Color32::GRAY, "No controller detected"); }
+                            (None, false) => { ui.colored_label(egui::Color32::GRAY, "Controller unavailable"); }
+                        }
+                        ui.label("Click a binding, then press a controller button (Esc to cancel capture).");
+                        ui.add_space(4.0);
+                        egui::Grid::new("pad_bind_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                            for k in keys {
+                                ui.label(key_label(k));
+                                let name = crate::gamepad::keypad_key_name(k);
+                                let active = matches!(gamepad_capturing, Some(BindTarget::Gb(g)) if *g == k);
+                                let bound = gamepad_bindings.buttons.get(name).cloned().unwrap_or_else(|| "Unbound".to_string());
+                                let label = if active { "(press button)".to_string() } else { bound };
+                                if ui.add(egui::Button::new(label).min_size(egui::vec2(BIND_BUTTON_WIDTH, 0.0))).clicked() {
+                                    *gamepad_capturing = Some(BindTarget::Gb(k));
+                                    *capturing = None; // gamepad capture replaces any keyboard capture
+                                }
+                                ui.end_row();
+                            }
+                        });
+                        ui.add_space(4.0);
+                        egui::CollapsingHeader::new("System hotkeys").default_open(false).show(ui, |ui| {
+                            egui::Grid::new("pad_hotkey_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                                for action in crate::gamepad::HotkeyAction::all() {
+                                    ui.label(action.label());
+                                    let active = matches!(gamepad_capturing, Some(BindTarget::Hotkey(a)) if *a == action);
+                                    let bound = gamepad_bindings.hotkeys.get(action.name()).cloned().unwrap_or_else(|| "Unbound".to_string());
+                                    let label = if active { "(press button)".to_string() } else { bound };
+                                    if ui.add(egui::Button::new(label).min_size(egui::vec2(BIND_BUTTON_WIDTH, 0.0))).clicked() {
+                                        *gamepad_capturing = Some(BindTarget::Hotkey(action));
+                                        *capturing = None;
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            if gamepad_capturing.is_some() && ui.button("Cancel Controller Capture").clicked() {
+                                *gamepad_capturing = None;
+                            }
+                            if ui.button("Reset Controller Defaults").clicked() {
+                                *gamepad_bindings = GamepadBindings::default();
+                                *resolved_gamepad = crate::gamepad::resolve(gamepad_bindings);
+                                *gamepad_capturing = None;
+                                let gb = gamepad_bindings.clone();
+                                crate::config::update_config(|c| c.gamepad = gb);
+                            }
+                        });
+                    }
+                }
+            });
+            content_size = content.response.rect.size();
+        });
+    });
+    let mut target = bw.display.draw();
+    target.clear_color(0.1, 0.1, 0.1, 1.0);
+    bw.egui_glium.paint(&bw.display, &mut target);
+    let _ = target.finish();
+    // Nothing else drives redraws of this window, so honor egui's repaint
+    // requests (collapsing-header animation, etc.) ourselves.
+    if bw.egui_glium.egui_ctx().has_requested_repaint() {
+        bw.window.request_redraw();
+    }
+    // Fit the window to the active tab's content (tab switches and the hotkeys
+    // expander change the size). Only re-request when the target changes so a
+    // denied/clamped request can't loop.
+    let desired = (
+        (content_size.x + 24.0).clamp(280.0, 800.0),
+        (content_size.y + 24.0).clamp(120.0, 800.0),
+    );
+    if bw
+        .requested_size
+        .is_none_or(|(w, h)| (w - desired.0).abs() > 2.0 || (h - desired.1).abs() > 2.0)
+    {
+        bw.requested_size = Some(desired);
+        let _ = bw
+            .window
+            .request_inner_size(winit::dpi::LogicalSize::new(desired.0, desired.1));
     }
 }
 
@@ -529,11 +766,17 @@ impl ApplicationHandler for RootApp {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
         use winit::event::ElementState::{Pressed, Released};
         use winit::keyboard::{Key, NamedKey};
+
+        // The keybindings window has its own egui instance and event handling.
+        if self.bind_window.as_ref().is_some_and(|b| b.window.id() == window_id) {
+            self.bind_window_event(event);
+            return;
+        }
 
         // Pass events to egui in all phases (menus in Running phase)
         if let Some(egui_glium) = &mut self.egui_glium {
@@ -699,7 +942,6 @@ impl ApplicationHandler for RootApp {
                     running,
                     keybindings,
                     capturing,
-                    show_keybindings_window,
                     last_escape,
                     turbo_toggle,
                     turbo_held,
@@ -777,29 +1019,24 @@ impl ApplicationHandler for RootApp {
                     return;
                 }
                 match (state, logical.as_ref()) {
-                    // Escape: if keybindings window open, close it immediately; else require double-press to exit.
+                    // Escape: require double-press to exit. (The keybindings
+                    // window is a separate OS window with its own Esc handling.)
                     (Pressed, Key::Named(NamedKey::Escape)) => {
-                        if *show_keybindings_window {
-                            *show_keybindings_window = false;
-                            // Do not treat this as a potential exit press
-                            *last_escape = None;
-                        } else {
-                            const ESC_DOUBLE_PRESS_MS: u128 = 500;
-                            let now = Instant::now();
-                            if let Some(prev) = last_escape {
-                                if now.duration_since(*prev).as_millis() <= ESC_DOUBLE_PRESS_MS {
-                                    // Second press within window -> exit
-                                    *running = false;
-                                    event_loop.exit();
-                                    *last_escape = None;
-                                } else {
-                                    // Too slow; treat this as new first press
-                                    *last_escape = Some(now);
-                                }
+                        const ESC_DOUBLE_PRESS_MS: u128 = 500;
+                        let now = Instant::now();
+                        if let Some(prev) = last_escape {
+                            if now.duration_since(*prev).as_millis() <= ESC_DOUBLE_PRESS_MS {
+                                // Second press within window -> exit
+                                *running = false;
+                                event_loop.exit();
+                                *last_escape = None;
                             } else {
-                                // First press: record timestamp and do nothing else
+                                // Too slow; treat this as new first press
                                 *last_escape = Some(now);
                             }
+                        } else {
+                            // First press: record timestamp and do nothing else
+                            *last_escape = Some(now);
                         }
                     }
                     (Pressed, wkey) => {
@@ -824,9 +1061,6 @@ impl ApplicationHandler for RootApp {
                     latest_frame,
                     renderoptions,
                     running,
-                    keybindings,
-                    capturing,
-                    show_keybindings_window,
                     turbo_toggle,
                     turbo_setting,
                     volume,
@@ -839,10 +1073,6 @@ impl ApplicationHandler for RootApp {
                     is_color,
                     palette_scratch,
                     pre_mute_volume,
-                    gamepad_bindings,
-                    resolved_gamepad,
-                    gamepad_capturing,
-                    bind_tab,
                     ..
                 },
                 WindowEvent::RedrawRequested,
@@ -857,12 +1087,8 @@ impl ApplicationHandler for RootApp {
                 let mut open_recent: Option<PathBuf> = None;
                 let mut new_scale: Option<u32> = None;
                 let mut apply_fullscreen_now = false;
+                let mut open_keybindings = false;
                 let recent_roms = Config::load(&config_path()).recent_roms;
-                let gilrs_available = self.gilrs.is_some();
-                let pad_name: Option<String> = self
-                    .gilrs
-                    .as_ref()
-                    .and_then(|g| g.gamepads().next().map(|(_, p)| p.name().to_string()));
                 if let (Some(display), Some(window), Some(egui_glium)) =
                     (&self.display, &self.window, &mut self.egui_glium)
                 {
@@ -992,7 +1218,7 @@ impl ApplicationHandler for RootApp {
                                         crate::config::update_config(|c| c.volume = v);
                                     }
                                     ui.separator();
-                                    if ui.button("Keybindings...").clicked() { *show_keybindings_window = true; }
+                                    if ui.button("Keybindings...").clicked() { open_keybindings = true; }
                                 });
                             });
                         });
@@ -1010,101 +1236,6 @@ impl ApplicationHandler for RootApp {
                                         }
                                     });
                                 });
-                        }
-
-                        if *show_keybindings_window {
-                            // vscroll keeps the window usable when the game window is
-                            // small (e.g. 3x scale): egui clamps the window to the
-                            // screen and scrolls the overflow instead of clipping it.
-                            egui::Window::new("Keybindings").open(show_keybindings_window).vscroll(true).show(ctx, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.selectable_value(bind_tab, BindTab::Keyboard, "Keyboard");
-                                    ui.selectable_value(bind_tab, BindTab::Controller, "Controller");
-                                });
-                                ui.separator();
-                                let keys = [rust_gbe::KeypadKey::A, rust_gbe::KeypadKey::B, rust_gbe::KeypadKey::Start, rust_gbe::KeypadKey::Select,
-                                    rust_gbe::KeypadKey::Up, rust_gbe::KeypadKey::Down, rust_gbe::KeypadKey::Left, rust_gbe::KeypadKey::Right];
-                                let key_label = |k: rust_gbe::KeypadKey| match k { rust_gbe::KeypadKey::A=>"A", rust_gbe::KeypadKey::B=>"B", rust_gbe::KeypadKey::Start=>"Start", rust_gbe::KeypadKey::Select=>"Select", rust_gbe::KeypadKey::Up=>"Up", rust_gbe::KeypadKey::Down=>"Down", rust_gbe::KeypadKey::Left=>"Left", rust_gbe::KeypadKey::Right=>"Right" };
-                                match *bind_tab {
-                                    BindTab::Keyboard => {
-                                        ui.label("Click a binding, then press a key (Esc to cancel capture). Reserved keys can't be used.");
-                                        ui.add_space(4.0);
-                                        egui::Grid::new("kb_bind_grid").num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
-                                            for k in keys {
-                                                ui.label(key_label(k));
-                                                let active = matches_capturing(*capturing, k);
-                                                let val = binding_value(keybindings, k);
-                                                let conflict = is_reserved_key_name(&val);
-                                                let label = if active { "(press key)".to_string() } else { val.clone() };
-                                                let mut button = egui::Button::new(label).min_size(egui::vec2(BIND_BUTTON_WIDTH, 0.0));
-                                                if conflict {
-                                                    button = button.fill(egui::Color32::from_rgb(100,0,0));
-                                                }
-                                                if ui.add(button).clicked() {
-                                                    *capturing = Some(k);
-                                                    *gamepad_capturing = None; // keyboard capture replaces any gamepad capture
-                                                }
-                                                if conflict {
-                                                    ui.colored_label(egui::Color32::RED, "Conflicts with system keybind");
-                                                }
-                                                ui.end_row();
-                                            }
-                                        });
-                                        if capturing.is_some() && ui.button("Cancel Capture").clicked() { *capturing=None; }
-                                    }
-                                    BindTab::Controller => {
-                                        match (&pad_name, gilrs_available) {
-                                            (Some(n), _) => { ui.label(format!("Connected: {}", n)); }
-                                            (None, true) => { ui.colored_label(egui::Color32::GRAY, "No controller detected"); }
-                                            (None, false) => { ui.colored_label(egui::Color32::GRAY, "Controller unavailable"); }
-                                        }
-                                        ui.label("Click a binding, then press a controller button (Esc to cancel capture).");
-                                        ui.add_space(4.0);
-                                        egui::Grid::new("pad_bind_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                                            for k in keys {
-                                                ui.label(key_label(k));
-                                                let name = crate::gamepad::keypad_key_name(k);
-                                                let active = matches!(gamepad_capturing, Some(BindTarget::Gb(g)) if *g == k);
-                                                let bound = gamepad_bindings.buttons.get(name).cloned().unwrap_or_else(|| "Unbound".to_string());
-                                                let label = if active { "(press button)".to_string() } else { bound };
-                                                if ui.add(egui::Button::new(label).min_size(egui::vec2(BIND_BUTTON_WIDTH, 0.0))).clicked() {
-                                                    *gamepad_capturing = Some(BindTarget::Gb(k));
-                                                    *capturing = None; // gamepad capture replaces any keyboard capture
-                                                }
-                                                ui.end_row();
-                                            }
-                                        });
-                                        ui.add_space(4.0);
-                                        egui::CollapsingHeader::new("System hotkeys").default_open(false).show(ui, |ui| {
-                                            egui::Grid::new("pad_hotkey_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                                                for action in crate::gamepad::HotkeyAction::all() {
-                                                    ui.label(action.label());
-                                                    let active = matches!(gamepad_capturing, Some(BindTarget::Hotkey(a)) if *a == action);
-                                                    let bound = gamepad_bindings.hotkeys.get(action.name()).cloned().unwrap_or_else(|| "Unbound".to_string());
-                                                    let label = if active { "(press button)".to_string() } else { bound };
-                                                    if ui.add(egui::Button::new(label).min_size(egui::vec2(BIND_BUTTON_WIDTH, 0.0))).clicked() {
-                                                        *gamepad_capturing = Some(BindTarget::Hotkey(action));
-                                                        *capturing = None;
-                                                    }
-                                                    ui.end_row();
-                                                }
-                                            });
-                                        });
-                                        ui.horizontal(|ui| {
-                                            if gamepad_capturing.is_some() && ui.button("Cancel Controller Capture").clicked() {
-                                                *gamepad_capturing = None;
-                                            }
-                                            if ui.button("Reset Controller Defaults").clicked() {
-                                                *gamepad_bindings = GamepadBindings::default();
-                                                *resolved_gamepad = crate::gamepad::resolve(gamepad_bindings);
-                                                *gamepad_capturing = None;
-                                                let gb = gamepad_bindings.clone();
-                                                crate::config::update_config(|c| c.gamepad = gb);
-                                            }
-                                        });
-                                    }
-                                }
-                            });
                         }
                     });
                     if quit_requested {
@@ -1186,6 +1317,9 @@ impl ApplicationHandler for RootApp {
                 }
                 if let Some(p) = open_recent {
                     self.pending_action = Some(PendingAction::LoadRom(p));
+                }
+                if open_keybindings {
+                    self.open_bind_window(event_loop);
                 }
             }
             // Drag-and-drop a ROM onto the running emulator: tear down and load the new one.
