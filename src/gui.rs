@@ -131,14 +131,20 @@ enum BindTab {
 /// Uniform width for binding-value buttons so rows in the keybindings grids line up.
 const BIND_BUTTON_WIDTH: f32 = 130.0;
 
+/// Fixed logical width of the keybindings window. Width is not auto-sized:
+/// full-width widgets (separators, wrapped labels) track the available width,
+/// so measuring it would chase the window size (see the height-only measure
+/// in `draw_bind_window`).
+const BIND_WINDOW_WIDTH: f32 = 440.0;
+
 /// The keybindings editor lives in its own OS window (with its own GL context
 /// and egui instance) so it never has to fit inside the game window at small scales.
 struct BindWindow {
     window: winit::window::Window,
     display: glium::Display<glium::glutin::surface::WindowSurface>,
     egui_glium: egui_glium::EguiGlium,
-    /// Last (w, h) requested to fit content; avoids re-requesting every frame.
-    requested_size: Option<(f32, f32)>,
+    /// Last height requested to fit content; avoids re-requesting every frame.
+    requested_height: Option<f32>,
 }
 
 // Unified state machine for ROM selection and emulator run to ensure a single EventLoop
@@ -251,7 +257,7 @@ impl RootApp {
         }
         let (window, display) = glium::backend::glutin::SimpleWindowBuilder::new()
             .with_title("Keybindings")
-            .with_inner_size(320, 320)
+            .with_inner_size(BIND_WINDOW_WIDTH as u32, 320)
             .build(event_loop);
         let egui_glium =
             egui_glium::EguiGlium::new(egui::ViewportId::ROOT, &display, &window, &event_loop);
@@ -260,7 +266,7 @@ impl RootApp {
             window,
             display,
             egui_glium,
-            requested_size: None,
+            requested_height: None,
         });
     }
 
@@ -603,7 +609,7 @@ fn draw_bind_window(bw: &mut BindWindow, phase: &mut RootPhase, gilrs: Option<&G
     let gilrs_available = gilrs.is_some();
     let pad_name: Option<String> =
         gilrs.and_then(|g| g.gamepads().next().map(|(_, p)| p.name().to_string()));
-    let mut content_size = egui::Vec2::ZERO;
+    let mut content_height: f32 = 0.0;
     bw.egui_glium.run(&bw.window, |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             // CentralPanel expands to fill the window; measure a child scope
@@ -697,7 +703,7 @@ fn draw_bind_window(bw: &mut BindWindow, phase: &mut RootPhase, gilrs: Option<&G
                     }
                 }
             });
-            content_size = content.response.rect.size();
+            content_height = content.response.rect.height();
         });
     });
     let mut target = bw.display.draw();
@@ -709,21 +715,19 @@ fn draw_bind_window(bw: &mut BindWindow, phase: &mut RootPhase, gilrs: Option<&G
     if bw.egui_glium.egui_ctx().has_requested_repaint() {
         bw.window.request_redraw();
     }
-    // Fit the window to the active tab's content (tab switches and the hotkeys
-    // expander change the size). Only re-request when the target changes so a
-    // denied/clamped request can't loop.
-    let desired = (
-        (content_size.x + 24.0).clamp(280.0, 800.0),
-        (content_size.y + 24.0).clamp(120.0, 800.0),
-    );
+    // Fit the window height to the active tab's content (tab switches and the
+    // hotkeys expander change it); width stays fixed (see BIND_WINDOW_WIDTH).
+    // Only re-request when the target changes so a denied/clamped request
+    // can't loop.
+    let desired = (content_height + 24.0).clamp(120.0, 800.0);
     if bw
-        .requested_size
-        .is_none_or(|(w, h)| (w - desired.0).abs() > 2.0 || (h - desired.1).abs() > 2.0)
+        .requested_height
+        .is_none_or(|h| (h - desired).abs() > 2.0)
     {
-        bw.requested_size = Some(desired);
+        bw.requested_height = Some(desired);
         let _ = bw
             .window
-            .request_inner_size(winit::dpi::LogicalSize::new(desired.0, desired.1));
+            .request_inner_size(winit::dpi::LogicalSize::new(BIND_WINDOW_WIDTH, desired));
     }
 }
 
