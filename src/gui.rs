@@ -431,41 +431,35 @@ impl RootApp {
                     GBEvent::KeyUp(*k)
                 });
             }
-            if let Some((action, pressed)) = hotkey {
-                if let Some(sa) = action.to_system_action(pressed) {
-                    let outcome = handle_system_action(
-                        sa,
-                        &mut SysCtx {
-                            sender,
-                            save_slots,
-                            latest_frame,
-                            renderoptions,
-                            turbo_toggle,
-                            turbo_held,
-                            volume,
-                            pre_mute_volume,
-                            paused,
-                            fullscreen,
-                            fps_overlay,
-                        },
-                    );
-                    if outcome.apply_fullscreen {
-                        if let Some(win) = window.as_ref() {
-                            apply_window_mode(win, *scale, *fullscreen);
-                        }
-                    }
-                    if outcome.request_reset {
-                        *pending_action = Some(PendingAction::Reset);
-                    }
+            if let Some((action, pressed)) = hotkey && let Some(sa) = action.to_system_action(pressed) {
+                let outcome = handle_system_action(
+                    sa,
+                    &mut SysCtx {
+                        sender,
+                        save_slots,
+                        latest_frame,
+                        renderoptions,
+                        turbo_toggle,
+                        turbo_held,
+                        volume,
+                        pre_mute_volume,
+                        paused,
+                        fullscreen,
+                        fps_overlay,
+                    },
+                );
+                if outcome.apply_fullscreen && let Some(win) = window.as_ref() {
+                    apply_window_mode(win, *scale, *fullscreen);
+                }
+                if outcome.request_reset {
+                    *pending_action = Some(PendingAction::Reset);
                 }
             }
         }
         // Gamepad input arrives outside winit's event stream, so nothing else
         // requests a repaint after it. One redraw per poll that saw input is cheap.
-        if any_activity {
-            if let Some(w) = window.as_ref() {
-                w.request_redraw();
-            }
+        if any_activity && let Some(w) = window.as_ref() {
+            w.request_redraw();
         }
     }
 }
@@ -687,13 +681,9 @@ impl ApplicationHandler for RootApp {
             ) => {
                 let state = keyevent.state;
                 let logical = keyevent.logical_key.clone();
-                if gamepad_capturing.is_some() {
-                    if let (winit::event::ElementState::Pressed, Key::Named(NamedKey::Escape)) =
-                        (state, logical.as_ref())
-                    {
-                        *gamepad_capturing = None;
-                        return;
-                    }
+                if gamepad_capturing.is_some() && let (winit::event::ElementState::Pressed, Key::Named(NamedKey::Escape)) = (state, logical.as_ref()) {
+                    *gamepad_capturing = None;
+                    return;
                 }
                 if let Some(kp) = *capturing {
                     // Capturing mode: ESC cancels, any other key assigns.
@@ -741,10 +731,8 @@ impl ApplicationHandler for RootApp {
                     // Snapshot values we'll need outside the phase borrow.
                     let fs = *fullscreen;
                     let sc = self.scale;
-                    if outcome.apply_fullscreen {
-                        if let Some(win) = &self.window {
-                            apply_window_mode(win, sc, fs);
-                        }
+                    if outcome.apply_fullscreen && let Some(win) = &self.window {
+                        apply_window_mode(win, sc, fs);
                     }
                     if outcome.request_reset {
                         self.pending_action = Some(PendingAction::Reset);
@@ -1003,6 +991,7 @@ impl ApplicationHandler for RootApp {
                                     }
                                     if ui.add(button).clicked() {
                                         *capturing = Some(k);
+                                        *gamepad_capturing = None; // keyboard capture replaces any gamepad capture
                                     }
                                     if conflict {
                                         ui.colored_label(egui::Color32::RED, "Conflicts with system keybind");
