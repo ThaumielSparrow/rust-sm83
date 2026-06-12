@@ -129,6 +129,9 @@ enum BindTab {
     Controller,
 }
 
+/// Uniform width for binding-value buttons so rows in the keybindings grids line up.
+const BIND_BUTTON_WIDTH: f32 = 130.0;
+
 // Unified state machine for ROM selection and emulator run to ensure a single EventLoop
 enum RootPhase {
     Selecting {
@@ -636,8 +639,12 @@ impl ApplicationHandler for RootApp {
                                 }
                             }
                             ui.add_space(8.0);
-                            ui.label("Tip: drag a .gb/.gbc file onto this window to load it.");
-                            content_height = ui.min_rect().height();
+                            let last = ui.label("Tip: drag a .gb/.gbc file onto this window to load it.");
+                            // CentralPanel expands its ui to fill the window, so
+                            // ui.min_rect() would measure the window itself and
+                            // feed back into the resize below (endless growth).
+                            // Measure top-of-content to bottom-of-last-widget.
+                            content_height = last.rect.bottom() - ui.max_rect().top();
                         });
                     });
                     // Paint after UI
@@ -1021,24 +1028,28 @@ impl ApplicationHandler for RootApp {
                                 match *bind_tab {
                                     BindTab::Keyboard => {
                                         ui.label("Click a binding, then press a key (Esc to cancel capture). Reserved keys can't be used.");
-                                        for k in keys { ui.horizontal(|ui| {
-                                            ui.label(key_label(k));
-                                            let active = matches_capturing(*capturing, k);
-                                            let val = binding_value(keybindings, k);
-                                            let conflict = is_reserved_key_name(&val);
-                                            let label = if active { "(press key)".to_string() } else { val.clone() };
-                                            let mut button = egui::Button::new(label);
-                                            if conflict {
-                                                button = button.fill(egui::Color32::from_rgb(100,0,0));
+                                        ui.add_space(4.0);
+                                        egui::Grid::new("kb_bind_grid").num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
+                                            for k in keys {
+                                                ui.label(key_label(k));
+                                                let active = matches_capturing(*capturing, k);
+                                                let val = binding_value(keybindings, k);
+                                                let conflict = is_reserved_key_name(&val);
+                                                let label = if active { "(press key)".to_string() } else { val.clone() };
+                                                let mut button = egui::Button::new(label).min_size(egui::vec2(BIND_BUTTON_WIDTH, 0.0));
+                                                if conflict {
+                                                    button = button.fill(egui::Color32::from_rgb(100,0,0));
+                                                }
+                                                if ui.add(button).clicked() {
+                                                    *capturing = Some(k);
+                                                    *gamepad_capturing = None; // keyboard capture replaces any gamepad capture
+                                                }
+                                                if conflict {
+                                                    ui.colored_label(egui::Color32::RED, "Conflicts with system keybind");
+                                                }
+                                                ui.end_row();
                                             }
-                                            if ui.add(button).clicked() {
-                                                *capturing = Some(k);
-                                                *gamepad_capturing = None; // keyboard capture replaces any gamepad capture
-                                            }
-                                            if conflict {
-                                                ui.colored_label(egui::Color32::RED, "Conflicts with system keybind");
-                                            }
-                                        }); }
+                                        });
                                         if capturing.is_some() && ui.button("Cancel Capture").clicked() { *capturing=None; }
                                     }
                                     BindTab::Controller => {
@@ -1048,29 +1059,37 @@ impl ApplicationHandler for RootApp {
                                             (None, false) => { ui.colored_label(egui::Color32::GRAY, "Controller unavailable"); }
                                         }
                                         ui.label("Click a binding, then press a controller button (Esc to cancel capture).");
-                                        for k in keys { ui.horizontal(|ui| {
-                                            ui.label(key_label(k));
-                                            let name = crate::gamepad::keypad_key_name(k);
-                                            let active = matches!(gamepad_capturing, Some(BindTarget::Gb(g)) if *g == k);
-                                            let bound = gamepad_bindings.buttons.get(name).cloned().unwrap_or_else(|| "Unbound".to_string());
-                                            let label = if active { "(press button)".to_string() } else { bound };
-                                            if ui.button(label).clicked() {
-                                                *gamepad_capturing = Some(BindTarget::Gb(k));
-                                                *capturing = None; // gamepad capture replaces any keyboard capture
+                                        ui.add_space(4.0);
+                                        egui::Grid::new("pad_bind_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                                            for k in keys {
+                                                ui.label(key_label(k));
+                                                let name = crate::gamepad::keypad_key_name(k);
+                                                let active = matches!(gamepad_capturing, Some(BindTarget::Gb(g)) if *g == k);
+                                                let bound = gamepad_bindings.buttons.get(name).cloned().unwrap_or_else(|| "Unbound".to_string());
+                                                let label = if active { "(press button)".to_string() } else { bound };
+                                                if ui.add(egui::Button::new(label).min_size(egui::vec2(BIND_BUTTON_WIDTH, 0.0))).clicked() {
+                                                    *gamepad_capturing = Some(BindTarget::Gb(k));
+                                                    *capturing = None; // gamepad capture replaces any keyboard capture
+                                                }
+                                                ui.end_row();
                                             }
-                                        }); }
-                                        ui.separator();
-                                        ui.label("Hotkeys (optional):");
-                                        for action in crate::gamepad::HotkeyAction::all() { ui.horizontal(|ui| {
-                                            ui.label(action.label());
-                                            let active = matches!(gamepad_capturing, Some(BindTarget::Hotkey(a)) if *a == action);
-                                            let bound = gamepad_bindings.hotkeys.get(action.name()).cloned().unwrap_or_else(|| "Unbound".to_string());
-                                            let label = if active { "(press button)".to_string() } else { bound };
-                                            if ui.button(label).clicked() {
-                                                *gamepad_capturing = Some(BindTarget::Hotkey(action));
-                                                *capturing = None;
-                                            }
-                                        }); }
+                                        });
+                                        ui.add_space(4.0);
+                                        egui::CollapsingHeader::new("System hotkeys").default_open(false).show(ui, |ui| {
+                                            egui::Grid::new("pad_hotkey_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                                                for action in crate::gamepad::HotkeyAction::all() {
+                                                    ui.label(action.label());
+                                                    let active = matches!(gamepad_capturing, Some(BindTarget::Hotkey(a)) if *a == action);
+                                                    let bound = gamepad_bindings.hotkeys.get(action.name()).cloned().unwrap_or_else(|| "Unbound".to_string());
+                                                    let label = if active { "(press button)".to_string() } else { bound };
+                                                    if ui.add(egui::Button::new(label).min_size(egui::vec2(BIND_BUTTON_WIDTH, 0.0))).clicked() {
+                                                        *gamepad_capturing = Some(BindTarget::Hotkey(action));
+                                                        *capturing = None;
+                                                    }
+                                                    ui.end_row();
+                                                }
+                                            });
+                                        });
                                         ui.horizontal(|ui| {
                                             if gamepad_capturing.is_some() && ui.button("Cancel Controller Capture").clicked() {
                                                 *gamepad_capturing = None;
