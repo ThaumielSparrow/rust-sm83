@@ -121,11 +121,22 @@ impl FpsMeter {
     }
 }
 
+/// Which tab of the Keybindings window is visible. Tabs keep the window short
+/// enough to fit small game windows (e.g. 3x scale); a scroll bar catches the rest.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindTab {
+    Keyboard,
+    Controller,
+}
+
 // Unified state machine for ROM selection and emulator run to ensure a single EventLoop
 enum RootPhase {
     Selecting {
         rom_path: String,
         browse_requested: bool,
+        // Window height (logical px) last requested to fit the egui content,
+        // used to avoid re-requesting the same size every frame.
+        requested_height: Option<f32>,
     },
     Running {
         texture: glium::texture::texture2d::Texture2d,
@@ -165,6 +176,7 @@ enum RootPhase {
         resolved_gamepad: ResolvedBindings,
         gamepad_capturing: Option<BindTarget>,
         direction_mux: DirectionMux,
+        bind_tab: BindTab,
     },
 }
 
@@ -201,6 +213,7 @@ impl RootApp {
             phase: RootPhase::Selecting {
                 rom_path: default_dir,
                 browse_requested: false,
+                requested_height: None,
             },
             scale,
             pending_rom,
@@ -319,6 +332,7 @@ impl RootApp {
                 resolved_gamepad: crate::gamepad::resolve(&cfg.gamepad),
                 gamepad_capturing: None,
                 direction_mux: DirectionMux::default(),
+                bind_tab: BindTab::Keyboard,
             };
             if let RootPhase::Running { sender, .. } = &self.phase {
                 let _ = sender.send(GBEvent::UpdateTurbo(cfg.turbo));
@@ -544,6 +558,7 @@ impl ApplicationHandler for RootApp {
                 RootPhase::Selecting {
                     rom_path,
                     browse_requested,
+                    requested_height,
                 },
                 WindowEvent::RedrawRequested,
             ) => {
@@ -561,6 +576,9 @@ impl ApplicationHandler for RootApp {
                 let mut launch_path: Option<PathBuf> = None;
                 let mut quit_requested = false;
                 let recent_roms = Config::load(&config_path()).recent_roms;
+                // Measured height of the egui content this frame (logical px),
+                // used to grow/shrink the window to fit the recent-ROMs list.
+                let mut content_height: f32 = 0.0;
                 if let (Some(window), Some(display), Some(egui_glium)) =
                     (&self.window, &self.display, &mut self.egui_glium)
                 {
@@ -619,6 +637,7 @@ impl ApplicationHandler for RootApp {
                             }
                             ui.add_space(8.0);
                             ui.label("Tip: drag a .gb/.gbc file onto this window to load it.");
+                            content_height = ui.min_rect().height();
                         });
                     });
                     // Paint after UI
@@ -626,6 +645,17 @@ impl ApplicationHandler for RootApp {
                     target.clear_color(0.1, 0.1, 0.1, 1.0);
                     egui_glium.paint(display, &mut target);
                     let _ = target.finish();
+
+                    // Resize the window to fit the content (the recent-ROMs list
+                    // grows it past the initial 220px). Only request when the
+                    // target changes so a denied/clamped request can't loop.
+                    let desired = (content_height + 24.0).clamp(220.0, 700.0);
+                    if requested_height.is_none_or(|h| (h - desired).abs() > 2.0) {
+                        *requested_height = Some(desired);
+                        let _ = window.request_inner_size(winit::dpi::LogicalSize::new(
+                            600.0, desired,
+                        ));
+                    }
                 }
                 if let Some(p) = launch_path {
                     self.start_game_from_path(p);
@@ -805,6 +835,7 @@ impl ApplicationHandler for RootApp {
                     gamepad_bindings,
                     resolved_gamepad,
                     gamepad_capturing,
+                    bind_tab,
                     ..
                 },
                 WindowEvent::RedrawRequested,
@@ -975,72 +1006,85 @@ impl ApplicationHandler for RootApp {
                         }
 
                         if *show_keybindings_window {
-                            egui::Window::new("Keybindings").open(show_keybindings_window).show(ctx, |ui| {
-                                ui.label("Click a binding, then press a key (Esc to cancel capture). Reserved keys can't be used.");
+                            // vscroll keeps the window usable when the game window is
+                            // small (e.g. 3x scale): egui clamps the window to the
+                            // screen and scrolls the overflow instead of clipping it.
+                            egui::Window::new("Keybindings").open(show_keybindings_window).vscroll(true).show(ctx, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(bind_tab, BindTab::Keyboard, "Keyboard");
+                                    ui.selectable_value(bind_tab, BindTab::Controller, "Controller");
+                                });
+                                ui.separator();
                                 let keys = [rust_gbe::KeypadKey::A, rust_gbe::KeypadKey::B, rust_gbe::KeypadKey::Start, rust_gbe::KeypadKey::Select,
                                     rust_gbe::KeypadKey::Up, rust_gbe::KeypadKey::Down, rust_gbe::KeypadKey::Left, rust_gbe::KeypadKey::Right];
-                                for k in keys { ui.horizontal(|ui| {
-                                    ui.label(match k { rust_gbe::KeypadKey::A=>"A", rust_gbe::KeypadKey::B=>"B", rust_gbe::KeypadKey::Start=>"Start", rust_gbe::KeypadKey::Select=>"Select", rust_gbe::KeypadKey::Up=>"Up", rust_gbe::KeypadKey::Down=>"Down", rust_gbe::KeypadKey::Left=>"Left", rust_gbe::KeypadKey::Right=>"Right" });
-                                    let active = matches_capturing(*capturing, k);
-                                    let val = binding_value(keybindings, k);
-                                    let conflict = is_reserved_key_name(&val);
-                                    let label = if active { "(press key)".to_string() } else { val.clone() };
-                                    let mut button = egui::Button::new(label);
-                                    if conflict {
-                                        button = button.fill(egui::Color32::from_rgb(100,0,0));
+                                let key_label = |k: rust_gbe::KeypadKey| match k { rust_gbe::KeypadKey::A=>"A", rust_gbe::KeypadKey::B=>"B", rust_gbe::KeypadKey::Start=>"Start", rust_gbe::KeypadKey::Select=>"Select", rust_gbe::KeypadKey::Up=>"Up", rust_gbe::KeypadKey::Down=>"Down", rust_gbe::KeypadKey::Left=>"Left", rust_gbe::KeypadKey::Right=>"Right" };
+                                match *bind_tab {
+                                    BindTab::Keyboard => {
+                                        ui.label("Click a binding, then press a key (Esc to cancel capture). Reserved keys can't be used.");
+                                        for k in keys { ui.horizontal(|ui| {
+                                            ui.label(key_label(k));
+                                            let active = matches_capturing(*capturing, k);
+                                            let val = binding_value(keybindings, k);
+                                            let conflict = is_reserved_key_name(&val);
+                                            let label = if active { "(press key)".to_string() } else { val.clone() };
+                                            let mut button = egui::Button::new(label);
+                                            if conflict {
+                                                button = button.fill(egui::Color32::from_rgb(100,0,0));
+                                            }
+                                            if ui.add(button).clicked() {
+                                                *capturing = Some(k);
+                                                *gamepad_capturing = None; // keyboard capture replaces any gamepad capture
+                                            }
+                                            if conflict {
+                                                ui.colored_label(egui::Color32::RED, "Conflicts with system keybind");
+                                            }
+                                        }); }
+                                        if capturing.is_some() && ui.button("Cancel Capture").clicked() { *capturing=None; }
                                     }
-                                    if ui.add(button).clicked() {
-                                        *capturing = Some(k);
-                                        *gamepad_capturing = None; // keyboard capture replaces any gamepad capture
+                                    BindTab::Controller => {
+                                        match (&pad_name, gilrs_available) {
+                                            (Some(n), _) => { ui.label(format!("Connected: {}", n)); }
+                                            (None, true) => { ui.colored_label(egui::Color32::GRAY, "No controller detected"); }
+                                            (None, false) => { ui.colored_label(egui::Color32::GRAY, "Controller unavailable"); }
+                                        }
+                                        ui.label("Click a binding, then press a controller button (Esc to cancel capture).");
+                                        for k in keys { ui.horizontal(|ui| {
+                                            ui.label(key_label(k));
+                                            let name = crate::gamepad::keypad_key_name(k);
+                                            let active = matches!(gamepad_capturing, Some(BindTarget::Gb(g)) if *g == k);
+                                            let bound = gamepad_bindings.buttons.get(name).cloned().unwrap_or_else(|| "Unbound".to_string());
+                                            let label = if active { "(press button)".to_string() } else { bound };
+                                            if ui.button(label).clicked() {
+                                                *gamepad_capturing = Some(BindTarget::Gb(k));
+                                                *capturing = None; // gamepad capture replaces any keyboard capture
+                                            }
+                                        }); }
+                                        ui.separator();
+                                        ui.label("Hotkeys (optional):");
+                                        for action in crate::gamepad::HotkeyAction::all() { ui.horizontal(|ui| {
+                                            ui.label(action.label());
+                                            let active = matches!(gamepad_capturing, Some(BindTarget::Hotkey(a)) if *a == action);
+                                            let bound = gamepad_bindings.hotkeys.get(action.name()).cloned().unwrap_or_else(|| "Unbound".to_string());
+                                            let label = if active { "(press button)".to_string() } else { bound };
+                                            if ui.button(label).clicked() {
+                                                *gamepad_capturing = Some(BindTarget::Hotkey(action));
+                                                *capturing = None;
+                                            }
+                                        }); }
+                                        ui.horizontal(|ui| {
+                                            if gamepad_capturing.is_some() && ui.button("Cancel Controller Capture").clicked() {
+                                                *gamepad_capturing = None;
+                                            }
+                                            if ui.button("Reset Controller Defaults").clicked() {
+                                                *gamepad_bindings = GamepadBindings::default();
+                                                *resolved_gamepad = crate::gamepad::resolve(gamepad_bindings);
+                                                *gamepad_capturing = None;
+                                                let gb = gamepad_bindings.clone();
+                                                crate::config::update_config(|c| c.gamepad = gb);
+                                            }
+                                        });
                                     }
-                                    if conflict {
-                                        ui.colored_label(egui::Color32::RED, "Conflicts with system keybind");
-                                    }
-                                }); }
-                                if capturing.is_some() && ui.button("Cancel Capture").clicked() { *capturing=None; }
-                                ui.separator();
-                                ui.heading("Controller");
-                                match (&pad_name, gilrs_available) {
-                                    (Some(n), _) => { ui.label(format!("Connected: {}", n)); }
-                                    (None, true) => { ui.colored_label(egui::Color32::GRAY, "No controller detected"); }
-                                    (None, false) => { ui.colored_label(egui::Color32::GRAY, "Controller unavailable"); }
                                 }
-                                ui.label("Click a binding, then press a controller button (Esc to cancel capture).");
-                                for k in keys { ui.horizontal(|ui| {
-                                    ui.label(match k { rust_gbe::KeypadKey::A=>"A", rust_gbe::KeypadKey::B=>"B", rust_gbe::KeypadKey::Start=>"Start", rust_gbe::KeypadKey::Select=>"Select", rust_gbe::KeypadKey::Up=>"Up", rust_gbe::KeypadKey::Down=>"Down", rust_gbe::KeypadKey::Left=>"Left", rust_gbe::KeypadKey::Right=>"Right" });
-                                    let name = crate::gamepad::keypad_key_name(k);
-                                    let active = matches!(gamepad_capturing, Some(BindTarget::Gb(g)) if *g == k);
-                                    let bound = gamepad_bindings.buttons.get(name).cloned().unwrap_or_else(|| "Unbound".to_string());
-                                    let label = if active { "(press button)".to_string() } else { bound };
-                                    if ui.button(label).clicked() {
-                                        *gamepad_capturing = Some(BindTarget::Gb(k));
-                                        *capturing = None; // gamepad capture replaces any keyboard capture
-                                    }
-                                }); }
-                                ui.separator();
-                                ui.label("Hotkeys (optional):");
-                                for action in crate::gamepad::HotkeyAction::all() { ui.horizontal(|ui| {
-                                    ui.label(action.label());
-                                    let active = matches!(gamepad_capturing, Some(BindTarget::Hotkey(a)) if *a == action);
-                                    let bound = gamepad_bindings.hotkeys.get(action.name()).cloned().unwrap_or_else(|| "Unbound".to_string());
-                                    let label = if active { "(press button)".to_string() } else { bound };
-                                    if ui.button(label).clicked() {
-                                        *gamepad_capturing = Some(BindTarget::Hotkey(action));
-                                        *capturing = None;
-                                    }
-                                }); }
-                                ui.horizontal(|ui| {
-                                    if gamepad_capturing.is_some() && ui.button("Cancel Controller Capture").clicked() {
-                                        *gamepad_capturing = None;
-                                    }
-                                    if ui.button("Reset Controller Defaults").clicked() {
-                                        *gamepad_bindings = GamepadBindings::default();
-                                        *resolved_gamepad = crate::gamepad::resolve(gamepad_bindings);
-                                        *gamepad_capturing = None;
-                                        let gb = gamepad_bindings.clone();
-                                        crate::config::update_config(|c| c.gamepad = gb);
-                                    }
-                                });
                             });
                         }
                     });
