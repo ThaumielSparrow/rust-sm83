@@ -29,8 +29,7 @@ jobs:
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libwayland-dev libxkbcommon-dev mesa-common-dev
-
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libgtk-3-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libwayland-dev libxkbcommon-dev mesa-common-dev
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
