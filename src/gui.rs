@@ -152,7 +152,7 @@ const SYSTEM_HOTKEY_HELP: &[(&str, &str)] = &[
     ("P", "Pause"),
     ("M", "Mute"),
     ("Ctrl+R", "Reset"),
-    ("Esc", "Close menu / exit (double-press)"),
+    ("Esc", "Exit (double-press)"),
 ];
 
 /// The keybindings editor lives in its own OS window (with its own GL context
@@ -1283,12 +1283,17 @@ impl ApplicationHandler for RootApp {
                         }
                         if *rewinding {
                             egui::Area::new(egui::Id::new("rewind_overlay"))
-                                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 8.0))
+                                .anchor(
+                                    egui::Align2::CENTER_TOP,
+                                    egui::vec2(0.0, menu_bar_height + 4.0),
+                                )
                                 .show(ctx, |ui| {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(255, 80, 80),
-                                        "⏪ REWIND",
-                                    );
+                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(255, 80, 80),
+                                            "⏪ REWIND",
+                                        );
+                                    });
                                 });
                         }
                     });
