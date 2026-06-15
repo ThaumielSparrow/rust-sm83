@@ -1493,6 +1493,8 @@ fn handle_system_action(action: crate::input::SystemAction, ctx: &mut SysCtx) ->
             let on = *ctx.fps_overlay;
             crate::config::update_config(|c| c.fps_overlay = on);
         }
+        // Rewind actions — handled in Task 9; no-op for now.
+        SystemAction::RewindHold(_) | SystemAction::RewindStep => {}
     }
     outcome
 }
