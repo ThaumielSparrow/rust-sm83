@@ -13,7 +13,7 @@ pub struct Device {
     save_state: Option<String>,
 }
 
-const SAVE_STATE_MAGIC: &[u8; 8] = b"RGBEST03";
+const SAVE_STATE_MAGIC: &[u8; 8] = b"RGBEST04";
 const SAVE_STATE_HEADER_LEN: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -281,28 +281,24 @@ mod test {
     }
 
     #[test]
-    fn v3_magic_is_used_for_writes() {
+    fn v4_magic_is_used_for_writes() {
         let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
         let cpu = CPU::new(cart, None).unwrap();
         let data = encode_cpu_state(&cpu).unwrap();
-        assert!(data.starts_with(b"RGBEST03"), "writes must use V3 magic");
+        assert!(data.starts_with(b"RGBEST04"), "writes must use V4 magic");
     }
 
     #[test]
-    fn v1_and_v2_saves_are_rejected() {
-        let mut fake_v1 = Vec::from(b"RGBEST01" as &[u8]);
-        fake_v1.extend_from_slice(&[0u8; 16]);
-        assert!(
-            decode_cpu_state(&fake_v1).is_err(),
-            "V1 saves must no longer load"
-        );
-
-        let mut fake_v2 = Vec::from(b"RGBEST02" as &[u8]);
-        fake_v2.extend_from_slice(&[0u8; 64]);
-        assert!(
-            decode_cpu_state(&fake_v2).is_err(),
-            "V2 saves must no longer load"
-        );
+    fn old_format_saves_are_rejected() {
+        for magic in [b"RGBEST01", b"RGBEST02", b"RGBEST03"] {
+            let mut fake = Vec::from(magic as &[u8]);
+            fake.extend_from_slice(&[0u8; 64]);
+            assert!(
+                decode_cpu_state(&fake).is_err(),
+                "{} saves must not load",
+                std::str::from_utf8(magic).unwrap()
+            );
+        }
     }
 
     #[test]
