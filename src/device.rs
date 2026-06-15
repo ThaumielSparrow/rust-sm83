@@ -464,7 +464,7 @@ mod test {
         };
 
         assert!(device.flush_to_disk().is_ok());
-        // The auto-save snapshot must exist and decode as V3.
+        // The auto-save snapshot must exist and decode cleanly (current format).
         let data = std::fs::read(&state_path).unwrap();
         assert!(data.starts_with(SAVE_STATE_MAGIC));
         assert!(decode_cpu_state(&data).is_ok());
