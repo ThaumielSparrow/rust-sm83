@@ -1,4 +1,5 @@
 //! High-level emulator orchestration: device construction, run loop & events.
+use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,7 +41,9 @@ const REWIND_INTERVAL_FRAMES: u64 = 2;
 const REWIND_CAPACITY: usize = 600;
 /// Step-back distance for a discrete RewindStep (~1 s = 30 snapshots).
 const REWIND_STEP_FRAMES: usize = 30;
-/// Host loop iterations between rewind playback steps (~1x backward speed).
+/// Host loop iterations between rewind playback steps. One snapshot is consumed
+/// every DIVISOR * ~16ms; each snapshot spans REWIND_INTERVAL_FRAMES emulated
+/// frames, so 2 here gives ~1x real-time backward playback.
 const REWIND_PLAYBACK_DIVISOR: u64 = 2;
 
 /// Pure debounce predicate for battery-RAM autosave. Returns true when a disk
@@ -74,7 +77,8 @@ fn rewind_pops(len: usize, step: usize) -> usize {
 }
 
 /// Copy `frame` into a free reusable buffer and try to send it to the GUI.
-/// Returns Err(()) if the channel has disconnected (caller should shut down).
+/// `Ok(())` covers both "sent" and "all buffers busy / channel full → frame
+/// dropped"; only `Err(())` means the channel disconnected (caller shuts down).
 fn try_send_frame(
     frame: &[u8],
     frame_buffers: &mut [Arc<Vec<u8>>],
@@ -154,8 +158,7 @@ pub fn run_cpu(
     ];
     let mut next_fb = 0usize;
 
-    let mut ring: std::collections::VecDeque<Vec<u8>> =
-        std::collections::VecDeque::with_capacity(REWIND_CAPACITY);
+    let mut ring: VecDeque<Vec<u8>> = VecDeque::with_capacity(REWIND_CAPACITY);
     let mut rewinding = false;
     let mut rewind_tick: u64 = 0;
 
@@ -281,6 +284,9 @@ pub fn run_cpu(
                     GBEvent::SetRewinding(r) => {
                         rewinding = r;
                         rewind_tick = 0;
+                        // `ticks` is meaningless while rewinding (the CPU isn't
+                        // stepped); reset so forward play resumes on a clean frame.
+                        ticks = 0;
                         if !r {
                             cpu.sync_audio();
                         }
@@ -293,6 +299,8 @@ pub fn run_cpu(
                             if let Err(e) = cpu.restore_rewind(payload) {
                                 eprintln!("rewind step failed: {}", e);
                             } else {
+                                // A disconnect here is caught next iteration in
+                                // the 'recv loop, which breaks 'outer cleanly.
                                 let _ = try_send_frame(
                                     cpu.get_gpu_data(),
                                     &mut frame_buffers,
