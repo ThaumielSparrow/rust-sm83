@@ -18,6 +18,8 @@ pub enum GBEvent {
     UpdateTurbo(crate::config::TurboSetting),
     UpdateVolume(f32), // master volume 0.0-1.0
     SetPaused(bool),
+    SetRewinding(bool),
+    RewindStep,
     Shutdown,
 }
 
@@ -31,6 +33,15 @@ pub enum GuiEvent {
 /// state, so this is purely a write-rate throttle to avoid hammering the disk
 /// when a game touches SRAM many times per second.
 const RAM_SAVE_DEBOUNCE_FRAMES: u64 = 60;
+
+/// Capture a rewind snapshot every N emulated frames (~30 Hz at every-2).
+const REWIND_INTERVAL_FRAMES: u64 = 2;
+/// Ring-buffer depth in snapshots (~20 s of history at every-2-frames).
+const REWIND_CAPACITY: usize = 600;
+/// Step-back distance for a discrete RewindStep (~1 s = 30 snapshots).
+const REWIND_STEP_FRAMES: usize = 30;
+/// Host loop iterations between rewind playback steps (~1x backward speed).
+const REWIND_PLAYBACK_DIVISOR: u64 = 2;
 
 /// Pure debounce predicate for battery-RAM autosave. Returns true when a disk
 /// write should happen on this frame: only when dirty, and only once the
@@ -60,6 +71,31 @@ fn should_capture(frame_count: u64, interval: u64) -> bool {
 /// always leaving at least one entry (the oldest) in the ring.
 fn rewind_pops(len: usize, step: usize) -> usize {
     step.min(len.saturating_sub(1))
+}
+
+/// Copy `frame` into a free reusable buffer and try to send it to the GUI.
+/// Returns Err(()) if the channel has disconnected (caller should shut down).
+fn try_send_frame(
+    frame: &[u8],
+    frame_buffers: &mut [Arc<Vec<u8>>],
+    next_fb: &mut usize,
+    sender: &SyncSender<Arc<Vec<u8>>>,
+) -> Result<(), ()> {
+    for attempt in 0..frame_buffers.len() {
+        let idx = (*next_fb + attempt) % frame_buffers.len();
+        if let Some(buf_mut) = Arc::get_mut(&mut frame_buffers[idx]) {
+            buf_mut.copy_from_slice(frame);
+            match sender.try_send(frame_buffers[idx].clone()) {
+                Ok(_) => {
+                    *next_fb = (idx + 1) % frame_buffers.len();
+                    return Ok(());
+                }
+                Err(TrySendError::Disconnected(..)) => return Err(()),
+                Err(TrySendError::Full(_)) => return Ok(()), // drop frame if GUI busy
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn construct_cpu_auto(filename: &str) -> Option<(Box<Device>, bool)> {
@@ -118,52 +154,86 @@ pub fn run_cpu(
     ];
     let mut next_fb = 0usize;
 
+    let mut ring: std::collections::VecDeque<Vec<u8>> =
+        std::collections::VecDeque::with_capacity(REWIND_CAPACITY);
+    let mut rewinding = false;
+    let mut rewind_tick: u64 = 0;
+
     'outer: loop {
-        // Always execute at least one frame worth of cycles (unless paused).
-        let frame_target = base_waitticks;
-        while !paused && ticks < frame_target {
-            ticks += cpu.do_cycle();
-            if cpu.check_and_reset_gpu_updated() {
-                // Try to find a free (uniquely owned) buffer to copy into.
-                for attempt in 0..frame_buffers.len() {
-                    let idx = (next_fb + attempt) % frame_buffers.len();
-                    if let Some(buf_mut) = Arc::get_mut(&mut frame_buffers[idx]) {
-                        // Safe to mutate this buffer: no other references.
-                        let src = cpu.get_gpu_data();
-                        buf_mut.copy_from_slice(src);
-                        match sender.try_send(frame_buffers[idx].clone()) {
-                            Ok(_) => {
-                                next_fb = (idx + 1) % frame_buffers.len();
-                            }
-                            Err(TrySendError::Disconnected(..)) => {
-                                if let Err(e) = cpu.flush_to_disk() {
-                                    eprintln!("flush_to_disk failed: {}", e);
-                                }
-                                break 'outer;
-                            }
-                            Err(TrySendError::Full(_)) => { /* Drop frame if receiver busy */ }
-                        }
-                        break;
+        if rewinding {
+            // Rewind playback: do NOT advance the CPU. Step one snapshot back
+            // every REWIND_PLAYBACK_DIVISOR host iterations for ~1x backward.
+            rewind_tick = rewind_tick.wrapping_add(1);
+            if rewind_tick % REWIND_PLAYBACK_DIVISOR == 0 {
+                for _ in 0..rewind_pops(ring.len(), 1) {
+                    ring.pop_back();
+                }
+                if let Some(payload) = ring.back() {
+                    if let Err(e) = cpu.restore_rewind(payload) {
+                        eprintln!("rewind restore failed: {}", e);
+                    } else if try_send_frame(
+                        cpu.get_gpu_data(),
+                        &mut frame_buffers,
+                        &mut next_fb,
+                        &sender,
+                    )
+                    .is_err()
+                    {
+                        let _ = cpu.flush_to_disk();
+                        break 'outer;
                     }
                 }
             }
-        }
-        if !paused {
-            ticks -= frame_target;
-            frame_count += 1;
-
-            if cpu.check_and_reset_ram_updated() {
-                ram_dirty = true;
-            }
-            if should_save_ram(ram_dirty, last_ram_save_frame, frame_count, RAM_SAVE_DEBOUNCE_FRAMES)
-            {
-                let _ = cpu.save_battery_ram_silent();
-                ram_dirty = false;
-                last_ram_save_frame = Some(frame_count);
-            }
         } else {
-            // While paused, ensure we don't busy-loop or overflow tick budgeting.
-            ticks = 0;
+            // Normal forward execution.
+            let frame_target = base_waitticks;
+            while !paused && ticks < frame_target {
+                ticks += cpu.do_cycle();
+                if cpu.check_and_reset_gpu_updated()
+                    && try_send_frame(
+                        cpu.get_gpu_data(),
+                        &mut frame_buffers,
+                        &mut next_fb,
+                        &sender,
+                    )
+                    .is_err()
+                {
+                    let _ = cpu.flush_to_disk();
+                    break 'outer;
+                }
+            }
+            if !paused {
+                ticks -= frame_target;
+                frame_count += 1;
+
+                if should_capture(frame_count, REWIND_INTERVAL_FRAMES) {
+                    match cpu.snapshot_rewind() {
+                        Ok(snap) => {
+                            if ring.len() == REWIND_CAPACITY {
+                                ring.pop_front();
+                            }
+                            ring.push_back(snap);
+                        }
+                        Err(e) => eprintln!("rewind snapshot failed: {}", e),
+                    }
+                }
+
+                if cpu.check_and_reset_ram_updated() {
+                    ram_dirty = true;
+                }
+                if should_save_ram(
+                    ram_dirty,
+                    last_ram_save_frame,
+                    frame_count,
+                    RAM_SAVE_DEBOUNCE_FRAMES,
+                ) {
+                    let _ = cpu.save_battery_ram_silent();
+                    ram_dirty = false;
+                    last_ram_save_frame = Some(frame_count);
+                }
+            } else {
+                ticks = 0;
+            }
         }
 
         'recv: loop {
@@ -194,6 +264,7 @@ pub fn run_cpu(
                         if let Err(e) = cpu.load_state_slot(s) {
                             eprintln!("Failed to load state from slot {}: {}", s, e);
                         }
+                        ring.clear();
                     }
                     GBEvent::UpdateTurbo(ts) => {
                         turbo_setting = ts;
@@ -206,6 +277,30 @@ pub fn run_cpu(
                             cpu.sync_audio();
                         }
                         paused = p;
+                    }
+                    GBEvent::SetRewinding(r) => {
+                        rewinding = r;
+                        rewind_tick = 0;
+                        if !r {
+                            cpu.sync_audio();
+                        }
+                    }
+                    GBEvent::RewindStep => {
+                        for _ in 0..rewind_pops(ring.len(), REWIND_STEP_FRAMES) {
+                            ring.pop_back();
+                        }
+                        if let Some(payload) = ring.back() {
+                            if let Err(e) = cpu.restore_rewind(payload) {
+                                eprintln!("rewind step failed: {}", e);
+                            } else {
+                                let _ = try_send_frame(
+                                    cpu.get_gpu_data(),
+                                    &mut frame_buffers,
+                                    &mut next_fb,
+                                    &sender,
+                                );
+                            }
+                        }
                     }
                     GBEvent::Shutdown => {
                         if let Err(e) = cpu.flush_to_disk() {
@@ -225,7 +320,9 @@ pub fn run_cpu(
         }
 
         // Timing / pacing
-        let target_frame_ms = if paused {
+        let target_frame_ms = if rewinding {
+            16.0 // rewind playback paced by REWIND_PLAYBACK_DIVISOR
+        } else if paused {
             16.0 // keep checking events at ~60 Hz while paused
         } else if limit_speed {
             16.0 // baseline ~60 FPS
