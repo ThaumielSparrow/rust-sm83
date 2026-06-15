@@ -50,6 +50,18 @@ fn should_save_ram(
     }
 }
 
+/// True on frames where a rewind snapshot should be captured. `interval == 0`
+/// disables capture.
+fn should_capture(frame_count: u64, interval: u64) -> bool {
+    interval != 0 && frame_count % interval == 0
+}
+
+/// How many ring entries to drop from the back to step back `step` moments,
+/// always leaving at least one entry (the oldest) in the ring.
+fn rewind_pops(len: usize, step: usize) -> usize {
+    step.min(len.saturating_sub(1))
+}
+
 pub fn construct_cpu_auto(filename: &str) -> Option<(Box<Device>, bool)> {
     let rom_path = std::path::Path::new(filename);
     let save_state_path = rom_path.with_extension("state");
@@ -255,5 +267,24 @@ mod tests {
         assert!(should_save_ram(true, Some(100), 160, 60));
         // Clean state never saves.
         assert!(!should_save_ram(false, Some(100), 1000, 60));
+    }
+
+    #[test]
+    fn capture_cadence_every_two_frames() {
+        assert!(should_capture(0, 2));
+        assert!(!should_capture(1, 2));
+        assert!(should_capture(2, 2));
+        assert!(!should_capture(5, 2));
+        assert!(should_capture(6, 2));
+        assert!(!should_capture(10, 0), "interval 0 never captures");
+    }
+
+    #[test]
+    fn rewind_pops_clamp_to_keep_one() {
+        assert_eq!(rewind_pops(0, 30), 0);
+        assert_eq!(rewind_pops(1, 30), 0);
+        assert_eq!(rewind_pops(10, 30), 9);
+        assert_eq!(rewind_pops(100, 30), 30);
+        assert_eq!(rewind_pops(100, 1), 1);
     }
 }
