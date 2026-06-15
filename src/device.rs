@@ -503,6 +503,22 @@ mod test {
     }
 
     #[test]
+    fn rewind_snapshot_restore_round_trip() {
+        let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
+        let cpu = CPU::new(cart, None).unwrap();
+        let mut device = Device { cpu, save_state: None };
+
+        device.write_byte(0xC000, 0xAB); // WRAM
+        let snap = device.snapshot_rewind().unwrap();
+        device.write_byte(0xC000, 0xCD);
+        assert_eq!(device.read_byte(0xC000), 0xCD);
+
+        device.restore_rewind(&snap).unwrap();
+        assert_eq!(device.read_byte(0xC000), 0xAB, "WRAM restored from snapshot");
+        assert_eq!(device.romname(), "RKYVTEST", "ROM readable after restore");
+    }
+
+    #[test]
     fn slot_save_path_falls_back_to_file_backed_rom_directory() {
         let rom_dir =
             std::env::temp_dir().join(format!("rust_gbe_slot_rom_dir_test_{}", std::process::id()));
@@ -746,6 +762,24 @@ impl Device {
                 Err("Failed to write save state file")
             }
         }
+    }
+
+    /// Serialize current mutable state for the rewind ring buffer. The ROM is
+    /// excluded (see the rom-skip in the MBCs); the APU is excluded as usual.
+    /// Returns the raw rkyv payload — no disk header, since these never hit disk.
+    pub fn snapshot_rewind(&self) -> StrResult<Vec<u8>> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(&self.cpu)
+            .map(|bytes| bytes.to_vec())
+            .map_err(|_| "Failed to serialize rewind snapshot")
+    }
+
+    /// Restore a snapshot produced by `snapshot_rewind`, carrying the live ROM
+    /// and audio player across the swap.
+    pub fn restore_rewind(&mut self, payload: &[u8]) -> StrResult<()> {
+        let decoded = rkyv::from_bytes::<CPU, rkyv::rancor::Error>(payload)
+            .map_err(|_| "Failed to deserialize rewind snapshot")?;
+        self.install_decoded_cpu(decoded);
+        Ok(())
     }
 
     /// Install a freshly-decoded (rom-less, audio-less) CPU as the live CPU,
