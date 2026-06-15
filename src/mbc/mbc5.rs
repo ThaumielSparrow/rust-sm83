@@ -121,6 +121,14 @@ impl MBC for MBC5 {
         self.ram_updated = false;
         result
     }
+
+    fn take_rom(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.rom)
+    }
+
+    fn set_rom(&mut self, rom: Vec<u8>) {
+        self.rom = rom;
+    }
 }
 
 #[cfg(test)]

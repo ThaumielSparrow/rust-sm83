@@ -21,6 +21,12 @@ pub trait MBC: Send {
     fn loadram(&mut self, ramdata: &[u8]) -> StrResult<()>;
     fn dumpram(&self) -> Vec<u8>;
 
+    /// Move the ROM bytes out, leaving the cartridge rom-less (reads return 0xFF).
+    /// Used to keep the immutable ROM out of rewind/save-state payloads.
+    fn take_rom(&mut self) -> Vec<u8>;
+    /// Move ROM bytes back in after a rom-less restore.
+    fn set_rom(&mut self, rom: Vec<u8>);
+
     fn get_save_path(&self) -> Option<String> {
         None // Default implementation for non-file-backed MBCs
     }
@@ -136,6 +142,26 @@ impl MBC for MbcState {
             MbcState::Mbc5(mbc) => mbc.dumpram(),
         }
     }
+
+    fn take_rom(&mut self) -> Vec<u8> {
+        match self {
+            MbcState::Mbc0(mbc) => mbc.take_rom(),
+            MbcState::Mbc1(mbc) => mbc.take_rom(),
+            MbcState::Mbc2(mbc) => mbc.take_rom(),
+            MbcState::Mbc3(mbc) => mbc.take_rom(),
+            MbcState::Mbc5(mbc) => mbc.take_rom(),
+        }
+    }
+
+    fn set_rom(&mut self, rom: Vec<u8>) {
+        match self {
+            MbcState::Mbc0(mbc) => mbc.set_rom(rom),
+            MbcState::Mbc1(mbc) => mbc.set_rom(rom),
+            MbcState::Mbc2(mbc) => mbc.set_rom(rom),
+            MbcState::Mbc3(mbc) => mbc.set_rom(rom),
+            MbcState::Mbc5(mbc) => mbc.set_rom(rom),
+        }
+    }
 }
 
 pub fn get_mbc(data: Vec<u8>, skip_checksum: bool) -> StrResult<MbcState> {
@@ -235,6 +261,14 @@ impl MBC for FileBackedMBC {
     fn get_save_path(&self) -> Option<String> {
         Some(self.rampath.clone())
     }
+
+    fn take_rom(&mut self) -> Vec<u8> {
+        self.mbc.take_rom()
+    }
+
+    fn set_rom(&mut self, rom: Vec<u8>) {
+        self.mbc.set_rom(rom)
+    }
 }
 
 impl Drop for FileBackedMBC {
@@ -327,6 +361,20 @@ impl MBC for Cartridge {
         match self {
             Cartridge::Memory(mbc) => mbc.get_save_path(),
             Cartridge::FileBacked(mbc) => mbc.get_save_path(),
+        }
+    }
+
+    fn take_rom(&mut self) -> Vec<u8> {
+        match self {
+            Cartridge::Memory(mbc) => mbc.take_rom(),
+            Cartridge::FileBacked(mbc) => mbc.take_rom(),
+        }
+    }
+
+    fn set_rom(&mut self, rom: Vec<u8>) {
+        match self {
+            Cartridge::Memory(mbc) => mbc.set_rom(rom),
+            Cartridge::FileBacked(mbc) => mbc.set_rom(rom),
         }
     }
 }

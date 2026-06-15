@@ -38,4 +38,12 @@ impl MBC for MBC0 {
     fn check_and_reset_ram_updated(&mut self) -> bool {
         false
     }
+
+    fn take_rom(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.rom)
+    }
+
+    fn set_rom(&mut self, rom: Vec<u8>) {
+        self.rom = rom;
+    }
 }
