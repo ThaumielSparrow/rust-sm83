@@ -309,13 +309,14 @@ mod test {
         let data = encode_cpu_state(&cpu).unwrap();
         assert!(data.starts_with(SAVE_STATE_MAGIC));
 
-        let decoded = decode_cpu_state(&data).unwrap();
+        let mut decoded = decode_cpu_state(&data).unwrap();
+        decoded.mmu.mbc.set_rom(test_rom());
         assert_eq!(decoded.mmu.mbc.romname(), "RKYVTEST");
         assert!(decoded.mmu.sound.is_none());
     }
 
     #[test]
-    fn cpu_state_round_trips_with_v3_preview() {
+    fn cpu_state_round_trips_with_v4_preview() {
         let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
         let cpu = CPU::new(cart, None).unwrap();
         let thumbnail = vec![7; crate::gpu::SCREEN_W * crate::gpu::SCREEN_H * 3];
@@ -326,7 +327,8 @@ mod test {
         assert_eq!(preview.thumbnail_height, crate::gpu::SCREEN_H as u16);
         assert_eq!(preview.thumbnail_rgb.as_deref(), Some(thumbnail.as_slice()));
 
-        let decoded = decode_cpu_state(&data).unwrap();
+        let mut decoded = decode_cpu_state(&data).unwrap();
+        decoded.mmu.mbc.set_rom(test_rom());
         assert_eq!(decoded.mmu.mbc.romname(), "RKYVTEST");
         assert!(decoded.mmu.sound.is_none());
 
@@ -341,7 +343,7 @@ mod test {
     }
 
     #[test]
-    fn slot_save_writes_v3_preview_file() {
+    fn slot_save_writes_v4_preview_file() {
         let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
         let cpu = CPU::new(cart, None).unwrap();
         let save_dir =
@@ -360,7 +362,8 @@ mod test {
         assert_eq!(read_save_state_preview(&slot_path).unwrap(), preview);
         assert_eq!(preview.thumbnail_rgb.as_deref(), Some(thumbnail.as_slice()));
 
-        let decoded = decode_cpu_state(&data).unwrap();
+        let mut decoded = decode_cpu_state(&data).unwrap();
+        decoded.mmu.mbc.set_rom(test_rom());
         assert_eq!(decoded.mmu.mbc.romname(), "RKYVTEST");
 
         let _ = std::fs::remove_file(slot_path);
@@ -487,6 +490,19 @@ mod test {
     }
 
     #[test]
+    fn rom_is_excluded_from_serialized_payload() {
+        let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
+        let cpu = CPU::new(cart, None).unwrap();
+        let data = encode_cpu_state(&cpu).unwrap();
+        // test_rom() puts "RKYVTEST" at 0x134; if the ROM were serialized those
+        // bytes would appear in the payload.
+        assert!(
+            !data.windows(8).any(|w| w == b"RKYVTEST"),
+            "ROM bytes must not appear in a rom-skipped payload"
+        );
+    }
+
+    #[test]
     fn slot_save_path_falls_back_to_file_backed_rom_directory() {
         let rom_dir =
             std::env::temp_dir().join(format!("rust_gbe_slot_rom_dir_test_{}", std::process::id()));
@@ -513,20 +529,6 @@ mod test {
 }
 
 impl Device {
-    pub fn load_state(path: &str) -> Option<Box<Device>> {
-        let mut file = std::fs::File::open(path).ok()?;
-        let mut data = Vec::new();
-        use std::io::Read;
-        if file.read_to_end(&mut data).is_err() {
-            return None;
-        }
-        let cpu = decode_cpu_state(&data).ok()?;
-        Some(Box::new(Device {
-            cpu,
-            save_state: Some(path.to_string()),
-        }))
-    }
-
     pub fn new(
         romname: &str,
         skip_checksum: bool,
@@ -746,6 +748,17 @@ impl Device {
         }
     }
 
+    /// Install a freshly-decoded (rom-less, audio-less) CPU as the live CPU,
+    /// carrying the immutable ROM and the live audio player across the swap.
+    /// Shared by slot-load and rewind restore.
+    fn install_decoded_cpu(&mut self, mut decoded: CPU) {
+        let rom = self.cpu.mmu.mbc.take_rom(); // zero-copy move from outgoing CPU
+        decoded.mmu.mbc.set_rom(rom);
+        decoded.mmu.sound = self.cpu.mmu.sound.take(); // keep the cpal player alive
+        self.cpu = decoded;
+        self.sync_audio(); // drop any stale queued samples
+    }
+
     pub fn load_state_slot(&mut self, slot: u8) -> StrResult<()> {
         println!("Loading state from slot {}...", slot);
         let save_path = self.save_state_slot_path(slot);
@@ -753,7 +766,7 @@ impl Device {
         match std::fs::read(&save_path) {
             Ok(data) => match decode_cpu_state(&data) {
                 Ok(cpu) => {
-                    self.cpu = cpu;
+                    self.install_decoded_cpu(cpu);
                     println!("State loaded from slot {}", slot);
                     Ok(())
                 }

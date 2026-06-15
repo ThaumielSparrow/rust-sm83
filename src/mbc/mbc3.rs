@@ -7,6 +7,7 @@ use std::time;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MBC3 {
+    #[rkyv(with = rkyv::with::Skip)]
     rom: Vec<u8>,
     ram: Vec<u8>,
     rombank: usize,

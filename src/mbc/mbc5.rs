@@ -3,6 +3,7 @@ use crate::StrResult;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MBC5 {
+    #[rkyv(with = rkyv::with::Skip)]
     rom: Vec<u8>,
     ram: Vec<u8>,
     rombank: usize,
