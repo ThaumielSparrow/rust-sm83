@@ -67,7 +67,7 @@ fn should_save_ram(
 /// True on frames where a rewind snapshot should be captured. `interval == 0`
 /// disables capture.
 fn should_capture(frame_count: u64, interval: u64) -> bool {
-    interval != 0 && frame_count % interval == 0
+    interval != 0 && frame_count.is_multiple_of(interval)
 }
 
 /// How many ring entries to drop from the back to step back `step` moments,
@@ -167,7 +167,7 @@ pub fn run_cpu(
             // Rewind playback: do NOT advance the CPU. Step one snapshot back
             // every REWIND_PLAYBACK_DIVISOR host iterations for ~1x backward.
             rewind_tick = rewind_tick.wrapping_add(1);
-            if rewind_tick % REWIND_PLAYBACK_DIVISOR == 0 {
+            if rewind_tick.is_multiple_of(REWIND_PLAYBACK_DIVISOR) {
                 for _ in 0..rewind_pops(ring.len(), 1) {
                     ring.pop_back();
                 }
