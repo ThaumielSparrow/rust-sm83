@@ -15,7 +15,9 @@ impl MBC0 {
 
 impl MBC for MBC0 {
     fn readrom(&self, a: u16) -> u8 {
-        self.rom[a as usize]
+        // unwrap_or(0xFF) so a rom-less cartridge (post-take_rom, before set_rom)
+        // returns open-bus instead of panicking, matching the other MBCs.
+        *self.rom.get(a as usize).unwrap_or(&0xFF)
     }
     fn readram(&self, _a: u16) -> u8 {
         0
@@ -46,5 +48,31 @@ impl MBC for MBC0 {
 
     fn set_rom(&mut self, rom: Vec<u8>) {
         self.rom = rom;
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn rom() -> Vec<u8> {
+        let mut data = vec![0u8; 0x8000];
+        data[0x147] = 0x00; // MBC0
+        data
+    }
+
+    #[test]
+    fn take_and_set_rom_round_trip() {
+        let mut mbc = MBC0::new(rom()).unwrap();
+        mbc.set_rom({
+            let mut r = rom();
+            r[0x0100] = 0xAB;
+            r
+        });
+        let taken = mbc.take_rom();
+        assert!(!taken.is_empty(), "take_rom yields the rom bytes");
+        assert_eq!(mbc.readrom(0x0100), 0xFF, "rom-less read returns 0xFF, no panic");
+        mbc.set_rom(taken);
+        assert_eq!(mbc.readrom(0x0100), 0xAB, "rom restored after set_rom");
     }
 }
