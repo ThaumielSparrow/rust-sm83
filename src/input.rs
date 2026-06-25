@@ -14,6 +14,8 @@ pub enum SystemAction {
     ToggleFullscreen,
     ToggleMute,
     ToggleFpsOverlay,
+    RewindHold(bool), // true=press, false=release
+    RewindStep,
 }
 
 /// Static mapping of (winit Key + modifiers) to SystemAction. Modifiers matter for
@@ -41,6 +43,9 @@ pub fn system_action_for(
         (Pressed, Key::Named(NamedKey::F11)) => Some(ToggleFullscreen),
         (Pressed, Key::Named(NamedKey::Shift)) => Some(TurboHold(true)),
         (Released, Key::Named(NamedKey::Shift)) => Some(TurboHold(false)),
+        (Pressed, Key::Named(NamedKey::Backspace)) => Some(RewindHold(true)),
+        (Released, Key::Named(NamedKey::Backspace)) => Some(RewindHold(false)),
+        (Pressed, Key::Character("\\")) => Some(RewindStep),
         (Pressed, Key::Character("t" | "T")) => Some(TurboToggle),
         (Pressed, Key::Character("y" | "Y")) => Some(ToggleInterpolation),
         (Pressed, Key::Character("p" | "P")) => Some(TogglePause),
@@ -54,10 +59,47 @@ pub const RESERVED_KEYS: &[&str] = &[
     "F1","F2","F3","F4","F5","F6","F7","F8", // save/load slots 1-4
     "F9","F11",                              // FPS overlay, fullscreen
     "Shift","T","Y","P","M",                 // turbo hold/toggle, interpolation, pause, mute
+    "Backspace","\\",                        // rewind hold / step back
 ];
 
 pub fn is_reserved_key_name(name: &str) -> bool {
     // Case-insensitive for letters
     let upper = name.to_uppercase();
     RESERVED_KEYS.iter().any(|k| k.eq_ignore_ascii_case(&upper))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::event::ElementState::{Pressed, Released};
+    use winit::keyboard::{Key, NamedKey};
+
+    #[test]
+    fn backspace_maps_to_rewind_hold() {
+        let m = ModifiersState::empty();
+        assert_eq!(
+            system_action_for(&Key::Named(NamedKey::Backspace), Pressed, m),
+            Some(SystemAction::RewindHold(true))
+        );
+        assert_eq!(
+            system_action_for(&Key::Named(NamedKey::Backspace), Released, m),
+            Some(SystemAction::RewindHold(false))
+        );
+    }
+
+    #[test]
+    fn backslash_maps_to_rewind_step_on_press_only() {
+        let m = ModifiersState::empty();
+        assert_eq!(
+            system_action_for(&Key::Character("\\"), Pressed, m),
+            Some(SystemAction::RewindStep)
+        );
+        assert_eq!(system_action_for(&Key::Character("\\"), Released, m), None);
+    }
+
+    #[test]
+    fn rewind_keys_are_reserved() {
+        assert!(is_reserved_key_name("Backspace"));
+        assert!(is_reserved_key_name("\\"));
+    }
 }

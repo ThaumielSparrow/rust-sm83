@@ -3,6 +3,7 @@ use crate::StrResult;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MBC2 {
+    #[rkyv(with = rkyv::with::Skip)]
     rom: Vec<u8>,
     ram: Vec<u8>,
     ram_on: bool,
@@ -93,5 +94,13 @@ impl MBC for MBC2 {
         let result = self.ram_updated;
         self.ram_updated = false;
         result
+    }
+
+    fn take_rom(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.rom)
+    }
+
+    fn set_rom(&mut self, rom: Vec<u8>) {
+        self.rom = rom;
     }
 }

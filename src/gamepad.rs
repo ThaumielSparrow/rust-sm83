@@ -20,16 +20,19 @@ pub enum HotkeyAction {
     FpsOverlay,
     Interpolation,
     Reset,
+    RewindHold,
+    RewindStep,
 }
 
 impl HotkeyAction {
-    pub fn all() -> [HotkeyAction; 16] {
+    pub fn all() -> [HotkeyAction; 18] {
         use HotkeyAction::*;
         [
             TurboHold, TurboToggle, Pause,
             SaveState(1), SaveState(2), SaveState(3), SaveState(4),
             LoadState(1), LoadState(2), LoadState(3), LoadState(4),
             Fullscreen, Mute, FpsOverlay, Interpolation, Reset,
+            RewindHold, RewindStep,
         ]
     }
 
@@ -53,6 +56,8 @@ impl HotkeyAction {
             FpsOverlay => "fps_overlay",
             Interpolation => "interpolation",
             Reset => "reset",
+            RewindHold => "rewind_hold",
+            RewindStep => "rewind_step",
         }
     }
 
@@ -73,6 +78,8 @@ impl HotkeyAction {
             FpsOverlay => "FPS Overlay".into(),
             Interpolation => "Linear Interpolation".into(),
             Reset => "Reset Game".into(),
+            RewindHold => "Rewind (hold)".into(),
+            RewindStep => "Rewind (step back)".into(),
         }
     }
 
@@ -82,6 +89,7 @@ impl HotkeyAction {
         use crate::input::SystemAction as SA;
         match (self, pressed) {
             (HotkeyAction::TurboHold, p) => Some(SA::TurboHold(p)),
+            (HotkeyAction::RewindHold, p) => Some(SA::RewindHold(p)),
             (_, false) => None,
             (HotkeyAction::TurboToggle, true) => Some(SA::TurboToggle),
             (HotkeyAction::Pause, true) => Some(SA::TogglePause),
@@ -92,6 +100,7 @@ impl HotkeyAction {
             (HotkeyAction::FpsOverlay, true) => Some(SA::ToggleFpsOverlay),
             (HotkeyAction::Interpolation, true) => Some(SA::ToggleInterpolation),
             (HotkeyAction::Reset, true) => Some(SA::Reset),
+            (HotkeyAction::RewindStep, true) => Some(SA::RewindStep),
         }
     }
 }
@@ -487,6 +496,24 @@ mod tests {
             matches!(r.lookup(Button::East), Some(BoundAction::Gb(KeypadKey::B))),
             "GB binding wins over hotkey on the same button"
         );
+    }
+
+    #[test]
+    fn rewind_hotkeys_map_to_system_actions() {
+        use crate::input::SystemAction;
+        assert!(matches!(
+            HotkeyAction::RewindHold.to_system_action(true),
+            Some(SystemAction::RewindHold(true))
+        ));
+        assert!(matches!(
+            HotkeyAction::RewindHold.to_system_action(false),
+            Some(SystemAction::RewindHold(false))
+        ));
+        assert!(matches!(
+            HotkeyAction::RewindStep.to_system_action(true),
+            Some(SystemAction::RewindStep)
+        ));
+        assert!(HotkeyAction::RewindStep.to_system_action(false).is_none());
     }
 
     #[test]

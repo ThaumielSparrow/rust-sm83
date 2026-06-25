@@ -13,7 +13,7 @@ pub struct Device {
     save_state: Option<String>,
 }
 
-const SAVE_STATE_MAGIC: &[u8; 8] = b"RGBEST03";
+const SAVE_STATE_MAGIC: &[u8; 8] = b"RGBEST04";
 const SAVE_STATE_HEADER_LEN: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -281,28 +281,24 @@ mod test {
     }
 
     #[test]
-    fn v3_magic_is_used_for_writes() {
+    fn v4_magic_is_used_for_writes() {
         let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
         let cpu = CPU::new(cart, None).unwrap();
         let data = encode_cpu_state(&cpu).unwrap();
-        assert!(data.starts_with(b"RGBEST03"), "writes must use V3 magic");
+        assert!(data.starts_with(b"RGBEST04"), "writes must use V4 magic");
     }
 
     #[test]
-    fn v1_and_v2_saves_are_rejected() {
-        let mut fake_v1 = Vec::from(b"RGBEST01" as &[u8]);
-        fake_v1.extend_from_slice(&[0u8; 16]);
-        assert!(
-            decode_cpu_state(&fake_v1).is_err(),
-            "V1 saves must no longer load"
-        );
-
-        let mut fake_v2 = Vec::from(b"RGBEST02" as &[u8]);
-        fake_v2.extend_from_slice(&[0u8; 64]);
-        assert!(
-            decode_cpu_state(&fake_v2).is_err(),
-            "V2 saves must no longer load"
-        );
+    fn old_format_saves_are_rejected() {
+        for magic in [b"RGBEST01", b"RGBEST02", b"RGBEST03"] {
+            let mut fake = Vec::from(magic as &[u8]);
+            fake.extend_from_slice(&[0u8; 64]);
+            assert!(
+                decode_cpu_state(&fake).is_err(),
+                "{} saves must not load",
+                std::str::from_utf8(magic).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -313,13 +309,14 @@ mod test {
         let data = encode_cpu_state(&cpu).unwrap();
         assert!(data.starts_with(SAVE_STATE_MAGIC));
 
-        let decoded = decode_cpu_state(&data).unwrap();
+        let mut decoded = decode_cpu_state(&data).unwrap();
+        decoded.mmu.mbc.set_rom(test_rom());
         assert_eq!(decoded.mmu.mbc.romname(), "RKYVTEST");
         assert!(decoded.mmu.sound.is_none());
     }
 
     #[test]
-    fn cpu_state_round_trips_with_v3_preview() {
+    fn cpu_state_round_trips_with_v4_preview() {
         let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
         let cpu = CPU::new(cart, None).unwrap();
         let thumbnail = vec![7; crate::gpu::SCREEN_W * crate::gpu::SCREEN_H * 3];
@@ -330,7 +327,8 @@ mod test {
         assert_eq!(preview.thumbnail_height, crate::gpu::SCREEN_H as u16);
         assert_eq!(preview.thumbnail_rgb.as_deref(), Some(thumbnail.as_slice()));
 
-        let decoded = decode_cpu_state(&data).unwrap();
+        let mut decoded = decode_cpu_state(&data).unwrap();
+        decoded.mmu.mbc.set_rom(test_rom());
         assert_eq!(decoded.mmu.mbc.romname(), "RKYVTEST");
         assert!(decoded.mmu.sound.is_none());
 
@@ -345,7 +343,7 @@ mod test {
     }
 
     #[test]
-    fn slot_save_writes_v3_preview_file() {
+    fn slot_save_writes_v4_preview_file() {
         let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
         let cpu = CPU::new(cart, None).unwrap();
         let save_dir =
@@ -364,7 +362,8 @@ mod test {
         assert_eq!(read_save_state_preview(&slot_path).unwrap(), preview);
         assert_eq!(preview.thumbnail_rgb.as_deref(), Some(thumbnail.as_slice()));
 
-        let decoded = decode_cpu_state(&data).unwrap();
+        let mut decoded = decode_cpu_state(&data).unwrap();
+        decoded.mmu.mbc.set_rom(test_rom());
         assert_eq!(decoded.mmu.mbc.romname(), "RKYVTEST");
 
         let _ = std::fs::remove_file(slot_path);
@@ -465,7 +464,7 @@ mod test {
         };
 
         assert!(device.flush_to_disk().is_ok());
-        // The auto-save snapshot must exist and decode as V3.
+        // The auto-save snapshot must exist and decode cleanly (current format).
         let data = std::fs::read(&state_path).unwrap();
         assert!(data.starts_with(SAVE_STATE_MAGIC));
         assert!(decode_cpu_state(&data).is_ok());
@@ -488,6 +487,35 @@ mod test {
             device.save_state_slot_path(3),
             save_dir.join("save_state_3.sav")
         );
+    }
+
+    #[test]
+    fn rom_is_excluded_from_serialized_payload() {
+        let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
+        let cpu = CPU::new(cart, None).unwrap();
+        let data = encode_cpu_state(&cpu).unwrap();
+        // test_rom() puts "RKYVTEST" at 0x134; if the ROM were serialized those
+        // bytes would appear in the payload.
+        assert!(
+            !data.windows(8).any(|w| w == b"RKYVTEST"),
+            "ROM bytes must not appear in a rom-skipped payload"
+        );
+    }
+
+    #[test]
+    fn rewind_snapshot_restore_round_trip() {
+        let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
+        let cpu = CPU::new(cart, None).unwrap();
+        let mut device = Device { cpu, save_state: None };
+
+        device.write_byte(0xC000, 0xAB); // WRAM
+        let snap = device.snapshot_rewind().unwrap();
+        device.write_byte(0xC000, 0xCD);
+        assert_eq!(device.read_byte(0xC000), 0xCD);
+
+        device.restore_rewind(&snap).unwrap();
+        assert_eq!(device.read_byte(0xC000), 0xAB, "WRAM restored from snapshot");
+        assert_eq!(device.romname(), "RKYVTEST", "ROM readable after restore");
     }
 
     #[test]
@@ -517,20 +545,6 @@ mod test {
 }
 
 impl Device {
-    pub fn load_state(path: &str) -> Option<Box<Device>> {
-        let mut file = std::fs::File::open(path).ok()?;
-        let mut data = Vec::new();
-        use std::io::Read;
-        if file.read_to_end(&mut data).is_err() {
-            return None;
-        }
-        let cpu = decode_cpu_state(&data).ok()?;
-        Some(Box::new(Device {
-            cpu,
-            save_state: Some(path.to_string()),
-        }))
-    }
-
     pub fn new(
         romname: &str,
         skip_checksum: bool,
@@ -750,6 +764,35 @@ impl Device {
         }
     }
 
+    /// Serialize current mutable state for the rewind ring buffer. The ROM is
+    /// excluded (see the rom-skip in the MBCs); the APU is excluded as usual.
+    /// Returns the raw rkyv payload — no disk header, since these never hit disk.
+    pub fn snapshot_rewind(&self) -> StrResult<Vec<u8>> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(&self.cpu)
+            .map(|bytes| bytes.to_vec())
+            .map_err(|_| "Failed to serialize rewind snapshot")
+    }
+
+    /// Restore a snapshot produced by `snapshot_rewind`, carrying the live ROM
+    /// and audio player across the swap.
+    pub fn restore_rewind(&mut self, payload: &[u8]) -> StrResult<()> {
+        let decoded = rkyv::from_bytes::<CPU, rkyv::rancor::Error>(payload)
+            .map_err(|_| "Failed to deserialize rewind snapshot")?;
+        self.install_decoded_cpu(decoded);
+        Ok(())
+    }
+
+    /// Install a freshly-decoded (rom-less, audio-less) CPU as the live CPU,
+    /// carrying the immutable ROM and the live audio player across the swap.
+    /// Shared by slot-load and rewind restore.
+    fn install_decoded_cpu(&mut self, mut decoded: CPU) {
+        let rom = self.cpu.mmu.mbc.take_rom(); // zero-copy move from outgoing CPU
+        decoded.mmu.mbc.set_rom(rom);
+        decoded.mmu.sound = self.cpu.mmu.sound.take(); // keep the cpal player alive
+        self.cpu = decoded;
+        self.sync_audio(); // drop any stale queued samples
+    }
+
     pub fn load_state_slot(&mut self, slot: u8) -> StrResult<()> {
         println!("Loading state from slot {}...", slot);
         let save_path = self.save_state_slot_path(slot);
@@ -757,7 +800,7 @@ impl Device {
         match std::fs::read(&save_path) {
             Ok(data) => match decode_cpu_state(&data) {
                 Ok(cpu) => {
-                    self.cpu = cpu;
+                    self.install_decoded_cpu(cpu);
                     println!("State loaded from slot {}", slot);
                     Ok(())
                 }

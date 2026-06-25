@@ -3,6 +3,7 @@ use crate::StrResult;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MBC1 {
+    #[rkyv(with = rkyv::with::Skip)]
     rom: Vec<u8>,
     ram: Vec<u8>,
     ram_on: bool,
@@ -136,6 +137,14 @@ impl MBC for MBC1 {
         self.ram_updated = false;
         result
     }
+
+    fn take_rom(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.rom)
+    }
+
+    fn set_rom(&mut self, rom: Vec<u8>) {
+        self.rom = rom;
+    }
 }
 
 #[cfg(test)]
@@ -163,5 +172,17 @@ mod test {
         let mut mbc = MBC1::new(no_ram_cart()).unwrap();
         mbc.writerom(0x0000, 0x0A);
         mbc.writeram(0xA000, 0x42);
+    }
+
+    #[test]
+    fn take_and_set_rom_round_trip() {
+        let mut mbc = MBC1::new(no_ram_cart()).unwrap();
+        let header_byte = mbc.readrom(0x0147);
+        assert_eq!(header_byte, 0x01);
+        let rom = mbc.take_rom();
+        assert!(!rom.is_empty(), "take_rom yields the rom bytes");
+        assert_eq!(mbc.readrom(0x0000), 0xFF, "rom-less read returns 0xFF");
+        mbc.set_rom(rom);
+        assert_eq!(mbc.readrom(0x0147), 0x01, "rom restored after set_rom");
     }
 }

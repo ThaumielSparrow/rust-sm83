@@ -137,6 +137,24 @@ const BIND_BUTTON_WIDTH: f32 = 130.0;
 /// in `draw_bind_window`).
 const BIND_WINDOW_WIDTH: f32 = 440.0;
 
+/// Read-only reference of fixed keyboard system hotkeys, shown in the
+/// keybindings window's Keyboard tab so they're discoverable in-app.
+const SYSTEM_HOTKEY_HELP: &[(&str, &str)] = &[
+    ("F1–F4", "Save State 1–4"),
+    ("F5–F8", "Load State 1–4"),
+    ("F9", "FPS overlay"),
+    ("F11", "Fullscreen"),
+    ("Shift", "Turbo (hold)"),
+    ("T", "Turbo (toggle)"),
+    ("Backspace", "Rewind (hold)"),
+    ("\\", "Rewind (step back)"),
+    ("Y", "Linear interpolation"),
+    ("P", "Pause"),
+    ("M", "Mute"),
+    ("Ctrl+R", "Reset"),
+    ("Esc", "Exit (double-press)"),
+];
+
 /// The keybindings editor lives in its own OS window (with its own GL context
 /// and egui instance) so it never has to fit inside the game window at small scales.
 struct BindWindow {
@@ -194,6 +212,7 @@ enum RootPhase {
         gamepad_capturing: Option<BindTarget>,
         direction_mux: DirectionMux,
         bind_tab: BindTab,
+        rewinding: bool,
     },
 }
 
@@ -430,6 +449,7 @@ impl RootApp {
                 gamepad_capturing: None,
                 direction_mux: DirectionMux::default(),
                 bind_tab: BindTab::Keyboard,
+                rewinding: false,
             };
             if let RootPhase::Running { sender, .. } = &self.phase {
                 let _ = sender.send(GBEvent::UpdateTurbo(cfg.turbo));
@@ -485,6 +505,7 @@ impl RootApp {
                 paused,
                 fullscreen,
                 fps_overlay,
+                rewinding,
                 gamepad_bindings,
                 resolved_gamepad,
                 gamepad_capturing,
@@ -557,6 +578,7 @@ impl RootApp {
                         paused,
                         fullscreen,
                         fps_overlay,
+                        rewinding,
                     },
                 );
                 if outcome.apply_fullscreen && let Some(win) = window.as_ref() {
@@ -649,6 +671,21 @@ fn draw_bind_window(bw: &mut BindWindow, phase: &mut RootPhase, gilrs: Option<&G
                             }
                         });
                         if capturing.is_some() && ui.button("Cancel Capture").clicked() { *capturing=None; }
+                        ui.add_space(4.0);
+                        egui::CollapsingHeader::new("System hotkeys (fixed)")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                egui::Grid::new("kb_hotkey_grid")
+                                    .num_columns(2)
+                                    .spacing([12.0, 4.0])
+                                    .show(ui, |ui| {
+                                        for (keys, action) in SYSTEM_HOTKEY_HELP {
+                                            ui.label(*keys);
+                                            ui.label(*action);
+                                            ui.end_row();
+                                        }
+                                    });
+                            });
                     }
                     BindTab::Controller => {
                         match (&pad_name, gilrs_available) {
@@ -955,6 +992,7 @@ impl ApplicationHandler for RootApp {
                     pre_mute_volume,
                     fullscreen,
                     fps_overlay,
+                    rewinding,
                     gamepad_capturing,
                     ..
                 },
@@ -1009,6 +1047,7 @@ impl ApplicationHandler for RootApp {
                             paused,
                             fullscreen,
                             fps_overlay,
+                            rewinding,
                         },
                     );
                     // Snapshot values we'll need outside the phase borrow.
@@ -1071,6 +1110,7 @@ impl ApplicationHandler for RootApp {
                     paused,
                     fullscreen,
                     fps_overlay,
+                    rewinding,
                     fps_meter,
                     dmg_palette_preset,
                     dmg_palette_custom,
@@ -1238,6 +1278,21 @@ impl ApplicationHandler for RootApp {
                                         if *paused {
                                             ui.colored_label(egui::Color32::LIGHT_YELLOW, "PAUSED");
                                         }
+                                    });
+                                });
+                        }
+                        if *rewinding {
+                            egui::Area::new(egui::Id::new("rewind_overlay"))
+                                .anchor(
+                                    egui::Align2::CENTER_TOP,
+                                    egui::vec2(0.0, menu_bar_height + 4.0),
+                                )
+                                .show(ctx, |ui| {
+                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(255, 80, 80),
+                                            "⏪ REWIND",
+                                        );
                                     });
                                 });
                         }
@@ -1426,6 +1481,7 @@ struct SysCtx<'a> {
     paused: &'a mut bool,
     fullscreen: &'a mut bool,
     fps_overlay: &'a mut bool,
+    rewinding: &'a mut bool,
 }
 
 fn handle_system_action(action: crate::input::SystemAction, ctx: &mut SysCtx) -> SysOutcome {
@@ -1492,6 +1548,13 @@ fn handle_system_action(action: crate::input::SystemAction, ctx: &mut SysCtx) ->
             *ctx.fps_overlay = !*ctx.fps_overlay;
             let on = *ctx.fps_overlay;
             crate::config::update_config(|c| c.fps_overlay = on);
+        }
+        SystemAction::RewindHold(press) => {
+            *ctx.rewinding = press;
+            let _ = ctx.sender.send(GBEvent::SetRewinding(press));
+        }
+        SystemAction::RewindStep => {
+            let _ = ctx.sender.send(GBEvent::RewindStep);
         }
     }
     outcome
