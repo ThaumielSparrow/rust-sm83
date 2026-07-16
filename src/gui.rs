@@ -1134,7 +1134,7 @@ impl ApplicationHandler for RootApp {
                 if !*running {
                     return;
                 }
-                drain_gui_events(ui_receiver, save_slots);
+                drain_gui_events(ui_receiver, save_slots, toasts);
                 // Deferred actions set inside the egui closure or below, applied after the borrow ends.
                 let mut quit_requested = false;
                 let mut reset_clicked = false;
@@ -1432,7 +1432,7 @@ impl ApplicationHandler for RootApp {
             if !*running {
                 return;
             }
-            drain_gui_events(ui_receiver, save_slots);
+            drain_gui_events(ui_receiver, save_slots, toasts);
             // Toasts animate even when no frames arrive (e.g. paused).
             if !toasts.is_empty() {
                 if let Some(w) = &self.window {
@@ -1587,14 +1587,32 @@ fn handle_system_action(action: crate::input::SystemAction, ctx: &mut SysCtx) ->
     outcome
 }
 
-fn drain_gui_events(receiver: &Receiver<GuiEvent>, save_slots: &mut SaveSlotCache) {
+fn drain_gui_events(
+    receiver: &Receiver<GuiEvent>,
+    save_slots: &mut SaveSlotCache,
+    toasts: &mut ToastQueue,
+) {
     loop {
         match receiver.try_recv() {
             Ok(GuiEvent::SaveStateSaved { slot, preview }) => {
                 save_slots.mark_saved(slot, preview);
+                toasts.push(format!("State saved to slot {}", slot), ToastKind::Success);
             }
             Ok(GuiEvent::SaveStateFailed { slot }) => {
                 save_slots.mark_failed(slot);
+                toasts.push(format!("Save to slot {} failed", slot), ToastKind::Error);
+            }
+            Ok(GuiEvent::LoadStateResult { slot, ok: true }) => {
+                toasts.push(format!("State {} loaded", slot), ToastKind::Success);
+            }
+            Ok(GuiEvent::LoadStateResult { slot, ok: false }) => {
+                toasts.push(format!("Couldn't load state {}", slot), ToastKind::Error);
+            }
+            Ok(GuiEvent::BatterySaveFailed) => {
+                toasts.push(
+                    "Battery save failed — check disk space and permissions",
+                    ToastKind::Error,
+                );
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => break,

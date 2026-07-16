@@ -27,6 +27,8 @@ pub enum GBEvent {
 pub enum GuiEvent {
     SaveStateSaved { slot: u8, preview: SaveStatePreview },
     SaveStateFailed { slot: u8 },
+    LoadStateResult { slot: u8, ok: bool },
+    BatterySaveFailed,
 }
 
 /// Number of emulated frames between background battery-RAM saves. At ~60 fps
@@ -149,6 +151,9 @@ pub fn run_cpu(
     // any pending dirty state so nothing is lost on quit.
     let mut ram_dirty = false;
     let mut last_ram_save_frame: Option<u64> = None;
+    // Battery-save failure latch: toast only on the ok→fail transition so a
+    // persistently failing disk produces one toast, not one per second.
+    let mut battery_save_ok = true;
 
     // Two reusable frame buffers; we only write to a buffer if it is uniquely held (strong_count==1).
     let frame_len = cpu.get_gpu_data().len();
@@ -230,7 +235,11 @@ pub fn run_cpu(
                     frame_count,
                     RAM_SAVE_DEBOUNCE_FRAMES,
                 ) {
-                    let _ = cpu.save_battery_ram_silent();
+                    let save_result = cpu.save_battery_ram_silent();
+                    if save_result.is_err() && battery_save_ok {
+                        let _ = ui_sender.send(GuiEvent::BatterySaveFailed);
+                    }
+                    battery_save_ok = save_result.is_ok();
                     ram_dirty = false;
                     last_ram_save_frame = Some(frame_count);
                 }
@@ -264,9 +273,14 @@ pub fn run_cpu(
                     }
                     GBEvent::LoadState(s) => {
                         println!("Attempting to load state from slot {}...", s);
-                        if let Err(e) = cpu.load_state_slot(s) {
-                            eprintln!("Failed to load state from slot {}: {}", s, e);
-                        }
+                        let ok = match cpu.load_state_slot(s) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                eprintln!("Failed to load state from slot {}: {}", s, e);
+                                false
+                            }
+                        };
+                        let _ = ui_sender.send(GuiEvent::LoadStateResult { slot: s, ok });
                         ring.clear();
                     }
                     GBEvent::UpdateTurbo(ts) => {
