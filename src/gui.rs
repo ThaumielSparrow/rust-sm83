@@ -215,6 +215,7 @@ enum RootPhase {
         bind_tab: BindTab,
         rewinding: bool,
         toasts: ToastQueue,
+        integer_scaling: bool,
     },
 }
 
@@ -455,6 +456,7 @@ impl RootApp {
                 bind_tab: BindTab::Keyboard,
                 rewinding: false,
                 toasts: ToastQueue::default(),
+                integer_scaling: cfg.integer_scaling,
             };
             if let RootPhase::Running { sender, .. } = &self.phase {
                 let _ = sender.send(GBEvent::UpdateTurbo(cfg.turbo));
@@ -1127,6 +1129,7 @@ impl ApplicationHandler for RootApp {
                     palette_scratch,
                     pre_mute_volume,
                     toasts,
+                    integer_scaling,
                     ..
                 },
                 WindowEvent::RedrawRequested,
@@ -1214,6 +1217,10 @@ impl ApplicationHandler for RootApp {
                                     });
                                     ui.separator();
                                     ui.checkbox(&mut renderoptions.linear_interpolation, "Linear interpolation (Y)");
+                                    if ui.checkbox(integer_scaling, "Integer scaling").changed() {
+                                        let on = *integer_scaling;
+                                        crate::config::update_config(|c| c.integer_scaling = on);
+                                    }
                                     ui.add_enabled_ui(!is_color_ro, |ui| {
                                         ui.menu_button("DMG Palette", |ui| {
                                             for preset in DmgPalettePreset::all() {
@@ -1322,23 +1329,29 @@ impl ApplicationHandler for RootApp {
                         (menu_bar_height * window.scale_factor() as f32) as u32;
                     let game_area_height = target_h.saturating_sub(menu_bar_height_pixels);
 
-                    // Render game texture offset downward by menu bar height
+                    // Black bars for the letterbox/pillarbox area.
+                    target.clear_color(0.0, 0.0, 0.0, 1.0);
+                    // Render the frame aspect-correct and centered in the game area.
                     if game_area_height > 0 {
                         let interpolation_type = if renderoptions.linear_interpolation {
                             glium::uniforms::MagnifySamplerFilter::Linear
                         } else {
                             glium::uniforms::MagnifySamplerFilter::Nearest
                         };
-                        texture.as_surface().blit_whole_color_to(
-                            &target,
-                            &glium::BlitTarget {
-                                left: 0,
-                                bottom: game_area_height, // Position at bottom of available area
-                                width: target_w as i32,
-                                height: -(game_area_height as i32), // Negative height to flip Y
-                            },
-                            interpolation_type,
-                        );
+                        let (left, bottom, w, h) =
+                            fit_rect(target_w, game_area_height, *integer_scaling);
+                        if w > 0 && h > 0 {
+                            texture.as_surface().blit_whole_color_to(
+                                &target,
+                                &glium::BlitTarget {
+                                    left,
+                                    bottom: bottom + h, // top edge; negative height flips Y
+                                    width: w as i32,
+                                    height: -(h as i32),
+                                },
+                                interpolation_type,
+                            );
+                        }
                     }
 
                     // Paint egui on top
@@ -1964,6 +1977,21 @@ fn key_to_string(key: &winit::keyboard::Key<&str>) -> String {
     }
 }
 
+/// Fit the GB frame into `avail_w` x `avail_h` preserving the 160:144 aspect.
+/// Returns (left, bottom, width, height) of the centered destination rect.
+/// With `integer_scaling`, the scale is floored to a whole multiple; below
+/// native size it falls back to a fractional aspect-preserving shrink.
+fn fit_rect(avail_w: u32, avail_h: u32, integer_scaling: bool) -> (u32, u32, u32, u32) {
+    let (nw, nh) = (rust_gbe::SCREEN_W as f64, rust_gbe::SCREEN_H as f64);
+    let mut scale = (avail_w as f64 / nw).min(avail_h as f64 / nh);
+    if integer_scaling && scale >= 1.0 {
+        scale = scale.floor();
+    }
+    let w = (nw * scale) as u32;
+    let h = (nh * scale) as u32;
+    ((avail_w.saturating_sub(w)) / 2, (avail_h.saturating_sub(h)) / 2, w, h)
+}
+
 fn matches_capturing(capturing: Option<rust_gbe::KeypadKey>, k: rust_gbe::KeypadKey) -> bool {
     use rust_gbe::KeypadKey::*;
     match (capturing, k) {
@@ -1976,5 +2004,39 @@ fn matches_capturing(capturing: Option<rust_gbe::KeypadKey>, k: rust_gbe::Keypad
         | (Some(Left), Left)
         | (Some(Right), Right) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_rect;
+
+    #[test]
+    fn fit_rect_preserves_aspect_fractional() {
+        // 1080/144 = 7.5 is the limiting scale → 1200x1080, centered horizontally.
+        let (l, b, w, h) = fit_rect(1920, 1080, false);
+        assert_eq!((w, h), (1200, 1080));
+        assert_eq!((l, b), ((1920 - 1200) / 2, 0));
+    }
+
+    #[test]
+    fn fit_rect_integer_floors_scale() {
+        // floor(7.5) = 7 → 1120x1008, centered both ways.
+        let (l, b, w, h) = fit_rect(1920, 1080, true);
+        assert_eq!((w, h), (1120, 1008));
+        assert_eq!((l, b), (400, 36));
+    }
+
+    #[test]
+    fn fit_rect_exact_multiple_fills() {
+        assert_eq!(fit_rect(480, 432, true), (0, 0, 480, 432));
+    }
+
+    #[test]
+    fn fit_rect_tiny_and_zero_windows_do_not_panic() {
+        // Below-native with integer scaling falls back to fractional shrink.
+        let (_, _, w, h) = fit_rect(80, 72, true);
+        assert!(w <= 80 && h <= 72 && w > 0 && h > 0);
+        assert_eq!(fit_rect(0, 0, false), (0, 0, 0, 0));
     }
 }
