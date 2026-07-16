@@ -503,6 +503,51 @@ mod test {
     }
 
     #[test]
+    fn auto_save_round_trips_via_load_auto_save() {
+        let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
+        let cpu = CPU::new(cart, None).unwrap();
+        let save_dir = std::env::temp_dir()
+            .join(format!("rust_gbe_auto_resume_test_{}", std::process::id()));
+        std::fs::create_dir_all(&save_dir).unwrap();
+        let mut device = Device {
+            cpu,
+            save_state: Some(save_dir.join("game.state").to_string_lossy().to_string()),
+        };
+
+        assert!(!device.has_auto_save(), "no auto-save before first flush");
+        device.write_byte(0xC000, 0x5A);
+        device.flush_to_disk().unwrap();
+        assert!(device.has_auto_save());
+        device.write_byte(0xC000, 0x00);
+
+        device.load_auto_save().unwrap();
+        assert_eq!(device.read_byte(0xC000), 0x5A, "WRAM restored from auto-save");
+        assert_eq!(device.romname(), "RKYVTEST", "ROM carried across restore");
+
+        let _ = std::fs::remove_dir_all(save_dir);
+    }
+
+    #[test]
+    fn load_auto_save_errors_without_file_or_path() {
+        let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
+        let cpu = CPU::new(cart, None).unwrap();
+        let missing = std::env::temp_dir()
+            .join(format!("rust_gbe_missing_auto_{}.state", std::process::id()));
+        let mut device = Device {
+            cpu,
+            save_state: Some(missing.to_string_lossy().to_string()),
+        };
+        assert!(!device.has_auto_save());
+        assert!(device.load_auto_save().is_err());
+
+        let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
+        let cpu = CPU::new(cart, None).unwrap();
+        let mut device = Device { cpu, save_state: None };
+        assert!(!device.has_auto_save());
+        assert!(device.load_auto_save().is_err());
+    }
+
+    #[test]
     fn rewind_snapshot_restore_round_trip() {
         let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
         let cpu = CPU::new(cart, None).unwrap();
@@ -791,6 +836,25 @@ impl Device {
         decoded.mmu.sound = self.cpu.mmu.sound.take(); // keep the cpal player alive
         self.cpu = decoded;
         self.sync_audio(); // drop any stale queued samples
+    }
+
+    /// True when the auto-save path is configured and the file exists on disk.
+    pub fn has_auto_save(&self) -> bool {
+        self.save_state
+            .as_deref()
+            .is_some_and(|p| std::path::Path::new(p).is_file())
+    }
+
+    /// Load the auto-save snapshot written by `flush_to_disk`, carrying the
+    /// live ROM and audio player across the swap (same path as slot loads).
+    pub fn load_auto_save(&mut self) -> StrResult<()> {
+        let Some(path) = self.save_state.as_deref() else {
+            return Err("No auto-save path configured");
+        };
+        let data = std::fs::read(path).map_err(|_| "No auto-save file")?;
+        let cpu = decode_cpu_state(&data)?;
+        self.install_decoded_cpu(cpu);
+        Ok(())
     }
 
     pub fn load_state_slot(&mut self, slot: u8) -> StrResult<()> {
