@@ -107,12 +107,15 @@ pub struct Config {
     #[serde(default)] pub fps_overlay: bool,
     #[serde(default)] pub fullscreen: bool,
     #[serde(default)] pub integer_scaling: bool,
+    #[serde(default = "default_true")] pub auto_resume: bool,
     #[serde(default)] pub dmg_palette_preset: DmgPalettePreset,
     #[serde(default="default_custom_palette")] pub dmg_palette_custom: [[u8; 3]; 4],
     #[serde(default)] pub gamepad: GamepadBindings,
 }
 
 fn default_volume() -> u8 { 100 }
+
+fn default_true() -> bool { true }
 
 impl Default for Config {
     fn default() -> Self {
@@ -125,6 +128,7 @@ impl Default for Config {
             fps_overlay: false,
             fullscreen: false,
             integer_scaling: false,
+            auto_resume: true,
             dmg_palette_preset: DmgPalettePreset::default(),
             dmg_palette_custom: default_custom_palette(),
             gamepad: GamepadBindings::default(),

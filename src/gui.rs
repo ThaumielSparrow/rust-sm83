@@ -216,6 +216,7 @@ enum RootPhase {
         rewinding: bool,
         toasts: ToastQueue,
         integer_scaling: bool,
+        auto_resume: bool,
     },
 }
 
@@ -361,29 +362,45 @@ impl RootApp {
                 };
                 if let Some(p) = path {
                     self.stop_emulator();
-                    self.start_game_from_path(p);
+                    // Reset must boot fresh, not re-resume the just-flushed state.
+                    self.start_game_from_path(p, false);
                 }
             }
             Some(PendingAction::LoadRom(p)) => {
                 if let RootPhase::Running { .. } = &self.phase {
                     self.stop_emulator();
                 }
-                self.start_game_from_path(p);
+                self.start_game_from_path(p, true);
             }
             None => {}
         }
     }
 
-    fn start_game_from_path(&mut self, rom_path: PathBuf) {
+    /// `resume`: attempt to continue from the auto-save written at last
+    /// shutdown. Reset passes false — it must not re-load the state that
+    /// `stop_emulator` just flushed.
+    fn start_game_from_path(&mut self, rom_path: PathBuf, resume: bool) {
         // Always run in (CGB-capable) mode; attempt CGB first, fallback to classic if needed.
         let filename = rom_path.to_string_lossy().to_string();
-        let (mut cpu, is_color) = match construct_cpu_auto(&filename) {
+        let (mut cpu, _) = match construct_cpu_auto(&filename) {
             Some(pair) => pair,
             None => {
                 self.exit_code = EXITCODE_CPULOADFAILS;
                 return;
             }
         };
+        let cfg = Config::load(&config_path());
+        let mut toasts = ToastQueue::default();
+        if resume && cfg.auto_resume && cpu.has_auto_save() {
+            match cpu.load_auto_save() {
+                Ok(()) => toasts.push("Resumed last session", ToastKind::Success),
+                Err(_) => toasts.push(
+                    "Couldn't resume last session — starting fresh",
+                    ToastKind::Info,
+                ),
+            }
+        }
+        let is_color = cpu.is_cgb_mode();
         // Enable audio by default; if no device is available, fall back to a
         // discarding player so the APU is still emulated (games poll NR52 etc.).
         let mut audio_stream = None;
@@ -413,7 +430,6 @@ impl RootApp {
                 rust_gbe::SCREEN_H as u32,
             )
             .unwrap();
-            let cfg = Config::load(&config_path());
             let initial_scale = cfg.scale;
             self.scale = initial_scale;
 
@@ -455,8 +471,9 @@ impl RootApp {
                 direction_mux: DirectionMux::default(),
                 bind_tab: BindTab::Keyboard,
                 rewinding: false,
-                toasts: ToastQueue::default(),
+                toasts,
                 integer_scaling: cfg.integer_scaling,
+                auto_resume: cfg.auto_resume,
             };
             if let RootPhase::Running { sender, .. } = &self.phase {
                 let _ = sender.send(GBEvent::UpdateTurbo(cfg.turbo));
@@ -801,7 +818,7 @@ impl ApplicationHandler for RootApp {
             }
             // If a ROM path was supplied on the command line, skip the file picker.
             if let Some(p) = self.pending_rom.take() {
-                self.start_game_from_path(p);
+                self.start_game_from_path(p, true);
             }
         }
     }
@@ -958,7 +975,7 @@ impl ApplicationHandler for RootApp {
                     }
                 }
                 if let Some(p) = launch_path {
-                    self.start_game_from_path(p);
+                    self.start_game_from_path(p, true);
                 }
                 if quit_requested {
                     self.exit_code = EXITCODE_SUCCESS;
@@ -972,7 +989,7 @@ impl ApplicationHandler for RootApp {
             ) => {
                 if rom_path_is_supported(&path) && path.is_file() {
                     *rom_path = path.to_string_lossy().into_owned();
-                    self.start_game_from_path(path);
+                    self.start_game_from_path(path, true);
                 }
             }
             // Track modifier state so chords like Ctrl+R work.
@@ -1130,6 +1147,7 @@ impl ApplicationHandler for RootApp {
                     pre_mute_volume,
                     toasts,
                     integer_scaling,
+                    auto_resume,
                     ..
                 },
                 WindowEvent::RedrawRequested,
@@ -1277,6 +1295,10 @@ impl ApplicationHandler for RootApp {
                                         let _ = sender.send(GBEvent::UpdateVolume(perceptual_to_linear(*volume)));
                                         let v = *volume;
                                         crate::config::update_config(|c| c.volume = v);
+                                    }
+                                    if ui.checkbox(auto_resume, "Resume last session on load").changed() {
+                                        let on = *auto_resume;
+                                        crate::config::update_config(|c| c.auto_resume = on);
                                     }
                                     ui.separator();
                                     if ui.button("Keybindings...").clicked() { open_keybindings = true; }
