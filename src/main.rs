@@ -12,6 +12,7 @@ mod config;
 mod input;
 mod gamepad;
 mod palette;
+mod toast;
 
 use std::path::PathBuf;
 
