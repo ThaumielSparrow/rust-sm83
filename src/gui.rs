@@ -381,13 +381,15 @@ impl RootApp {
                 return;
             }
         };
-        // Enable audio by default; if device fails, continue silently.
+        // Enable audio by default; if no device is available, fall back to a
+        // discarding player so the APU is still emulated (games poll NR52 etc.).
         let mut audio_stream = None;
         if let Some((player, s)) = init_audio() {
             cpu.enable_audio(player, true);
             audio_stream = Some(s);
         } else {
             warn("Audio disabled: no output device available");
+            cpu.enable_audio(crate::audio::null_player(), true);
         }
         let _ = cpu.romname();
         let save_slots = SaveSlotCache::from_paths(

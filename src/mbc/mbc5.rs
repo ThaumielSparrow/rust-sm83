@@ -29,6 +29,10 @@ impl MBC5 {
         };
         let ramsize = 0x2000 * rambanks;
         let rombanks = rom_banks(data[0x148]);
+        // rombank writes compute `% rombanks`; reject 0 banks (size byte > 8).
+        if rombanks == 0 {
+            return Err("Invalid ROM size in cartridge header");
+        }
 
         let res = MBC5 {
             rom: data,
@@ -54,7 +58,7 @@ impl MBC for MBC5 {
         } else {
             self.rombank * 0x4000 | ((a as usize) & 0x3FFF)
         };
-        *self.rom.get(idx).unwrap_or(&0)
+        *self.rom.get(idx).unwrap_or(&0xFF)
     }
     fn readram(&self, a: u16) -> u8 {
         if !self.ram_on || self.ram.is_empty() {
@@ -181,5 +185,14 @@ mod test {
     fn mbc5_no_ram_bank_write_does_not_panic() {
         let mut mbc = MBC5::new(no_ram_mbc5_cart()).unwrap();
         mbc.writerom(0x4000, 0x02);
+    }
+
+    #[test]
+    fn mbc5_romless_read_returns_open_bus() {
+        let mut mbc = MBC5::new(no_ram_mbc5_cart()).unwrap();
+        let rom = mbc.take_rom();
+        assert_eq!(mbc.readrom(0x0000), 0xFF, "rom-less read returns 0xFF");
+        mbc.set_rom(rom);
+        assert_eq!(mbc.readrom(0x0147), 0x19, "rom restored after set_rom");
     }
 }

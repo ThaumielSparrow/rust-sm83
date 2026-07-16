@@ -24,6 +24,12 @@ impl MBC1 {
             _ => (false, 0),
         };
         let rombanks = rom_banks(data[0x148]);
+        // rombank writes compute `% rombanks`; a size byte > 8 yields 0 banks
+        // and would panic there. MBC0/MBC3 tolerate any size byte, so this is
+        // rejected per-mapper rather than in get_mbc.
+        if rombanks == 0 {
+            return Err("Invalid ROM size in cartridge header");
+        }
         let ramsize = rambanks * 0x2000;
 
         let res = MBC1 {

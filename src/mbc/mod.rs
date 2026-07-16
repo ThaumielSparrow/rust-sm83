@@ -418,6 +418,39 @@ fn check_checksum(data: &[u8]) -> StrResult<()> {
 #[cfg(test)]
 mod test {
     #[test]
+    fn bank_switching_mbcs_reject_invalid_rom_size_byte() {
+        // MBC1/MBC2/MBC5 compute `% rombanks`; a size byte > 8 (rom_banks == 0)
+        // must be a clean Err, not a divide-by-zero panic on first bank switch.
+        for mbc_type in [0x01u8, 0x05, 0x19] {
+            let mut data = vec![0u8; 0x8000];
+            data[0x147] = mbc_type;
+            data[0x148] = 0x09;
+            assert_eq!(
+                super::get_mbc(data, true).err(),
+                Some("Invalid ROM size in cartridge header"),
+                "MBC type {:#04X}",
+                mbc_type
+            );
+        }
+    }
+
+    #[test]
+    fn non_dividing_mbcs_tolerate_invalid_rom_size_byte() {
+        // MBC0 and MBC3 never divide by rombanks; an odd size byte on an
+        // otherwise-playable ROM must not be rejected (compatibility).
+        for mbc_type in [0x00u8, 0x11] {
+            let mut data = vec![0u8; 0x8000];
+            data[0x147] = mbc_type;
+            data[0x148] = 0x52;
+            assert!(
+                super::get_mbc(data, true).is_ok(),
+                "MBC type {:#04X} should load despite size byte 0x52",
+                mbc_type
+            );
+        }
+    }
+
+    #[test]
     fn checksum_zero() {
         let mut data = vec![0; 0x150];
         data[0x14D] = -(0x14D_i32 - 0x134_i32) as u8;
