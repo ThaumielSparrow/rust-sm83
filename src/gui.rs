@@ -32,6 +32,7 @@ use crate::config::{binding_value, config_path, Config, DmgPalettePreset, KeyBin
 use crate::emulator::{construct_cpu_auto, run_cpu, GBEvent, GuiEvent};
 use crate::input::is_reserved_key_name;
 use crate::palette::{apply_dmg_palette, palette_for_preset, DmgPalette};
+use crate::toast::{ToastKind, ToastQueue};
 
 struct SaveSlotUi {
     slot: u8,
@@ -213,6 +214,7 @@ enum RootPhase {
         direction_mux: DirectionMux,
         bind_tab: BindTab,
         rewinding: bool,
+        toasts: ToastQueue,
     },
 }
 
@@ -452,6 +454,7 @@ impl RootApp {
                 direction_mux: DirectionMux::default(),
                 bind_tab: BindTab::Keyboard,
                 rewinding: false,
+                toasts: ToastQueue::default(),
             };
             if let RootPhase::Running { sender, .. } = &self.phase {
                 let _ = sender.send(GBEvent::UpdateTurbo(cfg.turbo));
@@ -512,6 +515,7 @@ impl RootApp {
                 resolved_gamepad,
                 gamepad_capturing,
                 direction_mux,
+                toasts,
                 ..
             } = &mut *phase
             else {
@@ -581,6 +585,7 @@ impl RootApp {
                         fullscreen,
                         fps_overlay,
                         rewinding,
+                        toasts,
                     },
                 );
                 if outcome.apply_fullscreen && let Some(win) = window.as_ref() {
@@ -996,6 +1001,7 @@ impl ApplicationHandler for RootApp {
                     fps_overlay,
                     rewinding,
                     gamepad_capturing,
+                    toasts,
                     ..
                 },
                 WindowEvent::KeyboardInput {
@@ -1050,6 +1056,7 @@ impl ApplicationHandler for RootApp {
                             fullscreen,
                             fps_overlay,
                             rewinding,
+                            toasts,
                         },
                     );
                     // Snapshot values we'll need outside the phase borrow.
@@ -1119,6 +1126,7 @@ impl ApplicationHandler for RootApp {
                     is_color,
                     palette_scratch,
                     pre_mute_volume,
+                    toasts,
                     ..
                 },
                 WindowEvent::RedrawRequested,
@@ -1298,6 +1306,7 @@ impl ApplicationHandler for RootApp {
                                     });
                                 });
                         }
+                        toasts.draw(ctx);
                     });
                     if quit_requested {
                         *running = false;
@@ -1416,6 +1425,7 @@ impl ApplicationHandler for RootApp {
             dmg_palette_preset,
             dmg_palette_custom,
             palette_scratch,
+            toasts,
             ..
         } = &mut self.phase
         {
@@ -1423,6 +1433,12 @@ impl ApplicationHandler for RootApp {
                 return;
             }
             drain_gui_events(ui_receiver, save_slots);
+            // Toasts animate even when no frames arrive (e.g. paused).
+            if !toasts.is_empty() {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
             let palette_now = palette_for_preset(*dmg_palette_preset, dmg_palette_custom);
             let needs_palette = !*is_color;
             match receiver.try_recv() {
@@ -1484,6 +1500,7 @@ struct SysCtx<'a> {
     fullscreen: &'a mut bool,
     fps_overlay: &'a mut bool,
     rewinding: &'a mut bool,
+    toasts: &'a mut ToastQueue,
 }
 
 fn handle_system_action(action: crate::input::SystemAction, ctx: &mut SysCtx) -> SysOutcome {
@@ -1518,6 +1535,10 @@ fn handle_system_action(action: crate::input::SystemAction, ctx: &mut SysCtx) ->
             } else if !*ctx.turbo_held {
                 let _ = ctx.sender.send(GBEvent::SpeedDown);
             }
+            ctx.toasts.push(
+                if *ctx.turbo_toggle { "Turbo on" } else { "Turbo off" },
+                ToastKind::Info,
+            );
         }
         SystemAction::ToggleInterpolation => {
             ctx.renderoptions.linear_interpolation = !ctx.renderoptions.linear_interpolation;
@@ -1545,6 +1566,10 @@ fn handle_system_action(action: crate::input::SystemAction, ctx: &mut SysCtx) ->
             let _ = ctx.sender.send(GBEvent::UpdateVolume(perceptual_to_linear(*ctx.volume)));
             let v = *ctx.volume;
             crate::config::update_config(|c| c.volume = v);
+            ctx.toasts.push(
+                if *ctx.volume == 0 { "Muted" } else { "Volume restored" },
+                ToastKind::Info,
+            );
         }
         SystemAction::ToggleFpsOverlay => {
             *ctx.fps_overlay = !*ctx.fps_overlay;
