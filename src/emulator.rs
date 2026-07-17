@@ -21,6 +21,7 @@ pub enum GBEvent {
     SetPaused(bool),
     SetRewinding(bool),
     RewindStep,
+    SetCheats(Vec<crate::cheats::PokeOp>),
     Shutdown,
 }
 
@@ -105,6 +106,17 @@ fn try_send_frame(
     Ok(())
 }
 
+/// Apply the enabled GameShark pokes. Called once per emulated frame while
+/// running forward (real carts hook vblank); skipped while paused/rewinding.
+fn apply_cheats(cpu: &mut Device, pokes: &[crate::cheats::PokeOp]) {
+    for p in pokes {
+        match p.bank {
+            Some(b) => cpu.cheat_write_wram_bank(b, p.addr, p.value),
+            None => cpu.write_byte(p.addr, p.value),
+        }
+    }
+}
+
 /// Decompress a rewind ring entry and restore it. Returns true on success;
 /// failures are logged and skipped (entries are process-local, so neither
 /// decompression nor decode should fail in practice).
@@ -186,6 +198,7 @@ pub fn run_cpu(
     let mut ring: VecDeque<Vec<u8>> = VecDeque::with_capacity(REWIND_CAPACITY);
     let mut rewinding = false;
     let mut rewind_tick: u64 = 0;
+    let mut cheats: Vec<crate::cheats::PokeOp> = Vec::new();
 
     'outer: loop {
         if rewinding {
@@ -232,6 +245,7 @@ pub fn run_cpu(
             if !paused {
                 ticks -= frame_target;
                 frame_count += 1;
+                apply_cheats(&mut cpu, &cheats);
 
                 if should_capture(frame_count, REWIND_INTERVAL_FRAMES) {
                     match cpu.snapshot_rewind() {
@@ -342,6 +356,7 @@ pub fn run_cpu(
                             }
                         }
                     }
+                    GBEvent::SetCheats(list) => cheats = list,
                     GBEvent::Shutdown => {
                         if let Err(e) = cpu.flush_to_disk() {
                             eprintln!("flush_to_disk failed: {}", e);
@@ -414,6 +429,21 @@ mod tests {
         assert!(!should_capture(5, 2));
         assert!(should_capture(6, 2));
         assert!(!should_capture(10, 0), "interval 0 never captures");
+    }
+
+    #[test]
+    fn apply_cheats_writes_plain_and_banked_pokes() {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x147] = 0x00;
+        let mut dev = Device::new_from_buffer(rom, true, None).unwrap();
+        let pokes = vec![
+            crate::cheats::PokeOp { bank: None, addr: 0xC010, value: 0x11 },
+            crate::cheats::PokeOp { bank: Some(2), addr: 0xD020, value: 0x22 },
+        ];
+        apply_cheats(&mut dev, &pokes);
+        assert_eq!(dev.read_byte(0xC010), 0x11);
+        // DMG device: banked poke degrades to a plain bus write.
+        assert_eq!(dev.read_byte(0xD020), 0x22);
     }
 
     #[test]
