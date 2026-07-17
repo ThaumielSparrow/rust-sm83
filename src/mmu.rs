@@ -294,6 +294,18 @@ impl MMU {
         self.wb(address.wrapping_add(1), (value >> 8) as u8);
     }
 
+    /// Direct banked WRAM write for GameShark 9x codes. `address` must be in
+    /// 0xD000-0xDFFF (the banked window); `bank` 0 aliases bank 1, matching
+    /// SVBK behavior. Callers with other address ranges use `wb`.
+    pub fn write_wram_banked(&mut self, bank: u8, address: u16, value: u8) {
+        debug_assert!((0xD000..=0xDFFF).contains(&address));
+        let bank = match (bank & 0x07) as usize {
+            0 => 1,
+            n => n,
+        };
+        self.wram[(bank * 0x1000) | (address as usize & 0x0FFF)] = value;
+    }
+
     pub fn switch_speed(&mut self) {
         if self.speed_switch_req {
             if self.gbspeed == GbSpeed::Double {

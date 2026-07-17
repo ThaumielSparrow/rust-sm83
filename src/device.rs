@@ -503,6 +503,41 @@ mod test {
     }
 
     #[test]
+    fn cheat_write_wram_bank_targets_selected_bank() {
+        let mut rom = test_rom();
+        rom[0x143] = 0x80; // CGB cart
+        let mut device = Device::new_cgb_from_buffer(rom, true, None).unwrap();
+
+        // Give bank 1's slot a known value first (WRAM is randomized at boot).
+        device.write_byte(0xFF70, 1);
+        device.write_byte(0xD123, 0x00);
+
+        device.cheat_write_wram_bank(3, 0xD123, 0x77);
+        assert_eq!(device.read_byte(0xD123), 0x00, "bank 1 untouched");
+        device.write_byte(0xFF70, 3);
+        assert_eq!(device.read_byte(0xD123), 0x77, "bank 3 poked");
+    }
+
+    #[test]
+    fn cheat_write_bank_zero_maps_to_bank_one() {
+        let mut rom = test_rom();
+        rom[0x143] = 0x80;
+        let mut device = Device::new_cgb_from_buffer(rom, true, None).unwrap();
+        device.cheat_write_wram_bank(0, 0xD00A, 0x55);
+        device.write_byte(0xFF70, 1);
+        assert_eq!(device.read_byte(0xD00A), 0x55, "bank 0 aliases bank 1 (SVBK)");
+    }
+
+    #[test]
+    fn cheat_write_wram_bank_falls_back_on_dmg_and_other_ranges() {
+        let mut device = Device::new_from_buffer(test_rom(), true, None).unwrap();
+        device.cheat_write_wram_bank(5, 0xD00A, 0x42);
+        assert_eq!(device.read_byte(0xD00A), 0x42, "DMG: plain bus write");
+        device.cheat_write_wram_bank(5, 0xC005, 0x24);
+        assert_eq!(device.read_byte(0xC005), 0x24, "non-D000 range: plain bus write");
+    }
+
+    #[test]
     fn auto_save_round_trips_via_load_auto_save() {
         let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
         let cpu = CPU::new(cart, None).unwrap();
@@ -750,6 +785,17 @@ impl Device {
     }
     pub fn write_byte(&mut self, address: u16, byte: u8) {
         self.cpu.write_byte(address, byte)
+    }
+
+    /// Apply a GameShark banked WRAM write (9x code). In CGB mode, addresses
+    /// in 0xD000-0xDFFF hit the given WRAM bank directly; anything else (and
+    /// all DMG-mode writes) goes through the normal bus write.
+    pub fn cheat_write_wram_bank(&mut self, bank: u8, address: u16, value: u8) {
+        if self.cpu.mmu.gbmode == GbMode::Color && (0xD000..=0xDFFF).contains(&address) {
+            self.cpu.mmu.write_wram_banked(bank, address, value);
+        } else {
+            self.cpu.mmu.wb(address, value);
+        }
     }
     pub fn read_wide(&mut self, address: u16) -> u16 {
         self.cpu.read_wide(address)
