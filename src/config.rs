@@ -106,12 +106,19 @@ pub struct Config {
     #[serde(default)] pub recent_roms: Vec<String>,
     #[serde(default)] pub fps_overlay: bool,
     #[serde(default)] pub fullscreen: bool,
+    #[serde(default)] pub integer_scaling: bool,
+    #[serde(default = "default_true")] pub auto_resume: bool,
+    /// Per-game cheat lists, keyed by cartridge header title (file name for
+    /// blank-title ROMs — see cheats::cheat_key).
+    #[serde(default)] pub cheats: HashMap<String, Vec<crate::cheats::Cheat>>,
     #[serde(default)] pub dmg_palette_preset: DmgPalettePreset,
     #[serde(default="default_custom_palette")] pub dmg_palette_custom: [[u8; 3]; 4],
     #[serde(default)] pub gamepad: GamepadBindings,
 }
 
 fn default_volume() -> u8 { 100 }
+
+fn default_true() -> bool { true }
 
 impl Default for Config {
     fn default() -> Self {
@@ -123,6 +130,9 @@ impl Default for Config {
             recent_roms: Vec::new(),
             fps_overlay: false,
             fullscreen: false,
+            integer_scaling: false,
+            auto_resume: true,
+            cheats: HashMap::new(),
             dmg_palette_preset: DmgPalettePreset::default(),
             dmg_palette_custom: default_custom_palette(),
             gamepad: GamepadBindings::default(),
@@ -203,6 +213,20 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).expect("parse");
         assert_eq!(cfg.gamepad.buttons.get("a").map(String::as_str), Some("South"));
         assert!(cfg.gamepad.hotkeys.is_empty());
+    }
+
+    #[test]
+    fn cheats_round_trip_and_default_empty() {
+        let mut cfg = Config::default();
+        assert!(cfg.cheats.is_empty());
+        cfg.cheats.insert(
+            "ZELDA".into(),
+            vec![crate::cheats::Cheat { code: "01FF56D3".into(), label: "hp".into(), enabled: true }],
+        );
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let back: Config = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back.cheats["ZELDA"].len(), 1);
+        assert!(back.cheats["ZELDA"][0].enabled);
     }
 
     #[test]

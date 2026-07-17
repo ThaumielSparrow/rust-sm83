@@ -20,6 +20,10 @@ impl MBC2 {
             _ => false,
         };
         let rombanks = rom_banks(data[0x148]);
+        // rombank writes compute `% rombanks`; reject 0 banks (size byte > 8).
+        if rombanks == 0 {
+            return Err("Invalid ROM size in cartridge header");
+        }
 
         let res = MBC2 {
             rom: data,

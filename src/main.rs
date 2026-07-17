@@ -7,11 +7,13 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 mod gui;
 mod audio;
+mod cheats;
 mod emulator;
 mod config;
 mod input;
 mod gamepad;
 mod palette;
+mod toast;
 
 use std::path::PathBuf;
 

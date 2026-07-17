@@ -21,12 +21,15 @@ pub enum GBEvent {
     SetPaused(bool),
     SetRewinding(bool),
     RewindStep,
+    SetCheats(Vec<crate::cheats::PokeOp>),
     Shutdown,
 }
 
 pub enum GuiEvent {
     SaveStateSaved { slot: u8, preview: SaveStatePreview },
     SaveStateFailed { slot: u8 },
+    LoadStateResult { slot: u8, ok: bool },
+    BatterySaveFailed,
 }
 
 /// Number of emulated frames between background battery-RAM saves. At ~60 fps
@@ -37,8 +40,9 @@ const RAM_SAVE_DEBOUNCE_FRAMES: u64 = 60;
 
 /// Capture a rewind snapshot every N emulated frames (~30 Hz at every-2).
 const REWIND_INTERVAL_FRAMES: u64 = 2;
-/// Ring-buffer depth in snapshots (~20 s of history at every-2-frames).
-const REWIND_CAPACITY: usize = 600;
+/// Ring-buffer depth in snapshots (~30 s of history at every-2-frames).
+/// Entries are lz4-compressed, so this costs ~10-25 MB rather than ~160 MB raw.
+const REWIND_CAPACITY: usize = 900;
 /// Step-back distance for a discrete RewindStep (~1 s = 30 snapshots).
 const REWIND_STEP_FRAMES: usize = 30;
 /// Host loop iterations between rewind playback steps. One snapshot is consumed
@@ -102,6 +106,36 @@ fn try_send_frame(
     Ok(())
 }
 
+/// Apply the enabled GameShark pokes. Called once per emulated frame while
+/// running forward (real carts hook vblank); skipped while paused/rewinding.
+fn apply_cheats(cpu: &mut Device, pokes: &[crate::cheats::PokeOp]) {
+    for p in pokes {
+        match p.bank {
+            Some(b) => cpu.cheat_write_wram_bank(b, p.addr, p.value),
+            None => cpu.write_byte(p.addr, p.value),
+        }
+    }
+}
+
+/// Decompress a rewind ring entry and restore it. Returns true on success;
+/// failures are logged and skipped (entries are process-local, so neither
+/// decompression nor decode should fail in practice).
+fn restore_compressed(cpu: &mut Device, payload: &[u8]) -> bool {
+    match lz4_flex::decompress_size_prepended(payload) {
+        Ok(snap) => match cpu.restore_rewind(&snap) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("rewind restore failed: {}", e);
+                false
+            }
+        },
+        Err(_) => {
+            eprintln!("rewind decompress failed");
+            false
+        }
+    }
+}
+
 pub fn construct_cpu_auto(filename: &str) -> Option<(Box<Device>, bool)> {
     let rom_path = std::path::Path::new(filename);
     let save_state_path = rom_path.with_extension("state");
@@ -149,6 +183,9 @@ pub fn run_cpu(
     // any pending dirty state so nothing is lost on quit.
     let mut ram_dirty = false;
     let mut last_ram_save_frame: Option<u64> = None;
+    // Battery-save failure latch: toast only on the ok→fail transition so a
+    // persistently failing disk produces one toast, not one per second.
+    let mut battery_save_ok = true;
 
     // Two reusable frame buffers; we only write to a buffer if it is uniquely held (strong_count==1).
     let frame_len = cpu.get_gpu_data().len();
@@ -161,6 +198,7 @@ pub fn run_cpu(
     let mut ring: VecDeque<Vec<u8>> = VecDeque::with_capacity(REWIND_CAPACITY);
     let mut rewinding = false;
     let mut rewind_tick: u64 = 0;
+    let mut cheats: Vec<crate::cheats::PokeOp> = Vec::new();
 
     'outer: loop {
         if rewinding {
@@ -172,15 +210,14 @@ pub fn run_cpu(
                     ring.pop_back();
                 }
                 if let Some(payload) = ring.back() {
-                    if let Err(e) = cpu.restore_rewind(payload) {
-                        eprintln!("rewind restore failed: {}", e);
-                    } else if try_send_frame(
-                        cpu.get_gpu_data(),
-                        &mut frame_buffers,
-                        &mut next_fb,
-                        &sender,
-                    )
-                    .is_err()
+                    if restore_compressed(&mut cpu, payload)
+                        && try_send_frame(
+                            cpu.get_gpu_data(),
+                            &mut frame_buffers,
+                            &mut next_fb,
+                            &sender,
+                        )
+                        .is_err()
                     {
                         let _ = cpu.flush_to_disk();
                         break 'outer;
@@ -208,14 +245,16 @@ pub fn run_cpu(
             if !paused {
                 ticks -= frame_target;
                 frame_count += 1;
+                apply_cheats(&mut cpu, &cheats);
 
                 if should_capture(frame_count, REWIND_INTERVAL_FRAMES) {
                     match cpu.snapshot_rewind() {
                         Ok(snap) => {
+                            let compressed = lz4_flex::compress_prepend_size(&snap);
                             if ring.len() == REWIND_CAPACITY {
                                 ring.pop_front();
                             }
-                            ring.push_back(snap);
+                            ring.push_back(compressed);
                         }
                         Err(e) => eprintln!("rewind snapshot failed: {}", e),
                     }
@@ -230,7 +269,11 @@ pub fn run_cpu(
                     frame_count,
                     RAM_SAVE_DEBOUNCE_FRAMES,
                 ) {
-                    let _ = cpu.save_battery_ram_silent();
+                    let save_result = cpu.save_battery_ram_silent();
+                    if save_result.is_err() && battery_save_ok {
+                        let _ = ui_sender.send(GuiEvent::BatterySaveFailed);
+                    }
+                    battery_save_ok = save_result.is_ok();
                     ram_dirty = false;
                     last_ram_save_frame = Some(frame_count);
                 }
@@ -264,9 +307,14 @@ pub fn run_cpu(
                     }
                     GBEvent::LoadState(s) => {
                         println!("Attempting to load state from slot {}...", s);
-                        if let Err(e) = cpu.load_state_slot(s) {
-                            eprintln!("Failed to load state from slot {}: {}", s, e);
-                        }
+                        let ok = match cpu.load_state_slot(s) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                eprintln!("Failed to load state from slot {}: {}", s, e);
+                                false
+                            }
+                        };
+                        let _ = ui_sender.send(GuiEvent::LoadStateResult { slot: s, ok });
                         ring.clear();
                     }
                     GBEvent::UpdateTurbo(ts) => {
@@ -296,9 +344,7 @@ pub fn run_cpu(
                             ring.pop_back();
                         }
                         if let Some(payload) = ring.back() {
-                            if let Err(e) = cpu.restore_rewind(payload) {
-                                eprintln!("rewind step failed: {}", e);
-                            } else {
+                            if restore_compressed(&mut cpu, payload) {
                                 // A disconnect here is caught next iteration in
                                 // the 'recv loop, which breaks 'outer cleanly.
                                 let _ = try_send_frame(
@@ -310,6 +356,7 @@ pub fn run_cpu(
                             }
                         }
                     }
+                    GBEvent::SetCheats(list) => cheats = list,
                     GBEvent::Shutdown => {
                         if let Err(e) = cpu.flush_to_disk() {
                             eprintln!("flush_to_disk failed: {}", e);
@@ -382,6 +429,42 @@ mod tests {
         assert!(!should_capture(5, 2));
         assert!(should_capture(6, 2));
         assert!(!should_capture(10, 0), "interval 0 never captures");
+    }
+
+    #[test]
+    fn apply_cheats_writes_plain_and_banked_pokes() {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x147] = 0x00;
+        let mut dev = Device::new_from_buffer(rom, true, None).unwrap();
+        let pokes = vec![
+            crate::cheats::PokeOp { bank: None, addr: 0xC010, value: 0x11 },
+            crate::cheats::PokeOp { bank: Some(2), addr: 0xD020, value: 0x22 },
+        ];
+        apply_cheats(&mut dev, &pokes);
+        assert_eq!(dev.read_byte(0xC010), 0x11);
+        // DMG device: banked poke degrades to a plain bus write.
+        assert_eq!(dev.read_byte(0xD020), 0x22);
+    }
+
+    #[test]
+    fn compressed_rewind_snapshot_restores() {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x147] = 0x00; // MBC0
+        let mut dev = Device::new_from_buffer(rom, true, None).unwrap();
+        dev.write_byte(0xC000, 0xAB);
+
+        let snap = dev.snapshot_rewind().unwrap();
+        let compressed = lz4_flex::compress_prepend_size(&snap);
+        assert!(
+            compressed.len() < snap.len() / 4,
+            "GB state should compress well: {} -> {}",
+            snap.len(),
+            compressed.len()
+        );
+
+        dev.write_byte(0xC000, 0xCD);
+        assert!(restore_compressed(&mut dev, &compressed));
+        assert_eq!(dev.read_byte(0xC000), 0xAB, "state restored through compression");
     }
 
     #[test]

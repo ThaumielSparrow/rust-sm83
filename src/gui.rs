@@ -32,6 +32,7 @@ use crate::config::{binding_value, config_path, Config, DmgPalettePreset, KeyBin
 use crate::emulator::{construct_cpu_auto, run_cpu, GBEvent, GuiEvent};
 use crate::input::is_reserved_key_name;
 use crate::palette::{apply_dmg_palette, palette_for_preset, DmgPalette};
+use crate::toast::{ToastKind, ToastQueue};
 
 struct SaveSlotUi {
     slot: u8,
@@ -155,14 +156,55 @@ const SYSTEM_HOTKEY_HELP: &[(&str, &str)] = &[
     ("Esc", "Exit (double-press)"),
 ];
 
-/// The keybindings editor lives in its own OS window (with its own GL context
-/// and egui instance) so it never has to fit inside the game window at small scales.
-struct BindWindow {
+/// A small auxiliary OS window (keybindings, cheats) with its own GL context
+/// and egui instance, height-fit to its content so it never has to squeeze
+/// into the game window at small scales.
+struct AuxWindow {
     window: winit::window::Window,
     display: glium::Display<glium::glutin::surface::WindowSurface>,
     egui_glium: egui_glium::EguiGlium,
     /// Last height requested to fit content; avoids re-requesting every frame.
     requested_height: Option<f32>,
+}
+
+impl AuxWindow {
+    fn open(event_loop: &ActiveEventLoop, title: &str, width: f32, initial_height: u32) -> AuxWindow {
+        let (window, display) = glium::backend::glutin::SimpleWindowBuilder::new()
+            .with_title(title)
+            .with_inner_size(width as u32, initial_height)
+            .build(event_loop);
+        let egui_glium =
+            egui_glium::EguiGlium::new(egui::ViewportId::ROOT, &display, &window, &event_loop);
+        window.request_redraw();
+        AuxWindow { window, display, egui_glium, requested_height: None }
+    }
+
+    /// Run one egui frame (`ui_fn` draws and returns the measured content
+    /// height), paint, honor egui repaint requests, and fit the window height
+    /// to the content. Width stays fixed. Only re-requests a size when the
+    /// target changes so a denied/clamped request can't loop.
+    fn draw(&mut self, width: f32, mut ui_fn: impl FnMut(&egui::Context) -> f32) {
+        let mut content_height: f32 = 0.0;
+        self.egui_glium.run(&self.window, |ctx| {
+            content_height = ui_fn(ctx);
+        });
+        let mut target = self.display.draw();
+        target.clear_color(0.1, 0.1, 0.1, 1.0);
+        self.egui_glium.paint(&self.display, &mut target);
+        let _ = target.finish();
+        // Nothing else drives redraws of this window, so honor egui's repaint
+        // requests (collapsing-header animation, etc.) ourselves.
+        if self.egui_glium.egui_ctx().has_requested_repaint() {
+            self.window.request_redraw();
+        }
+        let desired = (content_height + 24.0).clamp(120.0, 800.0);
+        if self.requested_height.is_none_or(|h| (h - desired).abs() > 2.0) {
+            self.requested_height = Some(desired);
+            let _ = self
+                .window
+                .request_inner_size(winit::dpi::LogicalSize::new(width, desired));
+        }
+    }
 }
 
 // Unified state machine for ROM selection and emulator run to ensure a single EventLoop
@@ -213,6 +255,14 @@ enum RootPhase {
         direction_mux: DirectionMux,
         bind_tab: BindTab,
         rewinding: bool,
+        toasts: ToastQueue,
+        integer_scaling: bool,
+        auto_resume: bool,
+        cheats: Vec<crate::cheats::Cheat>,
+        cheat_key: String,
+        cheat_entry: String,
+        cheat_entry_label: String,
+        cheat_error: Option<&'static str>,
     },
 }
 
@@ -235,7 +285,9 @@ pub struct RootApp {
     /// None if gamepad support failed to initialize (headless, missing driver).
     gilrs: Option<Gilrs>,
     /// Some while the keybindings window is open.
-    bind_window: Option<BindWindow>,
+    bind_window: Option<AuxWindow>,
+    /// Some while the cheats window is open.
+    cheat_window: Option<AuxWindow>,
 }
 
 impl RootApp {
@@ -265,6 +317,7 @@ impl RootApp {
                 }
             },
             bind_window: None,
+            cheat_window: None,
         }
     }
 
@@ -274,19 +327,46 @@ impl RootApp {
             bw.window.focus_window();
             return;
         }
-        let (window, display) = glium::backend::glutin::SimpleWindowBuilder::new()
-            .with_title("Keybindings")
-            .with_inner_size(BIND_WINDOW_WIDTH as u32, 320)
-            .build(event_loop);
-        let egui_glium =
-            egui_glium::EguiGlium::new(egui::ViewportId::ROOT, &display, &window, &event_loop);
-        window.request_redraw();
-        self.bind_window = Some(BindWindow {
-            window,
-            display,
-            egui_glium,
-            requested_height: None,
-        });
+        self.bind_window = Some(AuxWindow::open(event_loop, "Keybindings", BIND_WINDOW_WIDTH, 320));
+    }
+
+    /// Opens the cheats window, or focuses it if already open.
+    fn open_cheat_window(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(cw) = &self.cheat_window {
+            cw.window.focus_window();
+            return;
+        }
+        self.cheat_window = Some(AuxWindow::open(event_loop, "Cheats", CHEAT_WINDOW_WIDTH, 240));
+    }
+
+    /// Winit events addressed to the cheats window. Esc closes it.
+    fn cheat_window_event(&mut self, event: WindowEvent) {
+        use winit::keyboard::{Key, NamedKey};
+        let RootApp { cheat_window, phase, .. } = self;
+        let Some(cw) = cheat_window.as_mut() else { return };
+        let mut close = false;
+        let resp = cw.egui_glium.on_event(&cw.window, &event);
+        if resp.repaint {
+            cw.window.request_redraw();
+        }
+        if !resp.consumed {
+            match &event {
+                WindowEvent::CloseRequested => close = true,
+                WindowEvent::Resized(ps) => cw.display.resize((*ps).into()),
+                WindowEvent::RedrawRequested => draw_cheat_window(cw, phase),
+                WindowEvent::KeyboardInput { event: keyevent, .. }
+                    if keyevent.state == winit::event::ElementState::Pressed =>
+                {
+                    if let Key::Named(NamedKey::Escape) = keyevent.logical_key.as_ref() {
+                        close = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if close {
+            *cheat_window = None;
+        }
     }
 
     /// Handles winit events addressed to the keybindings window. Keyboard
@@ -358,36 +438,56 @@ impl RootApp {
                 };
                 if let Some(p) = path {
                     self.stop_emulator();
-                    self.start_game_from_path(p);
+                    // Reset must boot fresh, not re-resume the just-flushed state.
+                    self.start_game_from_path(p, false);
                 }
             }
             Some(PendingAction::LoadRom(p)) => {
                 if let RootPhase::Running { .. } = &self.phase {
                     self.stop_emulator();
                 }
-                self.start_game_from_path(p);
+                self.start_game_from_path(p, true);
             }
             None => {}
         }
     }
 
-    fn start_game_from_path(&mut self, rom_path: PathBuf) {
+    /// `resume`: attempt to continue from the auto-save written at last
+    /// shutdown. Reset passes false — it must not re-load the state that
+    /// `stop_emulator` just flushed.
+    fn start_game_from_path(&mut self, rom_path: PathBuf, resume: bool) {
         // Always run in (CGB-capable) mode; attempt CGB first, fallback to classic if needed.
         let filename = rom_path.to_string_lossy().to_string();
-        let (mut cpu, is_color) = match construct_cpu_auto(&filename) {
+        let (mut cpu, _) = match construct_cpu_auto(&filename) {
             Some(pair) => pair,
             None => {
                 self.exit_code = EXITCODE_CPULOADFAILS;
                 return;
             }
         };
-        // Enable audio by default; if device fails, continue silently.
+        let cfg = Config::load(&config_path());
+        let mut toasts = ToastQueue::default();
+        if resume && cfg.auto_resume && cpu.has_auto_save() {
+            match cpu.load_auto_save() {
+                Ok(()) => toasts.push("Resumed last session", ToastKind::Success),
+                Err(_) => toasts.push(
+                    "Couldn't resume last session — starting fresh",
+                    ToastKind::Info,
+                ),
+            }
+        }
+        let is_color = cpu.is_cgb_mode();
+        let cheat_key = crate::cheats::cheat_key(&cpu.romname(), &rom_path);
+        let cheats = cfg.cheats.get(&cheat_key).cloned().unwrap_or_default();
+        // Enable audio by default; if no device is available, fall back to a
+        // discarding player so the APU is still emulated (games poll NR52 etc.).
         let mut audio_stream = None;
         if let Some((player, s)) = init_audio() {
             cpu.enable_audio(player, true);
             audio_stream = Some(s);
         } else {
             warn("Audio disabled: no output device available");
+            cpu.enable_audio(crate::audio::null_player(), true);
         }
         let _ = cpu.romname();
         let save_slots = SaveSlotCache::from_paths(
@@ -408,7 +508,6 @@ impl RootApp {
                 rust_gbe::SCREEN_H as u32,
             )
             .unwrap();
-            let cfg = Config::load(&config_path());
             let initial_scale = cfg.scale;
             self.scale = initial_scale;
 
@@ -450,10 +549,19 @@ impl RootApp {
                 direction_mux: DirectionMux::default(),
                 bind_tab: BindTab::Keyboard,
                 rewinding: false,
+                toasts,
+                integer_scaling: cfg.integer_scaling,
+                auto_resume: cfg.auto_resume,
+                cheats,
+                cheat_key,
+                cheat_entry: String::new(),
+                cheat_entry_label: String::new(),
+                cheat_error: None,
             };
-            if let RootPhase::Running { sender, .. } = &self.phase {
+            if let RootPhase::Running { sender, cheats, .. } = &self.phase {
                 let _ = sender.send(GBEvent::UpdateTurbo(cfg.turbo));
                 let _ = sender.send(GBEvent::UpdateVolume(perceptual_to_linear(cfg.volume)));
+                let _ = sender.send(GBEvent::SetCheats(crate::cheats::enabled_pokes(cheats)));
             }
             // Now that we've transitioned to Running, resize/configure window.
             if let Some(win) = &self.window {
@@ -510,6 +618,7 @@ impl RootApp {
                 resolved_gamepad,
                 gamepad_capturing,
                 direction_mux,
+                toasts,
                 ..
             } = &mut *phase
             else {
@@ -579,6 +688,7 @@ impl RootApp {
                         fullscreen,
                         fps_overlay,
                         rewinding,
+                        toasts,
                     },
                 );
                 if outcome.apply_fullscreen && let Some(win) = window.as_ref() {
@@ -614,8 +724,7 @@ fn apply_window_mode(window: &winit::window::Window, scale: u32, fullscreen: boo
 
 /// Renders the keybindings UI into its own OS window and resizes the window
 /// to fit the active tab's content.
-fn draw_bind_window(bw: &mut BindWindow, phase: &mut RootPhase, gilrs: Option<&Gilrs>) {
-    use glium::Surface;
+fn draw_bind_window(bw: &mut AuxWindow, phase: &mut RootPhase, gilrs: Option<&Gilrs>) {
     let RootPhase::Running {
         keybindings,
         capturing,
@@ -631,8 +740,8 @@ fn draw_bind_window(bw: &mut BindWindow, phase: &mut RootPhase, gilrs: Option<&G
     let gilrs_available = gilrs.is_some();
     let pad_name: Option<String> =
         gilrs.and_then(|g| g.gamepads().next().map(|(_, p)| p.name().to_string()));
-    let mut content_height: f32 = 0.0;
-    bw.egui_glium.run(&bw.window, |ctx| {
+    bw.draw(BIND_WINDOW_WIDTH, |ctx| {
+        let mut content_height: f32 = 0.0;
         egui::CentralPanel::default().show(ctx, |ui| {
             // CentralPanel expands to fill the window; measure a child scope
             // (like the loader screen) so the resize below tracks content.
@@ -742,30 +851,101 @@ fn draw_bind_window(bw: &mut BindWindow, phase: &mut RootPhase, gilrs: Option<&G
             });
             content_height = content.response.rect.height();
         });
+        content_height
     });
-    let mut target = bw.display.draw();
-    target.clear_color(0.1, 0.1, 0.1, 1.0);
-    bw.egui_glium.paint(&bw.display, &mut target);
-    let _ = target.finish();
-    // Nothing else drives redraws of this window, so honor egui's repaint
-    // requests (collapsing-header animation, etc.) ourselves.
-    if bw.egui_glium.egui_ctx().has_requested_repaint() {
-        bw.window.request_redraw();
-    }
-    // Fit the window height to the active tab's content (tab switches and the
-    // hotkeys expander change it); width stays fixed (see BIND_WINDOW_WIDTH).
-    // Only re-request when the target changes so a denied/clamped request
-    // can't loop.
-    let desired = (content_height + 24.0).clamp(120.0, 800.0);
-    if bw
-        .requested_height
-        .is_none_or(|h| (h - desired).abs() > 2.0)
-    {
-        bw.requested_height = Some(desired);
-        let _ = bw
-            .window
-            .request_inner_size(winit::dpi::LogicalSize::new(BIND_WINDOW_WIDTH, desired));
-    }
+}
+
+const CHEAT_WINDOW_WIDTH: f32 = 420.0;
+
+/// Persist this game's cheat list and push the enabled pokes to the emulator.
+fn sync_cheats(sender: &mpsc::Sender<GBEvent>, key: &str, cheats: &[crate::cheats::Cheat]) {
+    let key_owned = key.to_string();
+    let list = cheats.to_vec();
+    crate::config::update_config(move |c| {
+        if list.is_empty() {
+            c.cheats.remove(&key_owned);
+        } else {
+            c.cheats.insert(key_owned, list);
+        }
+    });
+    let _ = sender.send(GBEvent::SetCheats(crate::cheats::enabled_pokes(cheats)));
+}
+
+/// Renders the cheat editor into its own OS window (AuxWindow shell).
+fn draw_cheat_window(cw: &mut AuxWindow, phase: &mut RootPhase) {
+    let RootPhase::Running {
+        cheats,
+        cheat_key,
+        cheat_entry,
+        cheat_entry_label,
+        cheat_error,
+        sender,
+        ..
+    } = phase
+    else {
+        return;
+    };
+    cw.draw(CHEAT_WINDOW_WIDTH, |ctx| {
+        let mut height: f32 = 0.0;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let content = ui.vertical(|ui| {
+                ui.label("GameShark codes (XXYYZZAA). Types 01 and 90–97 supported.");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Code:");
+                    ui.add(egui::TextEdit::singleline(cheat_entry).desired_width(90.0));
+                    ui.label("Label:");
+                    ui.add(egui::TextEdit::singleline(cheat_entry_label).desired_width(120.0));
+                    if ui.button("Add").clicked() {
+                        match crate::cheats::parse_code(cheat_entry) {
+                            Ok(_) => {
+                                cheats.push(crate::cheats::Cheat {
+                                    code: crate::cheats::normalize_code(cheat_entry),
+                                    label: cheat_entry_label.clone(),
+                                    enabled: true,
+                                });
+                                cheat_entry.clear();
+                                cheat_entry_label.clear();
+                                *cheat_error = None;
+                                sync_cheats(sender, cheat_key, cheats);
+                            }
+                            Err(e) => *cheat_error = Some(e),
+                        }
+                    }
+                });
+                if let Some(err) = *cheat_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                }
+                ui.separator();
+                let mut changed = false;
+                let mut remove: Option<usize> = None;
+                for (i, cheat) in cheats.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut cheat.enabled, "").changed() {
+                            changed = true;
+                        }
+                        ui.monospace(&cheat.code);
+                        ui.label(&cheat.label);
+                        if ui.button("Delete").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    cheats.remove(i);
+                    changed = true;
+                }
+                if changed {
+                    sync_cheats(sender, cheat_key, cheats);
+                }
+                if cheats.is_empty() {
+                    ui.colored_label(egui::Color32::GRAY, "No cheats yet.");
+                }
+            });
+            height = content.response.rect.height();
+        });
+        height
+    });
 }
 
 fn rom_path_is_supported(p: &Path) -> bool {
@@ -792,7 +972,7 @@ impl ApplicationHandler for RootApp {
             }
             // If a ROM path was supplied on the command line, skip the file picker.
             if let Some(p) = self.pending_rom.take() {
-                self.start_game_from_path(p);
+                self.start_game_from_path(p, true);
             }
         }
     }
@@ -816,6 +996,11 @@ impl ApplicationHandler for RootApp {
         // The keybindings window has its own egui instance and event handling.
         if self.bind_window.as_ref().is_some_and(|b| b.window.id() == window_id) {
             self.bind_window_event(event);
+            return;
+        }
+        // Likewise the cheats window.
+        if self.cheat_window.as_ref().is_some_and(|c| c.window.id() == window_id) {
+            self.cheat_window_event(event);
             return;
         }
 
@@ -949,7 +1134,7 @@ impl ApplicationHandler for RootApp {
                     }
                 }
                 if let Some(p) = launch_path {
-                    self.start_game_from_path(p);
+                    self.start_game_from_path(p, true);
                 }
                 if quit_requested {
                     self.exit_code = EXITCODE_SUCCESS;
@@ -963,7 +1148,7 @@ impl ApplicationHandler for RootApp {
             ) => {
                 if rom_path_is_supported(&path) && path.is_file() {
                     *rom_path = path.to_string_lossy().into_owned();
-                    self.start_game_from_path(path);
+                    self.start_game_from_path(path, true);
                 }
             }
             // Track modifier state so chords like Ctrl+R work.
@@ -994,6 +1179,7 @@ impl ApplicationHandler for RootApp {
                     fps_overlay,
                     rewinding,
                     gamepad_capturing,
+                    toasts,
                     ..
                 },
                 WindowEvent::KeyboardInput {
@@ -1048,6 +1234,7 @@ impl ApplicationHandler for RootApp {
                             fullscreen,
                             fps_overlay,
                             rewinding,
+                            toasts,
                         },
                     );
                     // Snapshot values we'll need outside the phase borrow.
@@ -1117,6 +1304,9 @@ impl ApplicationHandler for RootApp {
                     is_color,
                     palette_scratch,
                     pre_mute_volume,
+                    toasts,
+                    integer_scaling,
+                    auto_resume,
                     ..
                 },
                 WindowEvent::RedrawRequested,
@@ -1124,7 +1314,7 @@ impl ApplicationHandler for RootApp {
                 if !*running {
                     return;
                 }
-                drain_gui_events(ui_receiver, save_slots);
+                drain_gui_events(ui_receiver, save_slots, toasts);
                 // Deferred actions set inside the egui closure or below, applied after the borrow ends.
                 let mut quit_requested = false;
                 let mut reset_clicked = false;
@@ -1132,6 +1322,7 @@ impl ApplicationHandler for RootApp {
                 let mut new_scale: Option<u32> = None;
                 let mut apply_fullscreen_now = false;
                 let mut open_keybindings = false;
+                let mut open_cheats = false;
                 let recent_roms = Config::load(&config_path()).recent_roms;
                 if let (Some(display), Some(window), Some(egui_glium)) =
                     (&self.display, &self.window, &mut self.egui_glium)
@@ -1174,6 +1365,10 @@ impl ApplicationHandler for RootApp {
                                         reset_clicked = true;
                                         ui.close();
                                     }
+                                    if ui.button("Cheats...").clicked() {
+                                        open_cheats = true;
+                                        ui.close();
+                                    }
                                     ui.separator();
                                     ui.menu_button("Turbo Speed", |ui| {
                                         for ts in TurboSetting::all() {
@@ -1204,6 +1399,10 @@ impl ApplicationHandler for RootApp {
                                     });
                                     ui.separator();
                                     ui.checkbox(&mut renderoptions.linear_interpolation, "Linear interpolation (Y)");
+                                    if ui.checkbox(integer_scaling, "Integer scaling").changed() {
+                                        let on = *integer_scaling;
+                                        crate::config::update_config(|c| c.integer_scaling = on);
+                                    }
                                     ui.add_enabled_ui(!is_color_ro, |ui| {
                                         ui.menu_button("DMG Palette", |ui| {
                                             for preset in DmgPalettePreset::all() {
@@ -1261,6 +1460,10 @@ impl ApplicationHandler for RootApp {
                                         let v = *volume;
                                         crate::config::update_config(|c| c.volume = v);
                                     }
+                                    if ui.checkbox(auto_resume, "Resume last session on load").changed() {
+                                        let on = *auto_resume;
+                                        crate::config::update_config(|c| c.auto_resume = on);
+                                    }
                                     ui.separator();
                                     if ui.button("Keybindings...").clicked() { open_keybindings = true; }
                                 });
@@ -1296,6 +1499,7 @@ impl ApplicationHandler for RootApp {
                                     });
                                 });
                         }
+                        toasts.draw(ctx);
                     });
                     if quit_requested {
                         *running = false;
@@ -1311,23 +1515,29 @@ impl ApplicationHandler for RootApp {
                         (menu_bar_height * window.scale_factor() as f32) as u32;
                     let game_area_height = target_h.saturating_sub(menu_bar_height_pixels);
 
-                    // Render game texture offset downward by menu bar height
+                    // Black bars for the letterbox/pillarbox area.
+                    target.clear_color(0.0, 0.0, 0.0, 1.0);
+                    // Render the frame aspect-correct and centered in the game area.
                     if game_area_height > 0 {
                         let interpolation_type = if renderoptions.linear_interpolation {
                             glium::uniforms::MagnifySamplerFilter::Linear
                         } else {
                             glium::uniforms::MagnifySamplerFilter::Nearest
                         };
-                        texture.as_surface().blit_whole_color_to(
-                            &target,
-                            &glium::BlitTarget {
-                                left: 0,
-                                bottom: game_area_height, // Position at bottom of available area
-                                width: target_w as i32,
-                                height: -(game_area_height as i32), // Negative height to flip Y
-                            },
-                            interpolation_type,
-                        );
+                        let (left, bottom, w, h) =
+                            fit_rect(target_w, game_area_height, *integer_scaling);
+                        if w > 0 && h > 0 {
+                            texture.as_surface().blit_whole_color_to(
+                                &target,
+                                &glium::BlitTarget {
+                                    left,
+                                    bottom: bottom + h, // top edge; negative height flips Y
+                                    width: w as i32,
+                                    height: -(h as i32),
+                                },
+                                interpolation_type,
+                            );
+                        }
                     }
 
                     // Paint egui on top
@@ -1380,6 +1590,9 @@ impl ApplicationHandler for RootApp {
                 if open_keybindings {
                     self.open_bind_window(event_loop);
                 }
+                if open_cheats {
+                    self.open_cheat_window(event_loop);
+                }
             }
             // Drag-and-drop a ROM onto the running emulator: tear down and load the new one.
             (
@@ -1414,13 +1627,20 @@ impl ApplicationHandler for RootApp {
             dmg_palette_preset,
             dmg_palette_custom,
             palette_scratch,
+            toasts,
             ..
         } = &mut self.phase
         {
             if !*running {
                 return;
             }
-            drain_gui_events(ui_receiver, save_slots);
+            drain_gui_events(ui_receiver, save_slots, toasts);
+            // Toasts animate even when no frames arrive (e.g. paused).
+            if !toasts.is_empty() {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
             let palette_now = palette_for_preset(*dmg_palette_preset, dmg_palette_custom);
             let needs_palette = !*is_color;
             match receiver.try_recv() {
@@ -1482,6 +1702,7 @@ struct SysCtx<'a> {
     fullscreen: &'a mut bool,
     fps_overlay: &'a mut bool,
     rewinding: &'a mut bool,
+    toasts: &'a mut ToastQueue,
 }
 
 fn handle_system_action(action: crate::input::SystemAction, ctx: &mut SysCtx) -> SysOutcome {
@@ -1516,6 +1737,10 @@ fn handle_system_action(action: crate::input::SystemAction, ctx: &mut SysCtx) ->
             } else if !*ctx.turbo_held {
                 let _ = ctx.sender.send(GBEvent::SpeedDown);
             }
+            ctx.toasts.push(
+                if *ctx.turbo_toggle { "Turbo on" } else { "Turbo off" },
+                ToastKind::Info,
+            );
         }
         SystemAction::ToggleInterpolation => {
             ctx.renderoptions.linear_interpolation = !ctx.renderoptions.linear_interpolation;
@@ -1543,6 +1768,10 @@ fn handle_system_action(action: crate::input::SystemAction, ctx: &mut SysCtx) ->
             let _ = ctx.sender.send(GBEvent::UpdateVolume(perceptual_to_linear(*ctx.volume)));
             let v = *ctx.volume;
             crate::config::update_config(|c| c.volume = v);
+            ctx.toasts.push(
+                if *ctx.volume == 0 { "Muted" } else { "Volume restored" },
+                ToastKind::Info,
+            );
         }
         SystemAction::ToggleFpsOverlay => {
             *ctx.fps_overlay = !*ctx.fps_overlay;
@@ -1560,14 +1789,32 @@ fn handle_system_action(action: crate::input::SystemAction, ctx: &mut SysCtx) ->
     outcome
 }
 
-fn drain_gui_events(receiver: &Receiver<GuiEvent>, save_slots: &mut SaveSlotCache) {
+fn drain_gui_events(
+    receiver: &Receiver<GuiEvent>,
+    save_slots: &mut SaveSlotCache,
+    toasts: &mut ToastQueue,
+) {
     loop {
         match receiver.try_recv() {
             Ok(GuiEvent::SaveStateSaved { slot, preview }) => {
                 save_slots.mark_saved(slot, preview);
+                toasts.push(format!("State saved to slot {}", slot), ToastKind::Success);
             }
             Ok(GuiEvent::SaveStateFailed { slot }) => {
                 save_slots.mark_failed(slot);
+                toasts.push(format!("Save to slot {} failed", slot), ToastKind::Error);
+            }
+            Ok(GuiEvent::LoadStateResult { slot, ok: true }) => {
+                toasts.push(format!("State {} loaded", slot), ToastKind::Success);
+            }
+            Ok(GuiEvent::LoadStateResult { slot, ok: false }) => {
+                toasts.push(format!("Couldn't load state {}", slot), ToastKind::Error);
+            }
+            Ok(GuiEvent::BatterySaveFailed) => {
+                toasts.push(
+                    "Battery save failed — check disk space and permissions",
+                    ToastKind::Error,
+                );
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => break,
@@ -1919,6 +2166,21 @@ fn key_to_string(key: &winit::keyboard::Key<&str>) -> String {
     }
 }
 
+/// Fit the GB frame into `avail_w` x `avail_h` preserving the 160:144 aspect.
+/// Returns (left, bottom, width, height) of the centered destination rect.
+/// With `integer_scaling`, the scale is floored to a whole multiple; below
+/// native size it falls back to a fractional aspect-preserving shrink.
+fn fit_rect(avail_w: u32, avail_h: u32, integer_scaling: bool) -> (u32, u32, u32, u32) {
+    let (nw, nh) = (rust_gbe::SCREEN_W as f64, rust_gbe::SCREEN_H as f64);
+    let mut scale = (avail_w as f64 / nw).min(avail_h as f64 / nh);
+    if integer_scaling && scale >= 1.0 {
+        scale = scale.floor();
+    }
+    let w = (nw * scale) as u32;
+    let h = (nh * scale) as u32;
+    ((avail_w.saturating_sub(w)) / 2, (avail_h.saturating_sub(h)) / 2, w, h)
+}
+
 fn matches_capturing(capturing: Option<rust_gbe::KeypadKey>, k: rust_gbe::KeypadKey) -> bool {
     use rust_gbe::KeypadKey::*;
     match (capturing, k) {
@@ -1931,5 +2193,39 @@ fn matches_capturing(capturing: Option<rust_gbe::KeypadKey>, k: rust_gbe::Keypad
         | (Some(Left), Left)
         | (Some(Right), Right) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_rect;
+
+    #[test]
+    fn fit_rect_preserves_aspect_fractional() {
+        // 1080/144 = 7.5 is the limiting scale → 1200x1080, centered horizontally.
+        let (l, b, w, h) = fit_rect(1920, 1080, false);
+        assert_eq!((w, h), (1200, 1080));
+        assert_eq!((l, b), ((1920 - 1200) / 2, 0));
+    }
+
+    #[test]
+    fn fit_rect_integer_floors_scale() {
+        // floor(7.5) = 7 → 1120x1008, centered both ways.
+        let (l, b, w, h) = fit_rect(1920, 1080, true);
+        assert_eq!((w, h), (1120, 1008));
+        assert_eq!((l, b), (400, 36));
+    }
+
+    #[test]
+    fn fit_rect_exact_multiple_fills() {
+        assert_eq!(fit_rect(480, 432, true), (0, 0, 480, 432));
+    }
+
+    #[test]
+    fn fit_rect_tiny_and_zero_windows_do_not_panic() {
+        // Below-native with integer scaling falls back to fractional shrink.
+        let (_, _, w, h) = fit_rect(80, 72, true);
+        assert!(w <= 80 && h <= 72 && w > 0 && h > 0);
+        assert_eq!(fit_rect(0, 0, false), (0, 0, 0, 0));
     }
 }
