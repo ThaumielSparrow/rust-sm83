@@ -7,6 +7,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 mod gui;
 mod audio;
+mod cheats;
 mod emulator;
 mod config;
 mod input;
