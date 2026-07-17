@@ -156,14 +156,55 @@ const SYSTEM_HOTKEY_HELP: &[(&str, &str)] = &[
     ("Esc", "Exit (double-press)"),
 ];
 
-/// The keybindings editor lives in its own OS window (with its own GL context
-/// and egui instance) so it never has to fit inside the game window at small scales.
-struct BindWindow {
+/// A small auxiliary OS window (keybindings, cheats) with its own GL context
+/// and egui instance, height-fit to its content so it never has to squeeze
+/// into the game window at small scales.
+struct AuxWindow {
     window: winit::window::Window,
     display: glium::Display<glium::glutin::surface::WindowSurface>,
     egui_glium: egui_glium::EguiGlium,
     /// Last height requested to fit content; avoids re-requesting every frame.
     requested_height: Option<f32>,
+}
+
+impl AuxWindow {
+    fn open(event_loop: &ActiveEventLoop, title: &str, width: f32, initial_height: u32) -> AuxWindow {
+        let (window, display) = glium::backend::glutin::SimpleWindowBuilder::new()
+            .with_title(title)
+            .with_inner_size(width as u32, initial_height)
+            .build(event_loop);
+        let egui_glium =
+            egui_glium::EguiGlium::new(egui::ViewportId::ROOT, &display, &window, &event_loop);
+        window.request_redraw();
+        AuxWindow { window, display, egui_glium, requested_height: None }
+    }
+
+    /// Run one egui frame (`ui_fn` draws and returns the measured content
+    /// height), paint, honor egui repaint requests, and fit the window height
+    /// to the content. Width stays fixed. Only re-requests a size when the
+    /// target changes so a denied/clamped request can't loop.
+    fn draw(&mut self, width: f32, mut ui_fn: impl FnMut(&egui::Context) -> f32) {
+        let mut content_height: f32 = 0.0;
+        self.egui_glium.run(&self.window, |ctx| {
+            content_height = ui_fn(ctx);
+        });
+        let mut target = self.display.draw();
+        target.clear_color(0.1, 0.1, 0.1, 1.0);
+        self.egui_glium.paint(&self.display, &mut target);
+        let _ = target.finish();
+        // Nothing else drives redraws of this window, so honor egui's repaint
+        // requests (collapsing-header animation, etc.) ourselves.
+        if self.egui_glium.egui_ctx().has_requested_repaint() {
+            self.window.request_redraw();
+        }
+        let desired = (content_height + 24.0).clamp(120.0, 800.0);
+        if self.requested_height.is_none_or(|h| (h - desired).abs() > 2.0) {
+            self.requested_height = Some(desired);
+            let _ = self
+                .window
+                .request_inner_size(winit::dpi::LogicalSize::new(width, desired));
+        }
+    }
 }
 
 // Unified state machine for ROM selection and emulator run to ensure a single EventLoop
@@ -239,7 +280,7 @@ pub struct RootApp {
     /// None if gamepad support failed to initialize (headless, missing driver).
     gilrs: Option<Gilrs>,
     /// Some while the keybindings window is open.
-    bind_window: Option<BindWindow>,
+    bind_window: Option<AuxWindow>,
 }
 
 impl RootApp {
@@ -278,19 +319,7 @@ impl RootApp {
             bw.window.focus_window();
             return;
         }
-        let (window, display) = glium::backend::glutin::SimpleWindowBuilder::new()
-            .with_title("Keybindings")
-            .with_inner_size(BIND_WINDOW_WIDTH as u32, 320)
-            .build(event_loop);
-        let egui_glium =
-            egui_glium::EguiGlium::new(egui::ViewportId::ROOT, &display, &window, &event_loop);
-        window.request_redraw();
-        self.bind_window = Some(BindWindow {
-            window,
-            display,
-            egui_glium,
-            requested_height: None,
-        });
+        self.bind_window = Some(AuxWindow::open(event_loop, "Keybindings", BIND_WINDOW_WIDTH, 320));
     }
 
     /// Handles winit events addressed to the keybindings window. Keyboard
@@ -640,8 +669,7 @@ fn apply_window_mode(window: &winit::window::Window, scale: u32, fullscreen: boo
 
 /// Renders the keybindings UI into its own OS window and resizes the window
 /// to fit the active tab's content.
-fn draw_bind_window(bw: &mut BindWindow, phase: &mut RootPhase, gilrs: Option<&Gilrs>) {
-    use glium::Surface;
+fn draw_bind_window(bw: &mut AuxWindow, phase: &mut RootPhase, gilrs: Option<&Gilrs>) {
     let RootPhase::Running {
         keybindings,
         capturing,
@@ -657,8 +685,8 @@ fn draw_bind_window(bw: &mut BindWindow, phase: &mut RootPhase, gilrs: Option<&G
     let gilrs_available = gilrs.is_some();
     let pad_name: Option<String> =
         gilrs.and_then(|g| g.gamepads().next().map(|(_, p)| p.name().to_string()));
-    let mut content_height: f32 = 0.0;
-    bw.egui_glium.run(&bw.window, |ctx| {
+    bw.draw(BIND_WINDOW_WIDTH, |ctx| {
+        let mut content_height: f32 = 0.0;
         egui::CentralPanel::default().show(ctx, |ui| {
             // CentralPanel expands to fill the window; measure a child scope
             // (like the loader screen) so the resize below tracks content.
@@ -768,30 +796,8 @@ fn draw_bind_window(bw: &mut BindWindow, phase: &mut RootPhase, gilrs: Option<&G
             });
             content_height = content.response.rect.height();
         });
+        content_height
     });
-    let mut target = bw.display.draw();
-    target.clear_color(0.1, 0.1, 0.1, 1.0);
-    bw.egui_glium.paint(&bw.display, &mut target);
-    let _ = target.finish();
-    // Nothing else drives redraws of this window, so honor egui's repaint
-    // requests (collapsing-header animation, etc.) ourselves.
-    if bw.egui_glium.egui_ctx().has_requested_repaint() {
-        bw.window.request_redraw();
-    }
-    // Fit the window height to the active tab's content (tab switches and the
-    // hotkeys expander change it); width stays fixed (see BIND_WINDOW_WIDTH).
-    // Only re-request when the target changes so a denied/clamped request
-    // can't loop.
-    let desired = (content_height + 24.0).clamp(120.0, 800.0);
-    if bw
-        .requested_height
-        .is_none_or(|h| (h - desired).abs() > 2.0)
-    {
-        bw.requested_height = Some(desired);
-        let _ = bw
-            .window
-            .request_inner_size(winit::dpi::LogicalSize::new(BIND_WINDOW_WIDTH, desired));
-    }
 }
 
 fn rom_path_is_supported(p: &Path) -> bool {
