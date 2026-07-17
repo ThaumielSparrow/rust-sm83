@@ -258,6 +258,11 @@ enum RootPhase {
         toasts: ToastQueue,
         integer_scaling: bool,
         auto_resume: bool,
+        cheats: Vec<crate::cheats::Cheat>,
+        cheat_key: String,
+        cheat_entry: String,
+        cheat_entry_label: String,
+        cheat_error: Option<&'static str>,
     },
 }
 
@@ -281,6 +286,8 @@ pub struct RootApp {
     gilrs: Option<Gilrs>,
     /// Some while the keybindings window is open.
     bind_window: Option<AuxWindow>,
+    /// Some while the cheats window is open.
+    cheat_window: Option<AuxWindow>,
 }
 
 impl RootApp {
@@ -310,6 +317,7 @@ impl RootApp {
                 }
             },
             bind_window: None,
+            cheat_window: None,
         }
     }
 
@@ -320,6 +328,45 @@ impl RootApp {
             return;
         }
         self.bind_window = Some(AuxWindow::open(event_loop, "Keybindings", BIND_WINDOW_WIDTH, 320));
+    }
+
+    /// Opens the cheats window, or focuses it if already open.
+    fn open_cheat_window(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(cw) = &self.cheat_window {
+            cw.window.focus_window();
+            return;
+        }
+        self.cheat_window = Some(AuxWindow::open(event_loop, "Cheats", CHEAT_WINDOW_WIDTH, 240));
+    }
+
+    /// Winit events addressed to the cheats window. Esc closes it.
+    fn cheat_window_event(&mut self, event: WindowEvent) {
+        use winit::keyboard::{Key, NamedKey};
+        let RootApp { cheat_window, phase, .. } = self;
+        let Some(cw) = cheat_window.as_mut() else { return };
+        let mut close = false;
+        let resp = cw.egui_glium.on_event(&cw.window, &event);
+        if resp.repaint {
+            cw.window.request_redraw();
+        }
+        if !resp.consumed {
+            match &event {
+                WindowEvent::CloseRequested => close = true,
+                WindowEvent::Resized(ps) => cw.display.resize((*ps).into()),
+                WindowEvent::RedrawRequested => draw_cheat_window(cw, phase),
+                WindowEvent::KeyboardInput { event: keyevent, .. }
+                    if keyevent.state == winit::event::ElementState::Pressed =>
+                {
+                    if let Key::Named(NamedKey::Escape) = keyevent.logical_key.as_ref() {
+                        close = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if close {
+            *cheat_window = None;
+        }
     }
 
     /// Handles winit events addressed to the keybindings window. Keyboard
@@ -430,6 +477,8 @@ impl RootApp {
             }
         }
         let is_color = cpu.is_cgb_mode();
+        let cheat_key = crate::cheats::cheat_key(&cpu.romname(), &rom_path);
+        let cheats = cfg.cheats.get(&cheat_key).cloned().unwrap_or_default();
         // Enable audio by default; if no device is available, fall back to a
         // discarding player so the APU is still emulated (games poll NR52 etc.).
         let mut audio_stream = None;
@@ -503,10 +552,16 @@ impl RootApp {
                 toasts,
                 integer_scaling: cfg.integer_scaling,
                 auto_resume: cfg.auto_resume,
+                cheats,
+                cheat_key,
+                cheat_entry: String::new(),
+                cheat_entry_label: String::new(),
+                cheat_error: None,
             };
-            if let RootPhase::Running { sender, .. } = &self.phase {
+            if let RootPhase::Running { sender, cheats, .. } = &self.phase {
                 let _ = sender.send(GBEvent::UpdateTurbo(cfg.turbo));
                 let _ = sender.send(GBEvent::UpdateVolume(perceptual_to_linear(cfg.volume)));
+                let _ = sender.send(GBEvent::SetCheats(crate::cheats::enabled_pokes(cheats)));
             }
             // Now that we've transitioned to Running, resize/configure window.
             if let Some(win) = &self.window {
@@ -800,6 +855,99 @@ fn draw_bind_window(bw: &mut AuxWindow, phase: &mut RootPhase, gilrs: Option<&Gi
     });
 }
 
+const CHEAT_WINDOW_WIDTH: f32 = 420.0;
+
+/// Persist this game's cheat list and push the enabled pokes to the emulator.
+fn sync_cheats(sender: &mpsc::Sender<GBEvent>, key: &str, cheats: &[crate::cheats::Cheat]) {
+    let key_owned = key.to_string();
+    let list = cheats.to_vec();
+    crate::config::update_config(move |c| {
+        if list.is_empty() {
+            c.cheats.remove(&key_owned);
+        } else {
+            c.cheats.insert(key_owned, list);
+        }
+    });
+    let _ = sender.send(GBEvent::SetCheats(crate::cheats::enabled_pokes(cheats)));
+}
+
+/// Renders the cheat editor into its own OS window (AuxWindow shell).
+fn draw_cheat_window(cw: &mut AuxWindow, phase: &mut RootPhase) {
+    let RootPhase::Running {
+        cheats,
+        cheat_key,
+        cheat_entry,
+        cheat_entry_label,
+        cheat_error,
+        sender,
+        ..
+    } = phase
+    else {
+        return;
+    };
+    cw.draw(CHEAT_WINDOW_WIDTH, |ctx| {
+        let mut height: f32 = 0.0;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let content = ui.vertical(|ui| {
+                ui.label("GameShark codes (XXYYZZAA). Types 01 and 90–97 supported.");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Code:");
+                    ui.add(egui::TextEdit::singleline(cheat_entry).desired_width(90.0));
+                    ui.label("Label:");
+                    ui.add(egui::TextEdit::singleline(cheat_entry_label).desired_width(120.0));
+                    if ui.button("Add").clicked() {
+                        match crate::cheats::parse_code(cheat_entry) {
+                            Ok(_) => {
+                                cheats.push(crate::cheats::Cheat {
+                                    code: crate::cheats::normalize_code(cheat_entry),
+                                    label: cheat_entry_label.clone(),
+                                    enabled: true,
+                                });
+                                cheat_entry.clear();
+                                cheat_entry_label.clear();
+                                *cheat_error = None;
+                                sync_cheats(sender, cheat_key, cheats);
+                            }
+                            Err(e) => *cheat_error = Some(e),
+                        }
+                    }
+                });
+                if let Some(err) = *cheat_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                }
+                ui.separator();
+                let mut changed = false;
+                let mut remove: Option<usize> = None;
+                for (i, cheat) in cheats.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut cheat.enabled, "").changed() {
+                            changed = true;
+                        }
+                        ui.monospace(&cheat.code);
+                        ui.label(&cheat.label);
+                        if ui.button("Delete").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    cheats.remove(i);
+                    changed = true;
+                }
+                if changed {
+                    sync_cheats(sender, cheat_key, cheats);
+                }
+                if cheats.is_empty() {
+                    ui.colored_label(egui::Color32::GRAY, "No cheats yet.");
+                }
+            });
+            height = content.response.rect.height();
+        });
+        height
+    });
+}
+
 fn rom_path_is_supported(p: &Path) -> bool {
     matches!(
         p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()),
@@ -848,6 +996,11 @@ impl ApplicationHandler for RootApp {
         // The keybindings window has its own egui instance and event handling.
         if self.bind_window.as_ref().is_some_and(|b| b.window.id() == window_id) {
             self.bind_window_event(event);
+            return;
+        }
+        // Likewise the cheats window.
+        if self.cheat_window.as_ref().is_some_and(|c| c.window.id() == window_id) {
+            self.cheat_window_event(event);
             return;
         }
 
@@ -1169,6 +1322,7 @@ impl ApplicationHandler for RootApp {
                 let mut new_scale: Option<u32> = None;
                 let mut apply_fullscreen_now = false;
                 let mut open_keybindings = false;
+                let mut open_cheats = false;
                 let recent_roms = Config::load(&config_path()).recent_roms;
                 if let (Some(display), Some(window), Some(egui_glium)) =
                     (&self.display, &self.window, &mut self.egui_glium)
@@ -1209,6 +1363,10 @@ impl ApplicationHandler for RootApp {
                                     }
                                     if ui.button("Reset (Ctrl+R)").clicked() {
                                         reset_clicked = true;
+                                        ui.close();
+                                    }
+                                    if ui.button("Cheats...").clicked() {
+                                        open_cheats = true;
                                         ui.close();
                                     }
                                     ui.separator();
@@ -1431,6 +1589,9 @@ impl ApplicationHandler for RootApp {
                 }
                 if open_keybindings {
                     self.open_bind_window(event_loop);
+                }
+                if open_cheats {
+                    self.open_cheat_window(event_loop);
                 }
             }
             // Drag-and-drop a ROM onto the running emulator: tear down and load the new one.
