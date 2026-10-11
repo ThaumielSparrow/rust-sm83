@@ -96,7 +96,7 @@ impl LengthCounter {
         LengthCounter {
             enabled: false,
             value: 0,
-            max: max,
+            max,
         }
     }
 
@@ -319,7 +319,7 @@ impl SquareChannel {
         if newfreq > 2047 {
             self.active = false;
         }
-        return newfreq;
+        newfreq
     }
 
     fn step_sweep(&mut self) {
@@ -379,7 +379,7 @@ impl WaveChannel {
             volume_shift: 0,
             waveram: [0; 16],
             current_wave: 0,
-            dmg_mode: dmg_mode,
+            dmg_mode,
             sample_recently_accessed: false,
             blip: Blip(blip),
         }
@@ -489,7 +489,7 @@ impl WaveChannel {
 
             while time < end_time {
                 let wavebyte = self.waveram[self.current_wave as usize >> 1];
-                let sample = if self.current_wave % 2 == 0 {
+                let sample = if self.current_wave.is_multiple_of(2) {
                     wavebyte >> 4
                 } else {
                     wavebyte & 0xF
@@ -834,7 +834,7 @@ impl Sound {
             reg_vin_to_so: 0x00,
             reg_ff25: 0x00,
             need_sync: false,
-            dmg_mode: dmg_mode,
+            dmg_mode,
             output: Output::new(player),
         }
     }
@@ -871,7 +871,8 @@ impl Sound {
 
     pub fn rb(&mut self, a: u16) -> u8 {
         self.run();
-        let v = match a {
+        
+        match a {
             0xFF10..=0xFF14 => self.channel1.rb(a),
             0xFF16..=0xFF19 => self.channel2.rb(a),
             0xFF1A..=0xFF1E => self.channel3.rb(a),
@@ -888,8 +889,7 @@ impl Sound {
             }
             0xFF30..=0xFF3F => self.channel3.rb(a),
             _ => 0xFF,
-        };
-        return v;
+        }
     }
 
     pub fn wb(&mut self, a: u16, v: u8) {
@@ -1003,7 +1003,7 @@ impl Sound {
             self.channel3.run(self.prev_time, self.next_time);
             self.channel4.run(self.prev_time, self.next_time);
 
-            if self.frame_step % 2 == 0 {
+            if self.frame_step.is_multiple_of(2) {
                 self.channel1.step_length();
                 self.channel2.step_length();
                 self.channel3.step_length();

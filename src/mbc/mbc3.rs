@@ -140,7 +140,7 @@ impl MBC for MBC3 {
         let idx = if a < 0x4000 {
             a as usize
         } else {
-            self.rombank * 0x4000 | ((a as usize) & 0x3FFF)
+            (self.rombank * 0x4000) | ((a as usize) & 0x3FFF)
         };
         *self.rom.get(idx).unwrap_or(&0xFF)
     }
@@ -149,7 +149,7 @@ impl MBC for MBC3 {
             return 0xFF;
         }
         if !self.selectrtc && self.rambank < self.rambanks {
-            self.ram[self.rambank * 0x2000 | ((a as usize) & 0x1FFF)]
+            self.ram[(self.rambank * 0x2000) | ((a as usize) & 0x1FFF)]
         } else if self.selectrtc && self.has_rtc && self.rambank < 5 {
             self.rtc_latch[self.rambank]
         } else {
@@ -183,7 +183,7 @@ impl MBC for MBC3 {
             return;
         }
         if !self.selectrtc && self.rambank < self.rambanks {
-            self.ram[self.rambank * 0x2000 | ((a as usize) & 0x1FFF)] = v;
+            self.ram[(self.rambank * 0x2000) | ((a as usize) & 0x1FFF)] = v;
             self.ram_updated = true;
         } else if self.selectrtc && self.has_rtc && self.rambank < 5 {
             let mask = match self.rambank {

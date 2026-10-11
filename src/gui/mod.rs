@@ -803,11 +803,10 @@ impl ApplicationHandler<UserEvent> for RootApp {
             // egui flags every RedrawRequested as needing a repaint; acting on
             // that would redraw forever. Its real repaint requests are honored
             // after painting (has_requested_repaint).
-            if resp.repaint && !matches!(event, WindowEvent::RedrawRequested) {
-                if let Some(w) = &self.window {
+            if resp.repaint && !matches!(event, WindowEvent::RedrawRequested)
+                && let Some(w) = &self.window {
                     w.request_redraw();
                 }
-            }
             if resp.consumed {
                 return;
             }
@@ -1299,10 +1298,8 @@ impl ApplicationHandler<UserEvent> for RootApp {
                                             ui.separator();
                                             ui.label("Custom shades (lightest → darkest):");
                                             let mut custom_changed = false;
-                                            for i in 0..4 {
-                                                let mut rgb = dmg_palette_custom[i];
-                                                if ui.color_edit_button_srgb(&mut rgb).changed() {
-                                                    dmg_palette_custom[i] = rgb;
+                                            for rgb in dmg_palette_custom.iter_mut() {
+                                                if ui.color_edit_button_srgb(rgb).changed() {
                                                     custom_changed = true;
                                                 }
                                             }
@@ -1519,11 +1516,10 @@ impl ApplicationHandler<UserEvent> for RootApp {
             }
             drain_gui_events(ui_receiver, save_slots, toasts, &mut self.pending_rumble);
             // Toasts animate even when no frames arrive (e.g. paused).
-            if !toasts.is_empty() {
-                if let Some(w) = &self.window {
+            if !toasts.is_empty()
+                && let Some(w) = &self.window {
                     w.request_redraw();
                 }
-            }
             let palette_now = palette_for_preset(*dmg_palette_preset, dmg_palette_custom);
             let needs_palette = !*is_color;
             match receiver.try_recv() {

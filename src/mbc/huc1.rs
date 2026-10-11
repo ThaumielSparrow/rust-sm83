@@ -40,14 +40,14 @@ impl HuC1 {
 impl MBC for HuC1 {
     fn readrom(&self, a: u16) -> u8 {
         let bank = if a < 0x4000 { 0 } else { self.rombank };
-        *self.rom.get(bank * 0x4000 | (a as usize & 0x3FFF)).unwrap_or(&0xFF)
+        *self.rom.get((bank * 0x4000) | (a as usize & 0x3FFF)).unwrap_or(&0xFF)
     }
 
     fn readram(&self, a: u16) -> u8 {
         if self.ir_mode {
             return 0xC0; // IR receiver: no light
         }
-        *self.ram.get(self.rambank * 0x2000 | (a as usize & 0x1FFF)).unwrap_or(&0xFF)
+        *self.ram.get((self.rambank * 0x2000) | (a as usize & 0x1FFF)).unwrap_or(&0xFF)
     }
 
     fn writerom(&mut self, a: u16, v: u8) {
@@ -63,7 +63,7 @@ impl MBC for HuC1 {
         if self.ir_mode {
             return; // IR LED: nothing to drive
         }
-        let i = self.rambank * 0x2000 | (a as usize & 0x1FFF);
+        let i = (self.rambank * 0x2000) | (a as usize & 0x1FFF);
         if let Some(b) = self.ram.get_mut(i) {
             *b = v;
             self.ram_updated = true;

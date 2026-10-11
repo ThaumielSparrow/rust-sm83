@@ -273,6 +273,408 @@ impl Device {
     }
 }
 
+impl Device {
+    pub fn new(
+        romname: &str,
+        skip_checksum: bool,
+        save_state: Option<String>,
+    ) -> StrResult<Device> {
+        let cart = mbc::Cartridge::from_file(romname.into(), skip_checksum)?;
+        CPU::new(cart, None).map(|cpu| Device {
+            cpu,
+            save_state,
+        })
+    }
+
+    pub fn new_cgb(
+        romname: &str,
+        skip_checksum: bool,
+        save_state: Option<String>,
+    ) -> StrResult<Device> {
+        let cart = mbc::Cartridge::from_file(romname.into(), skip_checksum)?;
+        CPU::new_cgb(cart, None).map(|cpu| Device {
+            cpu,
+            save_state,
+        })
+    }
+
+    /// ROM bytes loaded by the host (e.g. from an archive), with battery
+    /// saves kept next to `save_base` like a ROM file at that path.
+    pub fn new_from_bytes(
+        romdata: Vec<u8>,
+        save_base: &str,
+        skip_checksum: bool,
+        save_state: Option<String>,
+    ) -> StrResult<Device> {
+        let cart = mbc::Cartridge::from_bytes_with_save(romdata, Path::new(save_base), skip_checksum)?;
+        CPU::new(cart, None).map(|cpu| Device { cpu, save_state })
+    }
+
+    pub fn new_cgb_from_bytes(
+        romdata: Vec<u8>,
+        save_base: &str,
+        skip_checksum: bool,
+        save_state: Option<String>,
+    ) -> StrResult<Device> {
+        let cart = mbc::Cartridge::from_bytes_with_save(romdata, Path::new(save_base), skip_checksum)?;
+        CPU::new_cgb(cart, None).map(|cpu| Device { cpu, save_state })
+    }
+
+    pub fn new_from_buffer(
+        romdata: Vec<u8>,
+        skip_checksum: bool,
+        save_state: Option<String>,
+    ) -> StrResult<Device> {
+        let cart = mbc::Cartridge::from_buffer(romdata, skip_checksum)?;
+        CPU::new(cart, None).map(|cpu| Device {
+            cpu,
+            save_state,
+        })
+    }
+
+    pub fn new_cgb_from_buffer(
+        romdata: Vec<u8>,
+        skip_checksum: bool,
+        save_state: Option<String>,
+    ) -> StrResult<Device> {
+        let cart = mbc::Cartridge::from_buffer(romdata, skip_checksum)?;
+        CPU::new_cgb(cart, None).map(|cpu| Device {
+            cpu,
+            save_state,
+        })
+    }
+
+    pub fn do_cycle(&mut self) -> u32 {
+        self.cpu.do_cycle()
+    }
+
+    pub fn check_and_reset_gpu_updated(&mut self) -> bool {
+        let result = self.cpu.mmu.gpu.updated;
+        self.cpu.mmu.gpu.updated = false;
+        result
+    }
+
+    pub fn get_gpu_data(&self) -> &[u8] {
+        self.cpu.mmu.gpu.front_buffer()
+    }
+
+    pub fn enable_audio(&mut self, player: Box<dyn apu::AudioPlayer>, is_on: bool) {
+        match self.cpu.mmu.gbmode {
+            GbMode::Classic => {
+                self.cpu.mmu.sound = Some(apu::Sound::new_dmg(player));
+            }
+            GbMode::Color | GbMode::ColorAsClassic => {
+                self.cpu.mmu.sound = Some(apu::Sound::new_cgb(player));
+            }
+        };
+        if is_on
+            && let Some(sound) = self.cpu.mmu.sound.as_mut() {
+                // MMU::set_initial ran before any Sound existed, so its
+                // post-boot APU writes were dropped; apply them now. (Without
+                // NR51 every channel stays unrouted until the game writes it.)
+                sound.apply_post_boot_state();
+            }
+    }
+
+    /// Replace the audio output device (e.g. after a hot-unplug) without
+    /// resetting the APU. No-op when audio was never enabled.
+    pub fn set_audio_player(&mut self, player: Box<dyn apu::AudioPlayer>) {
+        if let Some(sound) = self.cpu.mmu.sound.as_mut() {
+            sound.set_player(player);
+        }
+    }
+
+    pub fn set_master_volume(&mut self, v: f32) {
+        if let Some(sound) = self.cpu.mmu.sound.as_mut() {
+            sound.set_master_volume(v);
+        }
+    }
+
+    pub fn sync_audio(&mut self) {
+        if let Some(ref mut sound) = self.cpu.mmu.sound {
+            sound.sync();
+        }
+    }
+
+    pub fn keyup(&mut self, key: KeypadKey) {
+        self.cpu.mmu.keypad.keyup(key);
+    }
+
+    pub fn keydown(&mut self, key: KeypadKey) {
+        self.cpu.mmu.keypad.keydown(key);
+    }
+
+    /// Show CGB colors with (default) or without LCD color correction.
+    /// Display-only; not part of save states.
+    pub fn set_cgb_color_correction(&mut self, on: bool) {
+        self.cpu.mmu.gpu.set_raw_cgb_colors(!on);
+    }
+
+    /// Whether a rumble cartridge is currently driving its motor.
+    pub fn rumble(&self) -> bool {
+        self.cpu.mmu.mbc.rumble()
+    }
+
+    pub fn romname(&self) -> String {
+        self.cpu.mmu.mbc.romname()
+    }
+
+    pub fn is_cgb_mode(&self) -> bool {
+        self.cpu.mmu.gbmode == GbMode::Color
+    }
+
+    pub fn loadram(&mut self, ramdata: &[u8]) -> StrResult<()> {
+        self.cpu.mmu.mbc.loadram(ramdata)
+    }
+
+    pub fn dumpram(&self) -> Vec<u8> {
+        self.cpu.mmu.mbc.dumpram()
+    }
+
+    pub fn ram_is_battery_backed(&self) -> bool {
+        self.cpu.mmu.mbc.is_battery_backed()
+    }
+
+    pub fn check_and_reset_ram_updated(&mut self) -> bool {
+        self.cpu.mmu.mbc.check_and_reset_ram_updated()
+    }
+
+    pub fn save_battery_ram(&self) -> StrResult<()> {
+        self.save_battery_ram_with_message(true)
+    }
+
+    pub fn save_battery_ram_silent(&self) -> StrResult<()> {
+        self.save_battery_ram_with_message(false)
+    }
+
+    fn save_battery_ram_with_message(&self, show_message: bool) -> StrResult<()> {
+        if !self.cpu.mmu.mbc.is_battery_backed() {
+            return Ok(());
+        }
+        let ram_data = self.cpu.mmu.mbc.dumpram();
+        let Some(save_path) = self.cpu.mmu.mbc.get_save_path() else {
+            if show_message {
+                eprintln!("No save path available from MBC");
+            }
+            return Err("No save path available");
+        };
+        match write_atomic(std::path::Path::new(&save_path), &ram_data) {
+            Ok(_) => {
+                if show_message {
+                    println!("Game save written to {} ({} bytes)", save_path, ram_data.len());
+                }
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("Failed to write game save to {}: {}", save_path, e);
+                Err("Failed to write game save")
+            }
+        }
+    }
+
+    pub fn read_byte(&mut self, address: u16) -> u8 {
+        self.cpu.read_byte(address)
+    }
+    pub fn write_byte(&mut self, address: u16, byte: u8) {
+        self.cpu.write_byte(address, byte)
+    }
+
+    /// Apply a GameShark banked WRAM write (9x code). In CGB mode, addresses
+    /// in 0xD000-0xDFFF hit the given WRAM bank directly; anything else (and
+    /// all DMG-mode writes) goes through the normal bus write.
+    pub fn cheat_write_wram_bank(&mut self, bank: u8, address: u16, value: u8) {
+        if self.cpu.mmu.gbmode == GbMode::Color && (0xD000..=0xDFFF).contains(&address) {
+            self.cpu.mmu.write_wram_banked(bank, address, value);
+        } else {
+            self.cpu.mmu.wb(address, value);
+        }
+    }
+    pub fn read_wide(&mut self, address: u16) -> u16 {
+        self.cpu.read_wide(address)
+    }
+    pub fn write_wide(&mut self, address: u16, byte: u16) {
+        self.cpu.write_wide(address, byte)
+    }
+
+    /// Per-ROM slot file, `<rom>.slot{N}.state`, next to the ROM.
+    fn slot_path(&self, slot: u8) -> PathBuf {
+        let ext = format!("slot{slot}.state");
+        if let Some(path) = self.save_state.as_deref() {
+            return Path::new(path).with_extension(ext);
+        }
+        if let Some(path) = self.cpu.mmu.mbc.get_save_path() {
+            return Path::new(&path).with_extension(ext);
+        }
+        PathBuf::from(ext)
+    }
+
+    /// The slot file to read: the per-ROM file, or else a pre-existing legacy
+    /// `save_state_{N}.sav` (written by older builds and shared by every ROM
+    /// in the folder; `install_checked` rejects it if it's another game's).
+    /// Saving always writes the per-ROM file.
+    pub fn save_state_slot_path(&self, slot: u8) -> PathBuf {
+        let path = self.slot_path(slot);
+        if !path.exists() {
+            let legacy = self.legacy_slot_path(slot);
+            if legacy.is_file() {
+                return legacy;
+            }
+        }
+        path
+    }
+
+    fn legacy_slot_path(&self, slot: u8) -> PathBuf {
+        let filename = format!("save_state_{}.sav", slot);
+
+        if let Some(path) = self.save_state.as_deref().and_then(parent_dir) {
+            return path.join(filename);
+        }
+
+        if let Some(path) = self
+            .cpu
+            .mmu
+            .mbc
+            .get_save_path()
+            .as_deref()
+            .and_then(parent_dir)
+        {
+            return path.join(filename);
+        }
+
+        std::path::PathBuf::from(filename)
+    }
+
+    pub fn save_state_slot(
+        &self,
+        slot: u8,
+        thumbnail_rgb: Option<&[u8]>,
+    ) -> StrResult<SaveStatePreview> {
+        println!("Saving state to slot {}...", slot);
+
+        let (serialized_data, preview) =
+            match encode_cpu_state_with_preview(&self.cpu, thumbnail_rgb) {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!("Failed to serialize CPU state for slot {}", slot);
+                    return Err(e);
+                }
+            };
+
+        let save_path = self.slot_path(slot);
+
+        match write_atomic(&save_path, &serialized_data) {
+            Ok(_) => {
+                println!("State saved to slot {} ({})", slot, save_path.display());
+                Ok(preview)
+            }
+            Err(_) => {
+                eprintln!("Failed to write save state file for slot {}", slot);
+                Err("Failed to write save state file")
+            }
+        }
+    }
+
+    /// Serialize current mutable state for the rewind ring buffer. The ROM is
+    /// excluded (see the rom-skip in the MBCs); the APU is excluded as usual.
+    /// Returns the raw rkyv payload — no disk header, since these never hit disk.
+    pub fn snapshot_rewind(&self) -> StrResult<Vec<u8>> {
+        self.snapshot_rewind_with(<[u8]>::to_vec)
+    }
+
+    /// Like `snapshot_rewind`, but hands the payload to `f` by reference
+    /// (e.g. to compress it) instead of copying it into a new Vec.
+    pub fn snapshot_rewind_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> StrResult<R> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(&self.cpu)
+            .map(|bytes| f(&bytes))
+            .map_err(|_| "Failed to serialize rewind snapshot")
+    }
+
+    /// Restore a snapshot produced by `snapshot_rewind`, carrying the live ROM
+    /// and audio player across the swap.
+    pub fn restore_rewind(&mut self, payload: &[u8]) -> StrResult<()> {
+        let decoded = rkyv::from_bytes::<CPU, rkyv::rancor::Error>(payload)
+            .map_err(|_| "Failed to deserialize rewind snapshot")?;
+        self.install_decoded_cpu(decoded);
+        Ok(())
+    }
+
+    /// Like `install_decoded_cpu`, but refuses a state whose cartridge or
+    /// hardware mode doesn't match the running game (e.g. a state file from a
+    /// different ROM), which would otherwise run with the wrong mapper.
+    fn install_checked(&mut self, decoded: CPU) -> StrResult<()> {
+        if decoded.mmu.gbmode != self.cpu.mmu.gbmode
+            || !self.cpu.mmu.mbc.same_layout(&decoded.mmu.mbc)
+        {
+            return Err("Save state belongs to a different game");
+        }
+        self.install_decoded_cpu(decoded);
+        Ok(())
+    }
+
+    /// Install a freshly-decoded (rom-less, audio-less) CPU as the live CPU,
+    /// carrying the immutable ROM and the live audio player across the swap.
+    /// Shared by slot-load and rewind restore.
+    fn install_decoded_cpu(&mut self, mut decoded: CPU) {
+        decoded.mmu.mbc.adopt_live_state(&self.cpu.mmu.mbc);
+        let rom = self.cpu.mmu.mbc.take_rom(); // zero-copy move from outgoing CPU
+        decoded.mmu.mbc.set_rom(rom);
+        decoded.mmu.gpu.adopt_frame_buffers(&mut self.cpu.mmu.gpu);
+        // Restore the saved APU state but keep the live output (cpal player).
+        match (&mut decoded.mmu.sound, self.cpu.mmu.sound.as_mut()) {
+            (Some(saved), Some(live)) => saved.adopt_output(live),
+            // Saved without audio attached: keep the live APU as-is.
+            (None, Some(_)) => decoded.mmu.sound = self.cpu.mmu.sound.take(),
+            // No audio attached now: stay that way.
+            (_, None) => decoded.mmu.sound = None,
+        }
+        self.cpu = decoded;
+        self.sync_audio(); // drop any stale queued samples
+    }
+
+    /// True when the auto-save path is configured and the file exists on disk.
+    pub fn has_auto_save(&self) -> bool {
+        self.save_state
+            .as_deref()
+            .is_some_and(|p| std::path::Path::new(p).is_file())
+    }
+
+    /// Load the auto-save snapshot written by `flush_to_disk`, carrying the
+    /// live ROM and audio player across the swap (same path as slot loads).
+    pub fn load_auto_save(&mut self) -> StrResult<()> {
+        let Some(path) = self.save_state.as_deref() else {
+            return Err("No auto-save path configured");
+        };
+        let data = std::fs::read(path).map_err(|_| "No auto-save file")?;
+        let cpu = decode_cpu_state(&data)?;
+        self.install_checked(cpu)
+    }
+
+    pub fn load_state_slot(&mut self, slot: u8) -> StrResult<()> {
+        println!("Loading state from slot {}...", slot);
+        let save_path = self.save_state_slot_path(slot);
+
+        match std::fs::read(&save_path) {
+            Ok(data) => match decode_cpu_state(&data).and_then(|cpu| self.install_checked(cpu)) {
+                Ok(()) => {
+                    println!("State loaded from slot {}", slot);
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Failed to parse save state from slot {} (file may be corrupted)",
+                        slot
+                    );
+                    Err(e)
+                }
+            },
+            Err(_) => {
+                eprintln!("Save state slot {} does not exist", slot);
+                Err("Save state file does not exist")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -734,408 +1136,5 @@ mod test {
         let _ = std::fs::remove_file(rom_path);
         let _ = std::fs::remove_file(rom_dir.join("game.gbsave"));
         let _ = std::fs::remove_dir(rom_dir);
-    }
-}
-
-impl Device {
-    pub fn new(
-        romname: &str,
-        skip_checksum: bool,
-        save_state: Option<String>,
-    ) -> StrResult<Device> {
-        let cart = mbc::Cartridge::from_file(romname.into(), skip_checksum)?;
-        CPU::new(cart, None).map(|cpu| Device {
-            cpu: cpu,
-            save_state,
-        })
-    }
-
-    pub fn new_cgb(
-        romname: &str,
-        skip_checksum: bool,
-        save_state: Option<String>,
-    ) -> StrResult<Device> {
-        let cart = mbc::Cartridge::from_file(romname.into(), skip_checksum)?;
-        CPU::new_cgb(cart, None).map(|cpu| Device {
-            cpu: cpu,
-            save_state,
-        })
-    }
-
-    /// ROM bytes loaded by the host (e.g. from an archive), with battery
-    /// saves kept next to `save_base` like a ROM file at that path.
-    pub fn new_from_bytes(
-        romdata: Vec<u8>,
-        save_base: &str,
-        skip_checksum: bool,
-        save_state: Option<String>,
-    ) -> StrResult<Device> {
-        let cart = mbc::Cartridge::from_bytes_with_save(romdata, Path::new(save_base), skip_checksum)?;
-        CPU::new(cart, None).map(|cpu| Device { cpu, save_state })
-    }
-
-    pub fn new_cgb_from_bytes(
-        romdata: Vec<u8>,
-        save_base: &str,
-        skip_checksum: bool,
-        save_state: Option<String>,
-    ) -> StrResult<Device> {
-        let cart = mbc::Cartridge::from_bytes_with_save(romdata, Path::new(save_base), skip_checksum)?;
-        CPU::new_cgb(cart, None).map(|cpu| Device { cpu, save_state })
-    }
-
-    pub fn new_from_buffer(
-        romdata: Vec<u8>,
-        skip_checksum: bool,
-        save_state: Option<String>,
-    ) -> StrResult<Device> {
-        let cart = mbc::Cartridge::from_buffer(romdata, skip_checksum)?;
-        CPU::new(cart, None).map(|cpu| Device {
-            cpu: cpu,
-            save_state,
-        })
-    }
-
-    pub fn new_cgb_from_buffer(
-        romdata: Vec<u8>,
-        skip_checksum: bool,
-        save_state: Option<String>,
-    ) -> StrResult<Device> {
-        let cart = mbc::Cartridge::from_buffer(romdata, skip_checksum)?;
-        CPU::new_cgb(cart, None).map(|cpu| Device {
-            cpu: cpu,
-            save_state,
-        })
-    }
-
-    pub fn do_cycle(&mut self) -> u32 {
-        self.cpu.do_cycle()
-    }
-
-    pub fn check_and_reset_gpu_updated(&mut self) -> bool {
-        let result = self.cpu.mmu.gpu.updated;
-        self.cpu.mmu.gpu.updated = false;
-        result
-    }
-
-    pub fn get_gpu_data(&self) -> &[u8] {
-        self.cpu.mmu.gpu.front_buffer()
-    }
-
-    pub fn enable_audio(&mut self, player: Box<dyn apu::AudioPlayer>, is_on: bool) {
-        match self.cpu.mmu.gbmode {
-            GbMode::Classic => {
-                self.cpu.mmu.sound = Some(apu::Sound::new_dmg(player));
-            }
-            GbMode::Color | GbMode::ColorAsClassic => {
-                self.cpu.mmu.sound = Some(apu::Sound::new_cgb(player));
-            }
-        };
-        if is_on {
-            if let Some(sound) = self.cpu.mmu.sound.as_mut() {
-                // MMU::set_initial ran before any Sound existed, so its
-                // post-boot APU writes were dropped; apply them now. (Without
-                // NR51 every channel stays unrouted until the game writes it.)
-                sound.apply_post_boot_state();
-            }
-        }
-    }
-
-    /// Replace the audio output device (e.g. after a hot-unplug) without
-    /// resetting the APU. No-op when audio was never enabled.
-    pub fn set_audio_player(&mut self, player: Box<dyn apu::AudioPlayer>) {
-        if let Some(sound) = self.cpu.mmu.sound.as_mut() {
-            sound.set_player(player);
-        }
-    }
-
-    pub fn set_master_volume(&mut self, v: f32) {
-        if let Some(sound) = self.cpu.mmu.sound.as_mut() {
-            sound.set_master_volume(v);
-        }
-    }
-
-    pub fn sync_audio(&mut self) {
-        if let Some(ref mut sound) = self.cpu.mmu.sound {
-            sound.sync();
-        }
-    }
-
-    pub fn keyup(&mut self, key: KeypadKey) {
-        self.cpu.mmu.keypad.keyup(key);
-    }
-
-    pub fn keydown(&mut self, key: KeypadKey) {
-        self.cpu.mmu.keypad.keydown(key);
-    }
-
-    /// Show CGB colors with (default) or without LCD color correction.
-    /// Display-only; not part of save states.
-    pub fn set_cgb_color_correction(&mut self, on: bool) {
-        self.cpu.mmu.gpu.set_raw_cgb_colors(!on);
-    }
-
-    /// Whether a rumble cartridge is currently driving its motor.
-    pub fn rumble(&self) -> bool {
-        self.cpu.mmu.mbc.rumble()
-    }
-
-    pub fn romname(&self) -> String {
-        self.cpu.mmu.mbc.romname()
-    }
-
-    pub fn is_cgb_mode(&self) -> bool {
-        self.cpu.mmu.gbmode == GbMode::Color
-    }
-
-    pub fn loadram(&mut self, ramdata: &[u8]) -> StrResult<()> {
-        self.cpu.mmu.mbc.loadram(ramdata)
-    }
-
-    pub fn dumpram(&self) -> Vec<u8> {
-        self.cpu.mmu.mbc.dumpram()
-    }
-
-    pub fn ram_is_battery_backed(&self) -> bool {
-        self.cpu.mmu.mbc.is_battery_backed()
-    }
-
-    pub fn check_and_reset_ram_updated(&mut self) -> bool {
-        self.cpu.mmu.mbc.check_and_reset_ram_updated()
-    }
-
-    pub fn save_battery_ram(&self) -> StrResult<()> {
-        self.save_battery_ram_with_message(true)
-    }
-
-    pub fn save_battery_ram_silent(&self) -> StrResult<()> {
-        self.save_battery_ram_with_message(false)
-    }
-
-    fn save_battery_ram_with_message(&self, show_message: bool) -> StrResult<()> {
-        if !self.cpu.mmu.mbc.is_battery_backed() {
-            return Ok(());
-        }
-        let ram_data = self.cpu.mmu.mbc.dumpram();
-        let Some(save_path) = self.cpu.mmu.mbc.get_save_path() else {
-            if show_message {
-                eprintln!("No save path available from MBC");
-            }
-            return Err("No save path available");
-        };
-        match write_atomic(std::path::Path::new(&save_path), &ram_data) {
-            Ok(_) => {
-                if show_message {
-                    println!("Game save written to {} ({} bytes)", save_path, ram_data.len());
-                }
-                Ok(())
-            }
-            Err(e) => {
-                eprintln!("Failed to write game save to {}: {}", save_path, e);
-                Err("Failed to write game save")
-            }
-        }
-    }
-
-    pub fn read_byte(&mut self, address: u16) -> u8 {
-        self.cpu.read_byte(address)
-    }
-    pub fn write_byte(&mut self, address: u16, byte: u8) {
-        self.cpu.write_byte(address, byte)
-    }
-
-    /// Apply a GameShark banked WRAM write (9x code). In CGB mode, addresses
-    /// in 0xD000-0xDFFF hit the given WRAM bank directly; anything else (and
-    /// all DMG-mode writes) goes through the normal bus write.
-    pub fn cheat_write_wram_bank(&mut self, bank: u8, address: u16, value: u8) {
-        if self.cpu.mmu.gbmode == GbMode::Color && (0xD000..=0xDFFF).contains(&address) {
-            self.cpu.mmu.write_wram_banked(bank, address, value);
-        } else {
-            self.cpu.mmu.wb(address, value);
-        }
-    }
-    pub fn read_wide(&mut self, address: u16) -> u16 {
-        self.cpu.read_wide(address)
-    }
-    pub fn write_wide(&mut self, address: u16, byte: u16) {
-        self.cpu.write_wide(address, byte)
-    }
-
-    /// Per-ROM slot file, `<rom>.slot{N}.state`, next to the ROM.
-    fn slot_path(&self, slot: u8) -> PathBuf {
-        let ext = format!("slot{slot}.state");
-        if let Some(path) = self.save_state.as_deref() {
-            return Path::new(path).with_extension(ext);
-        }
-        if let Some(path) = self.cpu.mmu.mbc.get_save_path() {
-            return Path::new(&path).with_extension(ext);
-        }
-        PathBuf::from(ext)
-    }
-
-    /// The slot file to read: the per-ROM file, or else a pre-existing legacy
-    /// `save_state_{N}.sav` (written by older builds and shared by every ROM
-    /// in the folder; `install_checked` rejects it if it's another game's).
-    /// Saving always writes the per-ROM file.
-    pub fn save_state_slot_path(&self, slot: u8) -> PathBuf {
-        let path = self.slot_path(slot);
-        if !path.exists() {
-            let legacy = self.legacy_slot_path(slot);
-            if legacy.is_file() {
-                return legacy;
-            }
-        }
-        path
-    }
-
-    fn legacy_slot_path(&self, slot: u8) -> PathBuf {
-        let filename = format!("save_state_{}.sav", slot);
-
-        if let Some(path) = self.save_state.as_deref().and_then(parent_dir) {
-            return path.join(filename);
-        }
-
-        if let Some(path) = self
-            .cpu
-            .mmu
-            .mbc
-            .get_save_path()
-            .as_deref()
-            .and_then(parent_dir)
-        {
-            return path.join(filename);
-        }
-
-        std::path::PathBuf::from(filename)
-    }
-
-    pub fn save_state_slot(
-        &self,
-        slot: u8,
-        thumbnail_rgb: Option<&[u8]>,
-    ) -> StrResult<SaveStatePreview> {
-        println!("Saving state to slot {}...", slot);
-
-        let (serialized_data, preview) =
-            match encode_cpu_state_with_preview(&self.cpu, thumbnail_rgb) {
-                Ok(result) => result,
-                Err(e) => {
-                    eprintln!("Failed to serialize CPU state for slot {}", slot);
-                    return Err(e);
-                }
-            };
-
-        let save_path = self.slot_path(slot);
-
-        match write_atomic(&save_path, &serialized_data) {
-            Ok(_) => {
-                println!("State saved to slot {} ({})", slot, save_path.display());
-                Ok(preview)
-            }
-            Err(_) => {
-                eprintln!("Failed to write save state file for slot {}", slot);
-                Err("Failed to write save state file")
-            }
-        }
-    }
-
-    /// Serialize current mutable state for the rewind ring buffer. The ROM is
-    /// excluded (see the rom-skip in the MBCs); the APU is excluded as usual.
-    /// Returns the raw rkyv payload — no disk header, since these never hit disk.
-    pub fn snapshot_rewind(&self) -> StrResult<Vec<u8>> {
-        self.snapshot_rewind_with(<[u8]>::to_vec)
-    }
-
-    /// Like `snapshot_rewind`, but hands the payload to `f` by reference
-    /// (e.g. to compress it) instead of copying it into a new Vec.
-    pub fn snapshot_rewind_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> StrResult<R> {
-        rkyv::to_bytes::<rkyv::rancor::Error>(&self.cpu)
-            .map(|bytes| f(&bytes))
-            .map_err(|_| "Failed to serialize rewind snapshot")
-    }
-
-    /// Restore a snapshot produced by `snapshot_rewind`, carrying the live ROM
-    /// and audio player across the swap.
-    pub fn restore_rewind(&mut self, payload: &[u8]) -> StrResult<()> {
-        let decoded = rkyv::from_bytes::<CPU, rkyv::rancor::Error>(payload)
-            .map_err(|_| "Failed to deserialize rewind snapshot")?;
-        self.install_decoded_cpu(decoded);
-        Ok(())
-    }
-
-    /// Like `install_decoded_cpu`, but refuses a state whose cartridge or
-    /// hardware mode doesn't match the running game (e.g. a state file from a
-    /// different ROM), which would otherwise run with the wrong mapper.
-    fn install_checked(&mut self, decoded: CPU) -> StrResult<()> {
-        if decoded.mmu.gbmode != self.cpu.mmu.gbmode
-            || !self.cpu.mmu.mbc.same_layout(&decoded.mmu.mbc)
-        {
-            return Err("Save state belongs to a different game");
-        }
-        self.install_decoded_cpu(decoded);
-        Ok(())
-    }
-
-    /// Install a freshly-decoded (rom-less, audio-less) CPU as the live CPU,
-    /// carrying the immutable ROM and the live audio player across the swap.
-    /// Shared by slot-load and rewind restore.
-    fn install_decoded_cpu(&mut self, mut decoded: CPU) {
-        decoded.mmu.mbc.adopt_live_state(&self.cpu.mmu.mbc);
-        let rom = self.cpu.mmu.mbc.take_rom(); // zero-copy move from outgoing CPU
-        decoded.mmu.mbc.set_rom(rom);
-        decoded.mmu.gpu.adopt_frame_buffers(&mut self.cpu.mmu.gpu);
-        // Restore the saved APU state but keep the live output (cpal player).
-        match (&mut decoded.mmu.sound, self.cpu.mmu.sound.as_mut()) {
-            (Some(saved), Some(live)) => saved.adopt_output(live),
-            // Saved without audio attached: keep the live APU as-is.
-            (None, Some(_)) => decoded.mmu.sound = self.cpu.mmu.sound.take(),
-            // No audio attached now: stay that way.
-            (_, None) => decoded.mmu.sound = None,
-        }
-        self.cpu = decoded;
-        self.sync_audio(); // drop any stale queued samples
-    }
-
-    /// True when the auto-save path is configured and the file exists on disk.
-    pub fn has_auto_save(&self) -> bool {
-        self.save_state
-            .as_deref()
-            .is_some_and(|p| std::path::Path::new(p).is_file())
-    }
-
-    /// Load the auto-save snapshot written by `flush_to_disk`, carrying the
-    /// live ROM and audio player across the swap (same path as slot loads).
-    pub fn load_auto_save(&mut self) -> StrResult<()> {
-        let Some(path) = self.save_state.as_deref() else {
-            return Err("No auto-save path configured");
-        };
-        let data = std::fs::read(path).map_err(|_| "No auto-save file")?;
-        let cpu = decode_cpu_state(&data)?;
-        self.install_checked(cpu)
-    }
-
-    pub fn load_state_slot(&mut self, slot: u8) -> StrResult<()> {
-        println!("Loading state from slot {}...", slot);
-        let save_path = self.save_state_slot_path(slot);
-
-        match std::fs::read(&save_path) {
-            Ok(data) => match decode_cpu_state(&data).and_then(|cpu| self.install_checked(cpu)) {
-                Ok(()) => {
-                    println!("State loaded from slot {}", slot);
-                    Ok(())
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Failed to parse save state from slot {} (file may be corrupted)",
-                        slot
-                    );
-                    Err(e)
-                }
-            },
-            Err(_) => {
-                eprintln!("Save state slot {} does not exist", slot);
-                Err("Save state file does not exist")
-            }
-        }
     }
 }

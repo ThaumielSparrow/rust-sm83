@@ -38,15 +38,15 @@ impl MBC5 {
 
         let res = MBC5 {
             rom: data,
-            ram: ::std::iter::repeat(0u8).take(ramsize).collect(),
+            ram: std::iter::repeat_n(0u8, ramsize).collect(),
             rombank: 1,
             rambank: 0,
             ram_updated: false,
             ram_on: false,
-            has_battery: has_battery,
-            rombanks: rombanks,
-            rambanks: rambanks,
-            has_rumble: has_rumble,
+            has_battery,
+            rombanks,
+            rambanks,
+            has_rumble,
             rumble_on: false,
         };
 
@@ -59,7 +59,7 @@ impl MBC for MBC5 {
         let idx = if a < 0x4000 {
             a as usize
         } else {
-            self.rombank * 0x4000 | ((a as usize) & 0x3FFF)
+            (self.rombank * 0x4000) | ((a as usize) & 0x3FFF)
         };
         *self.rom.get(idx).unwrap_or(&0xFF)
     }
@@ -67,7 +67,7 @@ impl MBC for MBC5 {
         if !self.ram_on || self.ram.is_empty() {
             return 0xFF;
         }
-        let idx = self.rambank * 0x2000 | ((a as usize) & 0x1FFF);
+        let idx = (self.rambank * 0x2000) | ((a as usize) & 0x1FFF);
         *self.ram.get(idx).unwrap_or(&0xFF)
     }
     fn writerom(&mut self, a: u16, v: u8) {
@@ -101,7 +101,7 @@ impl MBC for MBC5 {
         if !self.ram_on || self.ram.is_empty() {
             return;
         }
-        let idx = self.rambank * 0x2000 | ((a as usize) & 0x1FFF);
+        let idx = (self.rambank * 0x2000) | ((a as usize) & 0x1FFF);
         if idx < self.ram.len() {
             self.ram[idx] = v;
             self.ram_updated = true;

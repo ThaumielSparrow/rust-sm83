@@ -440,10 +440,9 @@ fn rom_banks(v: u8) -> usize {
 pub const CHECKSUM_INVALID: &str = "Cartridge checksum is invalid";
 
 fn check_checksum(data: &[u8]) -> StrResult<()> {
-    let mut value: u8 = 0;
-    for i in 0x134..0x14D {
-        value = value.wrapping_sub(data[i]).wrapping_sub(1);
-    }
+    let value = data[0x134..0x14D]
+        .iter()
+        .fold(0u8, |v, &b| v.wrapping_sub(b).wrapping_sub(1));
     match data[0x14D] == value {
         true => Ok(()),
         false => Err(CHECKSUM_INVALID),

@@ -5,14 +5,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-pub enum TurboSetting { Quarter, Half, Double, Triple, Quadruple, Octuple, Hexadecuple, Uncapped }
+#[derive(Default)]
+pub enum TurboSetting { Quarter, Half, #[default]
+Double, Triple, Quadruple, Octuple, Hexadecuple, Uncapped }
 
-impl Default for TurboSetting { fn default() -> Self { TurboSetting::Double } }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-pub enum DmgPalettePreset { Green, Pocket, Light, Custom }
+#[derive(Default)]
+pub enum DmgPalettePreset { #[default]
+Green, Pocket, Light, Custom }
 
-impl Default for DmgPalettePreset { fn default() -> Self { DmgPalettePreset::Green } }
 
 impl DmgPalettePreset {
     pub fn all() -> &'static [DmgPalettePreset] {

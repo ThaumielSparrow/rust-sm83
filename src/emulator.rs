@@ -158,7 +158,7 @@ fn restore_compressed(cpu: &mut Device, payload: &[u8]) -> bool {
             }
         },
         Err(_) => {
-            crate::log::warn(format!("rewind decompress failed"));
+            crate::log::warn("rewind decompress failed".to_string());
             false
         }
     }
@@ -310,8 +310,8 @@ fn run_loop(
                 for _ in 0..rewind_pops(ring.len(), 1) {
                     ring.pop_back();
                 }
-                if let Some(payload) = ring.back() {
-                    if restore_compressed(cpu, payload)
+                if let Some(payload) = ring.back()
+                    && restore_compressed(cpu, payload)
                         && try_send_frame(
                             cpu.get_gpu_data(),
                             &mut frame_buffers,
@@ -324,7 +324,6 @@ fn run_loop(
                         let _ = cpu.flush_to_disk();
                         break 'outer;
                     }
-                }
             }
         } else {
             // Normal forward execution.
@@ -466,8 +465,8 @@ fn run_loop(
                         for _ in 0..rewind_pops(ring.len(), REWIND_STEP_FRAMES) {
                             ring.pop_back();
                         }
-                        if let Some(payload) = ring.back() {
-                            if restore_compressed(cpu, payload) {
+                        if let Some(payload) = ring.back()
+                            && restore_compressed(cpu, payload) {
                                 // A disconnect here is caught next iteration in
                                 // the 'recv loop, which breaks 'outer cleanly.
                                 let _ = try_send_frame(
@@ -478,7 +477,6 @@ fn run_loop(
                                     wake,
                                 );
                             }
-                        }
                     }
                     GBEvent::SetCheats(list) => cheats = list,
                     GBEvent::SetAudio(player, clock) => {
@@ -537,7 +535,7 @@ fn run_loop(
         } else {
             next_deadline = Instant::now();
             // Uncapped: still yield occasionally to avoid starving other threads
-            if frame_count % 120 == 0 {
+            if frame_count.is_multiple_of(120) {
                 std::thread::yield_now();
             }
         }

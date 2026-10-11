@@ -1,3 +1,6 @@
+// CPU, MMU, GPU, MBC, HDMA... are the hardware's own names.
+#![allow(clippy::upper_case_acronyms)]
+
 pub use crate::gpu::{SCREEN_H, SCREEN_W};
 pub use crate::keypad::KeypadKey;
 pub use crate::apu::AudioPlayer;

@@ -75,7 +75,7 @@ impl MMU {
             wrambank: 1,
             inte: 0,
             intf: 0,
-            serial: serial,
+            serial,
             timer: Timer::new(),
             keypad: Keypad::new(),
             gpu: GPU::new(),
@@ -122,7 +122,7 @@ impl MMU {
             hdma: [0; 4],
             inte: 0,
             intf: 0,
-            serial: serial,
+            serial,
             timer: Timer::new(),
             keypad: Keypad::new(),
             gpu: GPU::new(),
@@ -223,14 +223,16 @@ impl MMU {
         self.intf |= self.gpu.interrupt;
         self.gpu.interrupt = 0;
 
-        let _ = self.sound.as_mut().map_or((), |s| s.do_cycle(gputicks));
+        if let Some(s) = self.sound.as_mut() {
+            s.do_cycle(gputicks);
+        }
 
         self.mbc.tick(gputicks);
 
         self.intf |= self.serial.interrupt;
         self.serial.interrupt = 0;
 
-        return gputicks;
+        gputicks
     }
 
     /// True while a CGB general-purpose or HBlank VRAM DMA is in progress.
@@ -490,7 +492,7 @@ impl MMU {
 
         // Pan Docs: each 16-byte block takes 8 M-cycles at single speed
         // (16 at double speed), i.e. 32 dots either way. Callers count in dots.
-        return 32;
+        32
     }
 
     fn perform_gdma(&mut self) -> u32 {
@@ -500,7 +502,7 @@ impl MMU {
         }
 
         self.hdma_status = DMAType::NoDMA;
-        return len * 32;
+        len * 32
     }
 
     fn perform_vramdma_row(&mut self) {

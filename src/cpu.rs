@@ -305,7 +305,7 @@ impl CPU {
         self.reg.flag(Z, r == 0);
         self.reg.flag(H, (a & 0x0F) + 1 > 0x0F);
         self.reg.flag(N, false);
-        return r;
+        r
     }
 
     fn alu_dec(&mut self, a: u8) -> u8 {
@@ -313,7 +313,7 @@ impl CPU {
         self.reg.flag(Z, r == 0);
         self.reg.flag(H, (a & 0x0F) == 0);
         self.reg.flag(N, true);
-        return r;
+        r
     }
 
     fn alu_add16(&mut self, b: u16) {
@@ -331,7 +331,7 @@ impl CPU {
         self.reg.flag(Z, false);
         self.reg.flag(H, (a & 0x000F) + (b & 0x000F) > 0x000F);
         self.reg.flag(C, (a & 0x00FF) + (b & 0x00FF) > 0x00FF);
-        return a.wrapping_add(b);
+        a.wrapping_add(b)
     }
 
     fn alu_swap(&mut self, a: u8) -> u8 {
@@ -339,7 +339,7 @@ impl CPU {
         self.reg.flag(C, false);
         self.reg.flag(H, false);
         self.reg.flag(N, false);
-        (a >> 4) | (a << 4)
+        a.rotate_left(4)
     }
 
     fn alu_srflagupdate(&mut self, r: u8, c: bool) {
@@ -353,49 +353,49 @@ impl CPU {
         let c = a & 0x80 == 0x80;
         let r = (a << 1) | (if c { 1 } else { 0 });
         self.alu_srflagupdate(r, c);
-        return r;
+        r
     }
 
     fn alu_rl(&mut self, a: u8) -> u8 {
         let c = a & 0x80 == 0x80;
         let r = (a << 1) | (if self.reg.getflag(C) { 1 } else { 0 });
         self.alu_srflagupdate(r, c);
-        return r;
+        r
     }
 
     fn alu_rrc(&mut self, a: u8) -> u8 {
         let c = a & 0x01 == 0x01;
         let r = (a >> 1) | (if c { 0x80 } else { 0 });
         self.alu_srflagupdate(r, c);
-        return r;
+        r
     }
 
     fn alu_rr(&mut self, a: u8) -> u8 {
         let c = a & 0x01 == 0x01;
         let r = (a >> 1) | (if self.reg.getflag(C) { 0x80 } else { 0 });
         self.alu_srflagupdate(r, c);
-        return r;
+        r
     }
 
     fn alu_sla(&mut self, a: u8) -> u8 {
         let c = a & 0x80 == 0x80;
         let r = a << 1;
         self.alu_srflagupdate(r, c);
-        return r;
+        r
     }
 
     fn alu_sra(&mut self, a: u8) -> u8 {
         let c = a & 0x01 == 0x01;
         let r = (a >> 1) | (a & 0x80);
         self.alu_srflagupdate(r, c);
-        return r;
+        r
     }
 
     fn alu_srl(&mut self, a: u8) -> u8 {
         let c = a & 0x01 == 0x01;
         let r = a >> 1;
         self.alu_srflagupdate(r, c);
-        return r;
+        r
     }
 
     fn alu_bit(&mut self, a: u8, b: u8) {

@@ -345,16 +345,5 @@ pub(super) fn key_to_string(key: &winit::keyboard::Key<&str>) -> String {
 }
 
 pub(super) fn matches_capturing(capturing: Option<rust_gbe::KeypadKey>, k: rust_gbe::KeypadKey) -> bool {
-    use rust_gbe::KeypadKey::*;
-    match (capturing, k) {
-        (Some(A), A)
-        | (Some(B), B)
-        | (Some(Start), Start)
-        | (Some(Select), Select)
-        | (Some(Up), Up)
-        | (Some(Down), Down)
-        | (Some(Left), Left)
-        | (Some(Right), Right) => true,
-        _ => false,
-    }
+    capturing == Some(k)
 }

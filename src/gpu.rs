@@ -420,13 +420,13 @@ impl GPU {
     }
 
     fn rbvram0(&self, a: u16) -> u8 {
-        if a < 0x8000 || a >= 0xA000 {
+        if !(0x8000..0xA000).contains(&a) {
             panic!("Shouldn't have used rbvram0");
         }
         self.vram[a as usize & 0x1FFF]
     }
     fn rbvram1(&self, a: u16) -> u8 {
-        if a < 0x8000 || a >= 0xA000 {
+        if !(0x8000..0xA000).contains(&a) {
             panic!("Shouldn't have used rbvram1");
         }
         self.vram[0x2000 + (a as usize & 0x1FFF)]
@@ -843,7 +843,7 @@ impl GPU {
     }
 
     pub fn may_hdma(&self) -> bool {
-        return self.hblanking;
+        self.hblanking
     }
 }
 
@@ -871,12 +871,12 @@ fn dmg_sprite_order(a: &(i32, i32, u8), b: &(i32, i32, u8)) -> Ordering {
     if a.0 != b.0 {
         return b.0.cmp(&a.0);
     }
-    return b.2.cmp(&a.2);
+    b.2.cmp(&a.2)
 }
 
 fn cgb_sprite_order(a: &(i32, i32, u8), b: &(i32, i32, u8)) -> Ordering {
     // CGB order: only prioritize based on OAM position.
-    return b.2.cmp(&a.2);
+    b.2.cmp(&a.2)
 }
 
 #[cfg(test)]

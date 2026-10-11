@@ -91,7 +91,7 @@ fn is_multicart(rom: &[u8]) -> bool {
 impl MBC for MBC1 {
     fn readrom(&self, a: u16) -> u8 {
         let bank = if a < 0x4000 { self.rom_bank_low() } else { self.rom_bank_high() };
-        let idx = bank * 0x4000 | ((a as usize) & 0x3FFF);
+        let idx = (bank * 0x4000) | ((a as usize) & 0x3FFF);
         *self.rom.get(idx).unwrap_or(&0xFF)
     }
     fn readram(&self, a: u16) -> u8 {

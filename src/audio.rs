@@ -53,7 +53,9 @@ impl CpalPlayer {
         // (44.1 kHz, else 48 kHz, else the highest offered), then f32.
         // Device lists can start with odd fixed-rate ranges (WASAPI offers
         // 5512 Hz first), so never just take the first match.
-        let mut best: Option<((bool, u8, std::cmp::Reverse<u32>, bool), cpal::SupportedStreamConfig)> = None;
+        // (not stereo, rate preference, -rate, not f32): lower is better.
+        type Rank = (bool, u8, std::cmp::Reverse<u32>, bool);
+        let mut best: Option<(Rank, cpal::SupportedStreamConfig)> = None;
         for f in device.supported_output_configs().ok()? {
             if f.channels() == 0 {
                 continue;
