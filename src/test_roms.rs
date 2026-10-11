@@ -291,7 +291,7 @@ mod mooneye {
         #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] acceptance_ppu_lcdon_timing_gs = "acceptance/ppu/lcdon_timing-GS.gb",
         #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] acceptance_ppu_lcdon_write_timing_gs = "acceptance/ppu/lcdon_write_timing-GS.gb",
         acceptance_ppu_stat_irq_blocking = "acceptance/ppu/stat_irq_blocking.gb",
-        #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] acceptance_ppu_stat_lyc_onoff = "acceptance/ppu/stat_lyc_onoff.gb",
+        acceptance_ppu_stat_lyc_onoff = "acceptance/ppu/stat_lyc_onoff.gb",
         acceptance_ppu_vblank_stat_intr_gs = "acceptance/ppu/vblank_stat_intr-GS.gb",
         acceptance_push_timing = "acceptance/push_timing.gb",
         acceptance_rapid_di_ei = "acceptance/rapid_di_ei.gb",
@@ -411,6 +411,7 @@ fn bench() {
         println!("{path}: 60 emulated s in {secs:.3} s ({:.0}x realtime)", 60.0 / secs);
     }
 }
+
 
 
 

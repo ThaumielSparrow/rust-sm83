@@ -375,6 +375,15 @@ impl MMU {
             0xFFFF => self.inte = value,
             _ => {}
         };
+        // A register write can itself raise an interrupt (e.g. LCD enable
+        // making LY=LYC, a DIV write's timer glitch). Latch it into IF now so
+        // the very next instruction boundary sees it.
+        if address >= 0xFF00 {
+            self.intf |= self.gpu.interrupt | self.timer.interrupt | self.serial.interrupt;
+            self.gpu.interrupt = 0;
+            self.timer.interrupt = 0;
+            self.serial.interrupt = 0;
+        }
     }
 
     pub fn ww(&mut self, address: u16, value: u16) {

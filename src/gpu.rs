@@ -117,6 +117,9 @@ pub struct GPU {
     /// Line 0 right after the LCD is switched on has no OAM scan: it stays
     /// in mode 0 until mode 3.
     first_line_after_on: bool,
+    /// STAT bit 2 (LY=LYC). Latched: only re-evaluated while the LCD is on,
+    /// so it keeps its value across LCD off and LYC writes made meanwhile.
+    lyc_match: bool,
     prev_stat_signal: bool,
 }
 
@@ -170,6 +173,7 @@ impl GPU {
             first_frame: false,
             mode3_len: 172,
             first_line_after_on: false,
+            lyc_match: false,
             raw_cgb_colors: false,
             prev_stat_signal: false,
         }
@@ -334,11 +338,14 @@ impl GPU {
         // The signal is forced low while the LCD is off, so no STAT IRQ can fire
         // from register writes (FF41/FF45) during LCD-off, and a clean baseline
         // is kept for the rising-edge check after re-enable.
+        if self.lcd_on {
+            self.lyc_match = self.line == self.lyc;
+        }
         let signal = self.lcd_on
             && ((self.m0_inte && self.mode == 0)
                 || (self.m1_inte && self.mode == 1)
                 || (self.m2_inte && (self.mode == 2 || vblank_oam_quirk))
-                || (self.lyc_inte && self.line == self.lyc));
+                || (self.lyc_inte && self.lyc_match));
         if signal && !self.prev_stat_signal {
             self.interrupt |= 0x02;
         }
@@ -395,7 +402,7 @@ impl GPU {
                     | (if self.m2_inte { 0x20 } else { 0 })
                     | (if self.m1_inte { 0x10 } else { 0 })
                     | (if self.m0_inte { 0x08 } else { 0 })
-                    | (if self.line == self.lyc { 0x04 } else { 0 })
+                    | (if self.lyc_match { 0x04 } else { 0 })
                     | self.mode
             }
             0xFF42 => self.scy,
@@ -491,10 +498,11 @@ impl GPU {
                     self.line = 0;
                     self.first_frame = true;
                     self.first_line_after_on = true;
-                    // Set prev_stat_signal = true so that update_stat_signal() below
-                    // sees no rising edge (0→1) regardless of the current signal value,
-                    // suppressing any spurious IRQ on the enable transition.
-                    self.prev_stat_signal = true;
+                    // Seed the previous signal so enabling raises no mode-based
+                    // IRQ, but the LY=LYC comparison restarts from its latched
+                    // value: a false->true flip fires, true->true doesn't
+                    // (Mooneye stat_lyc_onoff).
+                    self.prev_stat_signal = self.m0_inte || (self.lyc_inte && self.lyc_match);
                     self.update_stat_signal();
                 }
             }
