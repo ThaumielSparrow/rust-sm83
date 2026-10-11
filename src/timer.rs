@@ -1,3 +1,6 @@
+/// See `Timer::reloaded_window`.
+const RELOADED_WINDOW: u8 = 4;
+
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Timer {
     internal_counter: u16,
@@ -5,6 +8,9 @@ pub struct Timer {
     tma: u8,
     tac: u8,
     reload_pending: u8,
+    // T-cycles left in the M-cycle where TMA was just loaded into TIMA:
+    // TIMA writes are ignored then, and TMA writes go to TIMA as well.
+    reloaded_window: u8,
     prev_tima_input: bool,
     pub interrupt: u8,
 }
@@ -17,6 +23,7 @@ impl Timer {
             tma: 0,
             tac: 0,
             reload_pending: 0,
+            reloaded_window: 0,
             prev_tima_input: false,
             interrupt: 0,
         }
@@ -61,13 +68,19 @@ impl Timer {
             }
             0xFF05 => {
                 // Pan Docs: a TIMA write during the reload window cancels the
-                // reload — no TMA load, no IRQ. The written value takes effect
-                // immediately. Outside the window it is an ordinary write.
-                self.tima = v;
+                // reload — no TMA load, no IRQ. In the M-cycle where TMA is
+                // loaded the write is ignored. Otherwise an ordinary write.
+                if self.reloaded_window == 0 {
+                    self.tima = v;
+                }
                 self.reload_pending = 0;
             }
             0xFF06 => {
                 self.tma = v;
+                // Written while TMA is being loaded: TIMA gets the new value.
+                if self.reloaded_window > 0 {
+                    self.tima = v;
+                }
             }
             0xFF07 => {
                 // Changing TAC can also cause a falling edge on the monitored bit.
@@ -155,6 +168,7 @@ impl Timer {
             return false;
         }
         let end = counter + ticks;
+        self.reloaded_window = self.reloaded_window.saturating_sub(ticks.min(0xFF) as u8);
         if enabled {
             // Falling edges of the selected bit = multiples of 2^(bit+1) crossed.
             // 0x10000 is such a multiple, so u16 wraparound needs no care.
@@ -173,11 +187,15 @@ impl Timer {
     fn advance_ticks(&mut self, ticks: u32) {
         for _ in 0..ticks {
             // Process reload window first (reload_pending counts down in t-cycles).
+            if self.reloaded_window > 0 {
+                self.reloaded_window -= 1;
+            }
             if self.reload_pending > 0 {
                 self.reload_pending -= 1;
                 if self.reload_pending == 0 {
                     self.tima = self.tma;
                     self.interrupt |= 0x04;
+                    self.reloaded_window = RELOADED_WINDOW;
                 }
             }
 
