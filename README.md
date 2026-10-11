@@ -17,7 +17,7 @@ On Linux systems, some system dependencies are required:
 
 Run with `cargo r --release`, or run the executable in `target\release`. Select your ROM (.gb, .gbc, or a .zip containing one) using the GUI, drag it onto the window, or pass its path as the first argument.
 
-Supports saving in-game (battery-backed RAM) or with savestates. Gamepads are supported (bindings under Settings > Keybindings), as are GameShark RAM cheats (Emulation > Cheats).
+Supports saving in-game (battery-backed RAM) or with savestates. Gamepads are supported (bindings under Settings > Keybindings; the right stick tilts MBC7 games like Kirby Tilt 'n' Tumble), as are GameShark RAM cheats (Emulation > Cheats).
 
 Files written next to the ROM: `<rom>.gbsave` (battery RAM, interchangeable with other emulators), `<rom>.state` (session auto-save), and `<rom>.slotN.state` (save-state slots). `config.json` and `crash.log` are written next to the executable.
 

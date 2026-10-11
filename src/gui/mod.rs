@@ -98,6 +98,8 @@ struct Running {
     resolved_gamepad: ResolvedBindings,
     gamepad_capturing: Option<BindTarget>,
     direction_mux: DirectionMux,
+    /// Right-stick tilt sent to MBC7 cartridges, in g.
+    tilt: (f32, f32),
     bind_tab: BindTab,
     rewinding: bool,
     toasts: ToastQueue,
@@ -454,6 +456,7 @@ impl RootApp {
                 resolved_gamepad: crate::gamepad::resolve(&cfg.gamepad),
                 gamepad_capturing: None,
                 direction_mux: DirectionMux::default(),
+                tilt: (0.0, 0.0),
                 bind_tab: BindTab::Keyboard,
                 rewinding: false,
                 toasts,
@@ -623,6 +626,7 @@ impl RootApp {
                 resolved_gamepad,
                 gamepad_capturing,
                 direction_mux,
+                tilt,
                 toasts,
                 .. } = &mut **running;
             // (button, pressed) pairs to dispatch; axis events fill `transitions`.
@@ -663,6 +667,16 @@ impl RootApp {
                 EventType::AxisChanged(Axis::LeftStickY, v, _) => {
                     direction_mux.set_stick_y(v, &mut transitions);
                     any_activity |= !transitions.is_empty();
+                }
+                // Right stick tilts MBC7 (accelerometer) cartridges. gilrs Y
+                // is up-positive; the cart's Y grows tilting toward the player.
+                EventType::AxisChanged(Axis::RightStickX, v, _) => {
+                    tilt.0 = v;
+                    let _ = sender.send(GBEvent::Tilt(tilt.0, tilt.1));
+                }
+                EventType::AxisChanged(Axis::RightStickY, v, _) => {
+                    tilt.1 = -v;
+                    let _ = sender.send(GBEvent::Tilt(tilt.0, tilt.1));
                 }
                 // An unplugged pad never sends its releases.
                 EventType::Disconnected => {

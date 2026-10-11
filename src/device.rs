@@ -410,6 +410,13 @@ impl Device {
         self.cpu.mmu.gpu.set_raw_cgb_colors(!on);
     }
 
+    /// Tilt for MBC7 (accelerometer) cartridges, in g per axis: x positive
+    /// tilting right, y positive tilting toward the player. Ignored by other
+    /// cartridges.
+    pub fn set_tilt(&mut self, x: f32, y: f32) {
+        self.cpu.mmu.mbc.set_tilt(x, y);
+    }
+
     /// Whether a rumble cartridge is currently driving its motor.
     pub fn rumble(&self) -> bool {
         self.cpu.mmu.mbc.rumble()

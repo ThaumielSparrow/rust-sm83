@@ -10,6 +10,7 @@ mod mbc2;
 mod mbc3;
 mod mbc5;
 mod huc1;
+mod mbc7;
 
 pub trait MBC: Send {
     fn readrom(&self, a: u16) -> u8;
@@ -31,6 +32,10 @@ pub trait MBC: Send {
     /// Advance cartridge hardware clocked by the system (the MBC3 RTC) by
     /// `ticks` real-time T-cycles (4.194304 MHz).
     fn tick(&mut self, _ticks: u32) {}
+
+    /// MBC7 accelerometer input from the host, in g per axis (x right,
+    /// y down when tilting the top away).
+    fn set_tilt(&mut self, _x: f32, _y: f32) {}
 
     /// MBC5 rumble carts: whether the motor is currently driven.
     fn rumble(&self) -> bool {
@@ -71,6 +76,7 @@ pub enum MbcState {
     Mbc3(mbc3::MBC3),
     Mbc5(mbc5::MBC5),
     HuC1(huc1::HuC1),
+    Mbc7(mbc7::MBC7),
 }
 
 /// Forward a call to whichever mapper the cartridge has.
@@ -83,6 +89,7 @@ macro_rules! dispatch {
             MbcState::Mbc3($m) => $call,
             MbcState::Mbc5($m) => $call,
             MbcState::HuC1($m) => $call,
+            MbcState::Mbc7($m) => $call,
         }
     };
 }
@@ -124,6 +131,9 @@ impl MBC for MbcState {
     fn tick(&mut self, ticks: u32) {
         dispatch!(self, m => m.tick(ticks))
     }
+    fn set_tilt(&mut self, x: f32, y: f32) {
+        dispatch!(self, m => m.set_tilt(x, y))
+    }
 }
 
 pub fn get_mbc(data: Vec<u8>, skip_checksum: bool) -> StrResult<MbcState> {
@@ -139,6 +149,7 @@ pub fn get_mbc(data: Vec<u8>, skip_checksum: bool) -> StrResult<MbcState> {
         0x05..=0x06 => mbc2::MBC2::new(data).map(MbcState::Mbc2),
         0x0F..=0x13 => mbc3::MBC3::new(data).map(MbcState::Mbc3),
         0x19..=0x1E => mbc5::MBC5::new(data).map(MbcState::Mbc5),
+        0x22 => mbc7::MBC7::new(data).map(MbcState::Mbc7),
         0xFF => huc1::HuC1::new(data).map(MbcState::HuC1),
         _ => Err("Unsupported MBC type"),
     }
@@ -241,6 +252,10 @@ impl MBC for FileBackedMBC {
 
     fn tick(&mut self, ticks: u32) {
         self.mbc.tick(ticks)
+    }
+
+    fn set_tilt(&mut self, x: f32, y: f32) {
+        self.mbc.set_tilt(x, y)
     }
 
     fn take_rom(&mut self) -> Vec<u8> {
@@ -386,6 +401,13 @@ impl MBC for Cartridge {
         match self {
             Cartridge::Memory(mbc) => mbc.tick(ticks),
             Cartridge::FileBacked(mbc) => mbc.tick(ticks),
+        }
+    }
+
+    fn set_tilt(&mut self, x: f32, y: f32) {
+        match self {
+            Cartridge::Memory(mbc) => mbc.set_tilt(x, y),
+            Cartridge::FileBacked(mbc) => mbc.set_tilt(x, y),
         }
     }
 
