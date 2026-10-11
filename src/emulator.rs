@@ -53,6 +53,8 @@ pub enum GuiEvent {
     LoadStateResult { slot: u8, error: Option<&'static str> },
     BatterySaveFailed,
     UndoLoadResult { ok: bool },
+    /// Rumble cartridge motor turned on/off.
+    Rumble(bool),
 }
 
 /// Number of emulated frames between background battery-RAM saves. At ~60 fps
@@ -258,6 +260,7 @@ fn run_loop(
     let mut cheats: Vec<crate::cheats::PokeOp> = Vec::new();
     // State from just before the last successful slot load ("undo load").
     let mut undo_load: Option<Vec<u8>> = None;
+    let mut rumbling = false;
 
     'outer: loop {
         if rewinding {
@@ -309,6 +312,13 @@ fn run_loop(
                 ticks -= frame_target;
                 frame_count += 1;
                 apply_cheats(cpu, &cheats);
+                // Games pulse the motor many times per frame to vary strength;
+                // the GUI only gets on/off as of the frame boundary.
+                if cpu.rumble() != rumbling {
+                    rumbling = !rumbling;
+                    let _ = ui_sender.send(GuiEvent::Rumble(rumbling));
+                    wake();
+                }
 
                 if should_capture(frame_count, REWIND_INTERVAL_FRAMES) {
                     match cpu.snapshot_rewind_with(lz4_flex::compress_prepend_size) {

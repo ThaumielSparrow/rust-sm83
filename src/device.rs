@@ -826,6 +826,11 @@ impl Device {
         self.cpu.mmu.keypad.keydown(key);
     }
 
+    /// Whether a rumble cartridge is currently driving its motor.
+    pub fn rumble(&self) -> bool {
+        self.cpu.mmu.mbc.rumble()
+    }
+
     pub fn romname(&self) -> String {
         self.cpu.mmu.mbc.romname()
     }

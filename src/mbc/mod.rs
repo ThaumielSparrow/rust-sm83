@@ -9,6 +9,7 @@ mod mbc1;
 mod mbc2;
 mod mbc3;
 mod mbc5;
+mod huc1;
 
 pub trait MBC: Send {
     fn readrom(&self, a: u16) -> u8;
@@ -26,6 +27,11 @@ pub trait MBC: Send {
     fn take_rom(&mut self) -> Vec<u8>;
     /// Move ROM bytes back in after a rom-less restore.
     fn set_rom(&mut self, rom: Vec<u8>);
+
+    /// MBC5 rumble carts: whether the motor is currently driven.
+    fn rumble(&self) -> bool {
+        false
+    }
 
     fn get_save_path(&self) -> Option<String> {
         None // Default implementation for non-file-backed MBCs
@@ -60,107 +66,56 @@ pub enum MbcState {
     Mbc2(mbc2::MBC2),
     Mbc3(mbc3::MBC3),
     Mbc5(mbc5::MBC5),
+    HuC1(huc1::HuC1),
+}
+
+/// Forward a call to whichever mapper the cartridge has.
+macro_rules! dispatch {
+    ($self:ident, $m:ident => $call:expr) => {
+        match $self {
+            MbcState::Mbc0($m) => $call,
+            MbcState::Mbc1($m) => $call,
+            MbcState::Mbc2($m) => $call,
+            MbcState::Mbc3($m) => $call,
+            MbcState::Mbc5($m) => $call,
+            MbcState::HuC1($m) => $call,
+        }
+    };
 }
 
 impl MBC for MbcState {
     fn readrom(&self, a: u16) -> u8 {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.readrom(a),
-            MbcState::Mbc1(mbc) => mbc.readrom(a),
-            MbcState::Mbc2(mbc) => mbc.readrom(a),
-            MbcState::Mbc3(mbc) => mbc.readrom(a),
-            MbcState::Mbc5(mbc) => mbc.readrom(a),
-        }
+        dispatch!(self, m => m.readrom(a))
     }
-
     fn readram(&self, a: u16) -> u8 {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.readram(a),
-            MbcState::Mbc1(mbc) => mbc.readram(a),
-            MbcState::Mbc2(mbc) => mbc.readram(a),
-            MbcState::Mbc3(mbc) => mbc.readram(a),
-            MbcState::Mbc5(mbc) => mbc.readram(a),
-        }
+        dispatch!(self, m => m.readram(a))
     }
-
     fn writerom(&mut self, a: u16, v: u8) {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.writerom(a, v),
-            MbcState::Mbc1(mbc) => mbc.writerom(a, v),
-            MbcState::Mbc2(mbc) => mbc.writerom(a, v),
-            MbcState::Mbc3(mbc) => mbc.writerom(a, v),
-            MbcState::Mbc5(mbc) => mbc.writerom(a, v),
-        }
+        dispatch!(self, m => m.writerom(a, v))
     }
-
     fn writeram(&mut self, a: u16, v: u8) {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.writeram(a, v),
-            MbcState::Mbc1(mbc) => mbc.writeram(a, v),
-            MbcState::Mbc2(mbc) => mbc.writeram(a, v),
-            MbcState::Mbc3(mbc) => mbc.writeram(a, v),
-            MbcState::Mbc5(mbc) => mbc.writeram(a, v),
-        }
+        dispatch!(self, m => m.writeram(a, v))
     }
-
     fn check_and_reset_ram_updated(&mut self) -> bool {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.check_and_reset_ram_updated(),
-            MbcState::Mbc1(mbc) => mbc.check_and_reset_ram_updated(),
-            MbcState::Mbc2(mbc) => mbc.check_and_reset_ram_updated(),
-            MbcState::Mbc3(mbc) => mbc.check_and_reset_ram_updated(),
-            MbcState::Mbc5(mbc) => mbc.check_and_reset_ram_updated(),
-        }
+        dispatch!(self, m => m.check_and_reset_ram_updated())
     }
-
     fn is_battery_backed(&self) -> bool {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.is_battery_backed(),
-            MbcState::Mbc1(mbc) => mbc.is_battery_backed(),
-            MbcState::Mbc2(mbc) => mbc.is_battery_backed(),
-            MbcState::Mbc3(mbc) => mbc.is_battery_backed(),
-            MbcState::Mbc5(mbc) => mbc.is_battery_backed(),
-        }
+        dispatch!(self, m => m.is_battery_backed())
     }
-
     fn loadram(&mut self, ramdata: &[u8]) -> StrResult<()> {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.loadram(ramdata),
-            MbcState::Mbc1(mbc) => mbc.loadram(ramdata),
-            MbcState::Mbc2(mbc) => mbc.loadram(ramdata),
-            MbcState::Mbc3(mbc) => mbc.loadram(ramdata),
-            MbcState::Mbc5(mbc) => mbc.loadram(ramdata),
-        }
+        dispatch!(self, m => m.loadram(ramdata))
     }
-
     fn dumpram(&self) -> Vec<u8> {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.dumpram(),
-            MbcState::Mbc1(mbc) => mbc.dumpram(),
-            MbcState::Mbc2(mbc) => mbc.dumpram(),
-            MbcState::Mbc3(mbc) => mbc.dumpram(),
-            MbcState::Mbc5(mbc) => mbc.dumpram(),
-        }
+        dispatch!(self, m => m.dumpram())
     }
-
     fn take_rom(&mut self) -> Vec<u8> {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.take_rom(),
-            MbcState::Mbc1(mbc) => mbc.take_rom(),
-            MbcState::Mbc2(mbc) => mbc.take_rom(),
-            MbcState::Mbc3(mbc) => mbc.take_rom(),
-            MbcState::Mbc5(mbc) => mbc.take_rom(),
-        }
+        dispatch!(self, m => m.take_rom())
     }
-
     fn set_rom(&mut self, rom: Vec<u8>) {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.set_rom(rom),
-            MbcState::Mbc1(mbc) => mbc.set_rom(rom),
-            MbcState::Mbc2(mbc) => mbc.set_rom(rom),
-            MbcState::Mbc3(mbc) => mbc.set_rom(rom),
-            MbcState::Mbc5(mbc) => mbc.set_rom(rom),
-        }
+        dispatch!(self, m => m.set_rom(rom))
+    }
+    fn rumble(&self) -> bool {
+        dispatch!(self, m => m.rumble())
     }
 }
 
@@ -172,11 +127,12 @@ pub fn get_mbc(data: Vec<u8>, skip_checksum: bool) -> StrResult<MbcState> {
         check_checksum(&data)?;
     }
     match data[0x147] {
-        0x00 => mbc0::MBC0::new(data).map(MbcState::Mbc0),
+        0x00 | 0x08 | 0x09 => mbc0::MBC0::new(data).map(MbcState::Mbc0),
         0x01..=0x03 => mbc1::MBC1::new(data).map(MbcState::Mbc1),
         0x05..=0x06 => mbc2::MBC2::new(data).map(MbcState::Mbc2),
         0x0F..=0x13 => mbc3::MBC3::new(data).map(MbcState::Mbc3),
         0x19..=0x1E => mbc5::MBC5::new(data).map(MbcState::Mbc5),
+        0xFF => huc1::HuC1::new(data).map(MbcState::HuC1),
         _ => Err("Unsupported MBC type"),
     }
 }
@@ -260,6 +216,10 @@ impl MBC for FileBackedMBC {
 
     fn get_save_path(&self) -> Option<String> {
         Some(self.rampath.clone())
+    }
+
+    fn rumble(&self) -> bool {
+        self.mbc.rumble()
     }
 
     fn take_rom(&mut self) -> Vec<u8> {
@@ -371,6 +331,13 @@ impl MBC for Cartridge {
         match self {
             Cartridge::Memory(mbc) => mbc.get_save_path(),
             Cartridge::FileBacked(mbc) => mbc.get_save_path(),
+        }
+    }
+
+    fn rumble(&self) -> bool {
+        match self {
+            Cartridge::Memory(mbc) => mbc.rumble(),
+            Cartridge::FileBacked(mbc) => mbc.rumble(),
         }
     }
 

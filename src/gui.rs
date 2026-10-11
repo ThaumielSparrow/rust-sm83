@@ -305,6 +305,10 @@ pub struct RootApp {
     window_pos: Option<(i32, i32)>,
     /// Lets the emulator thread wake the (otherwise sleeping) event loop.
     proxy: EventLoopProxy<UserEvent>,
+    /// Rumble cart motor change from the emulator, applied in about_to_wait.
+    pending_rumble: Option<bool>,
+    /// Playing force-feedback effect while a rumble cart's motor is on.
+    rumble_effect: Option<gilrs::ff::Effect>,
 }
 
 /// How often to retry opening an audio device while there is none.
@@ -358,6 +362,8 @@ impl RootApp {
             cheat_window: None,
             recent_roms: cfg.recent_roms,
             proxy,
+            pending_rumble: None,
+            rumble_effect: None,
             window_pos: cfg.window_pos,
         }
     }
@@ -632,6 +638,38 @@ impl RootApp {
         }
     }
 
+    /// Mirror a rumble cartridge's motor on every force-feedback gamepad.
+    fn set_rumble(&mut self, on: bool) {
+        // Dropping the effect stops it.
+        self.rumble_effect = None;
+        let Some(gilrs) = self.gilrs.as_mut() else {
+            return;
+        };
+        if !on {
+            return;
+        }
+        let pads: Vec<_> = gilrs
+            .gamepads()
+            .filter(|(_, g)| g.is_ff_supported())
+            .map(|(id, _)| id)
+            .collect();
+        if pads.is_empty() {
+            return;
+        }
+        let effect = gilrs::ff::EffectBuilder::new()
+            .add_effect(gilrs::ff::BaseEffect {
+                kind: gilrs::ff::BaseEffectType::Strong { magnitude: 40_000 },
+                ..Default::default()
+            })
+            .gamepads(&pads)
+            .finish(gilrs);
+        match effect {
+            Ok(e) if e.play().is_ok() => self.rumble_effect = Some(e),
+            Ok(_) => {}
+            Err(e) => crate::log::warn(format!("rumble unavailable: {e}")),
+        }
+    }
+
     /// Recover audio when the output device goes away (e.g. headphones
     /// unplugged) or appears after starting without one: open the current
     /// default device and hand the emulator a new player. APU state is kept.
@@ -693,6 +731,7 @@ impl RootApp {
     /// in `Running` (with `emu_thread = None`) so the caller can immediately transition
     /// to a new phase (Selecting or another Running via `start_game_from_path`).
     pub fn stop_emulator(&mut self) {
+        self.rumble_effect = None;
         let handle = match &mut self.phase {
             RootPhase::Running { sender, emu_thread, .. } => {
                 let _ = sender.send(GBEvent::Shutdown);
@@ -1520,7 +1559,7 @@ impl ApplicationHandler<UserEvent> for RootApp {
                 if !*running {
                     return;
                 }
-                drain_gui_events(ui_receiver, save_slots, toasts);
+                drain_gui_events(ui_receiver, save_slots, toasts, &mut self.pending_rumble);
                 // Deferred actions set inside the egui closure or below, applied after the borrow ends.
                 let mut quit_requested = false;
                 let mut reset_clicked = false;
@@ -1864,7 +1903,7 @@ impl ApplicationHandler<UserEvent> for RootApp {
             if !*running {
                 return;
             }
-            drain_gui_events(ui_receiver, save_slots, toasts);
+            drain_gui_events(ui_receiver, save_slots, toasts, &mut self.pending_rumble);
             // Toasts animate even when no frames arrive (e.g. paused).
             if !toasts.is_empty() {
                 if let Some(w) = &self.window {
@@ -1888,6 +1927,9 @@ impl ApplicationHandler<UserEvent> for RootApp {
                     event_loop.exit();
                 }
             }
+        }
+        if let Some(on) = self.pending_rumble.take() {
+            self.set_rumble(on);
         }
         // Gamepad-triggered Reset is queued as a pending action; window_event's
         // drain won't run until the next OS event, so drain here too.
@@ -2028,6 +2070,7 @@ fn drain_gui_events(
     receiver: &Receiver<GuiEvent>,
     save_slots: &mut SaveSlotCache,
     toasts: &mut ToastQueue,
+    rumble: &mut Option<bool>,
 ) {
     loop {
         match receiver.try_recv() {
@@ -2045,6 +2088,7 @@ fn drain_gui_events(
             Ok(GuiEvent::LoadStateResult { slot, error: Some(e) }) => {
                 toasts.push(format!("Couldn't load state {slot}: {e}"), ToastKind::Error);
             }
+            Ok(GuiEvent::Rumble(on)) => *rumble = Some(on),
             Ok(GuiEvent::UndoLoadResult { ok: true }) => {
                 toasts.push("Load undone", ToastKind::Success);
             }

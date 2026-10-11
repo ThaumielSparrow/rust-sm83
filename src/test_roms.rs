@@ -318,6 +318,7 @@ mod mooneye {
         emulator_only_mbc1_bits_bank2 = "emulator-only/mbc1/bits_bank2.gb",
         emulator_only_mbc1_bits_mode = "emulator-only/mbc1/bits_mode.gb",
         emulator_only_mbc1_bits_ramg = "emulator-only/mbc1/bits_ramg.gb",
+        emulator_only_mbc1_multicart_rom_8mb = "emulator-only/mbc1/multicart_rom_8Mb.gb",
         emulator_only_mbc1_ram_256kb = "emulator-only/mbc1/ram_256kb.gb",
         emulator_only_mbc1_ram_64kb = "emulator-only/mbc1/ram_64kb.gb",
         emulator_only_mbc1_rom_1mb = "emulator-only/mbc1/rom_1Mb.gb",

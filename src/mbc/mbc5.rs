@@ -14,6 +14,8 @@ pub struct MBC5 {
     rombanks: usize,
     rambanks: usize,
     has_rumble: bool,
+    /// Rumble carts: motor state (bit 3 of the last RAM-bank write).
+    rumble_on: bool,
 }
 
 impl MBC5 {
@@ -45,6 +47,7 @@ impl MBC5 {
             rombanks: rombanks,
             rambanks: rambanks,
             has_rumble: has_rumble,
+            rumble_on: false,
         };
 
         Ok(res)
@@ -78,15 +81,17 @@ impl MBC for MBC5 {
                     ((self.rombank & 0x0FF) | (((v & 0x1) as usize) << 8)) % self.rombanks
             }
             0x4000..=0x5FFF => {
+                // Bit 3 on rumble carts drives the motor, not the RAM bank.
+                if self.has_rumble {
+                    self.rumble_on = v & 0x08 != 0;
+                }
                 if self.rambanks == 0 {
-                    return; // no RAM; rumble bit, if any, has no host effect
+                    return;
                 }
                 let bank_mask: usize = if self.has_rumble { 0x07 } else { 0x0F };
                 if self.rambanks > 1 {
                     self.rambank = (v as usize) & bank_mask;
                 }
-                // Bit 3 on rumble carts drives the motor; we don't implement physical rumble,
-                // but it must NOT be routed into rambank.
             }
             0x6000..=0x7FFF => { /* ? */ }
             _ => (),
@@ -126,6 +131,10 @@ impl MBC for MBC5 {
         result
     }
 
+    fn rumble(&self) -> bool {
+        self.rumble_on
+    }
+
     fn take_rom(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.rom)
     }
@@ -147,6 +156,15 @@ mod test {
         // 32 KiB RAM (4 banks)
         rom[0x149] = 0x03;
         rom
+    }
+
+    #[test]
+    fn mbc5_rumble_bit_drives_the_motor() {
+        let mut mbc = MBC5::new(rumble_cart_4_banks()).unwrap();
+        mbc.writerom(0x4000, 0x08);
+        assert!(mbc.rumble());
+        mbc.writerom(0x4000, 0x01);
+        assert!(!mbc.rumble());
     }
 
     #[test]
