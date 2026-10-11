@@ -772,6 +772,26 @@ impl Sound {
         self.on = true;
     }
 
+    /// Put the APU in the state the boot ROM leaves it in (Pan Docs power-up
+    /// table): powered, registers as written by the boot chime, channel 1
+    /// still "on" but faded to silence. Trigger bits are not replayed, so the
+    /// game doesn't start with a stray beep.
+    pub fn apply_post_boot_state(&mut self) {
+        self.set_on();
+        const REGS: [(u16, u8); 20] = [
+            (0xFF10, 0x80), (0xFF11, 0xBF), (0xFF12, 0xF3), (0xFF13, 0xFF), (0xFF14, 0x3F),
+            (0xFF16, 0x3F), (0xFF17, 0x00), (0xFF18, 0xFF), (0xFF19, 0x3F),
+            (0xFF1A, 0x7F), (0xFF1B, 0xFF), (0xFF1C, 0x9F), (0xFF1D, 0xFF), (0xFF1E, 0x3F),
+            (0xFF20, 0xFF), (0xFF21, 0x00), (0xFF22, 0x00), (0xFF23, 0x3F),
+            (0xFF24, 0x77), (0xFF25, 0xF3),
+        ];
+        for (a, v) in REGS {
+            self.wb(a, v);
+        }
+        self.channel1.active = true;
+        self.channel1.volume_envelope.volume = 0;
+    }
+
     /// Reset the frame-sequencer phase (DIV-APU). Called by the MMU on writes
     /// to FF04 (DIV), since the DIV-APU is clocked from a tap on the DIV
     /// register. This resets the phase so games that reset DIV to resync music

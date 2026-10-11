@@ -790,12 +790,10 @@ impl Device {
         };
         if is_on {
             if let Some(sound) = self.cpu.mmu.sound.as_mut() {
-                sound.set_on();
                 // MMU::set_initial ran before any Sound existed, so its
-                // post-boot NR50/NR51 writes were dropped. Without NR51 every
-                // channel stays unrouted until the game writes it itself.
-                sound.wb(0xFF24, 0x77);
-                sound.wb(0xFF25, 0xF3);
+                // post-boot APU writes were dropped; apply them now. (Without
+                // NR51 every channel stays unrouted until the game writes it.)
+                sound.apply_post_boot_state();
             }
         }
     }

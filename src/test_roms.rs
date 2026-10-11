@@ -48,9 +48,7 @@ fn load(path: &str, cgb: bool) -> CPU {
     } else {
         crate::apu::Sound::new_cgb(Box::new(NullPlayer))
     };
-    sound.set_on();
-    sound.wb(0xFF24, 0x77);
-    sound.wb(0xFF25, 0xF3);
+    sound.apply_post_boot_state();
     cpu.mmu.sound = Some(sound);
     cpu
 }
@@ -255,7 +253,7 @@ mod mooneye {
         acceptance_bits_reg_f = "acceptance/bits/reg_f.gb",
         acceptance_bits_unused_hwio_gs = "acceptance/bits/unused_hwio-GS.gb",
         acceptance_boot_div_dmgabcmgb = "acceptance/boot_div-dmgABCmgb.gb",
-        #[ignore = "post-boot register/DIV state differs"] acceptance_boot_hwio_dmgabcmgb = "acceptance/boot_hwio-dmgABCmgb.gb",
+        acceptance_boot_hwio_dmgabcmgb = "acceptance/boot_hwio-dmgABCmgb.gb",
         acceptance_boot_regs_dmgabc = "acceptance/boot_regs-dmgABC.gb",
         acceptance_call_cc_timing = "acceptance/call_cc_timing.gb",
         acceptance_call_cc_timing2 = "acceptance/call_cc_timing2.gb",
@@ -343,7 +341,7 @@ mod mooneye {
     rom_tests!(run_mooneye, true, "mooneye", [
         misc_bits_unused_hwio_c = "misc/bits/unused_hwio-C.gb",
         #[ignore = "post-boot register/DIV state differs"] misc_boot_div_cgbabcde = "misc/boot_div-cgbABCDE.gb",
-        #[ignore = "post-boot register/DIV state differs"] misc_boot_hwio_c = "misc/boot_hwio-C.gb",
+        misc_boot_hwio_c = "misc/boot_hwio-C.gb",
         misc_boot_regs_cgb = "misc/boot_regs-cgb.gb",
         #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] misc_ppu_vblank_stat_intr_c = "misc/ppu/vblank_stat_intr-C.gb",
     ]);
@@ -412,4 +410,5 @@ fn bench() {
         println!("{path}: 60 emulated s in {secs:.3} s ({:.0}x realtime)", 60.0 / secs);
     }
 }
+
 

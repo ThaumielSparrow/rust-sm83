@@ -198,6 +198,14 @@ impl GPU {
         }
     }
 
+    /// Move the PPU to `dots` into line 0 (its position when the boot ROM
+    /// hands over), with the mode that position implies.
+    pub fn set_post_boot_clock(&mut self, dots: u32) {
+        self.line = 0;
+        self.modeclock = dots;
+        self.mode = if dots <= 80 { 2 } else if dots <= 80 + 172 { 3 } else { 0 };
+    }
+
     /// Dots until the next mode or line change, i.e. the next point where an
     /// interrupt could be raised. `u32::MAX` while the LCD is off; 0 if the
     /// mode is out of step with the clock (it will be fixed on the next step,
@@ -300,6 +308,12 @@ impl GPU {
             0xFF4B => self.winx,
             0xFF4C => 0xFF,
             0xFF4E => 0xFF,
+            // CGB hardware running a DMG cart: VBK reads as bank 0, fixed, and
+            // the palette index registers keep where the boot ROM's
+            // colorization writes left them (they're locked afterwards).
+            0xFF4F if self.gbmode == GbMode::ColorAsClassic => 0xFE,
+            0xFF68 if self.gbmode == GbMode::ColorAsClassic => 0xC8,
+            0xFF6A if self.gbmode == GbMode::ColorAsClassic => 0xD0,
             0xFF4F..=0xFF6B if self.gbmode != GbMode::Color => 0xFF,
             0xFF4F => self.vrambank as u8 | 0xFE,
             0xFF68 => 0x40 | self.cbgpal_ind | (if self.cbgpal_inc { 0x80 } else { 0 }),

@@ -100,6 +100,10 @@ impl MMU {
             return Err("This game does not work in Classic mode");
         }
         res.set_initial();
+        res.gpu.set_post_boot_clock(0);
+        // P1: the DMG boot ROM leaves both select lines low (reads 0xCF); the
+        // CGB one leaves them high (0xFF, the power-on value).
+        res.wb(0xFF00, 0x00);
         // Where the DMG boot ROM leaves the divider at PC=0x0100 (DIV = 0xAB),
         // calibrated against Mooneye boot_div-dmgABCmgb.
         res.timer.set_internal_counter(0xABC8);
@@ -141,6 +145,7 @@ impl MMU {
         fill_random(&mut res.wram, 42);
         res.determine_mode();
         res.set_initial();
+        res.gpu.set_post_boot_clock(0);
         Ok(res)
     }
 
@@ -175,6 +180,8 @@ impl MMU {
         self.wb(0xFF49, 0xFF);
         self.wb(0xFF4A, 0);
         self.wb(0xFF4B, 0);
+        // IF: the VBlank flag from the boot ROM's last frame is still set.
+        self.intf = 0x01;
     }
 
     fn determine_mode(&mut self) {
@@ -250,6 +257,8 @@ impl MMU {
             0xFF04..=0xFF07 => self.timer.rb(address),
             0xFF0F => self.intf | 0b11100000,
             0xFF10..=0xFF3F => self.sound.as_mut().map_or(0xFF, |s| s.rb(address)),
+            // CGB hardware running a DMG cart: VBK reads as bank 0, fixed.
+            0xFF4F if self.gbmode == GbMode::ColorAsClassic => 0xFE,
             0xFF4D | 0xFF4F | 0xFF51..=0xFF55 | 0xFF6C | 0xFF70 if self.gbmode != GbMode::Color => {
                 0xFF
             }
