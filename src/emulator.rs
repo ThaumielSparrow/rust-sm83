@@ -18,6 +18,7 @@ pub enum GBEvent {
     LoadState(u8),
     /// Go back to the state from just before the last LoadState.
     UndoLoad,
+    SetColorCorrection(bool),
     UpdateTurbo(crate::config::TurboSetting),
     UpdateVolume(f32), // master volume 0.0-1.0
     SetPaused(bool),
@@ -392,6 +393,7 @@ fn run_loop(
                         wake();
                         ring.clear();
                     }
+                    GBEvent::SetColorCorrection(on) => cpu.set_cgb_color_correction(on),
                     GBEvent::UndoLoad => {
                         let ok = undo_load.take().is_some_and(|snap| cpu.restore_rewind(&snap).is_ok());
                         if ok {

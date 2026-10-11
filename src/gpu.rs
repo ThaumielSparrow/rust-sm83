@@ -19,9 +19,13 @@ fn put(line: &mut [u8], x: usize, rgb: [u8; 3]) {
     line[x * 3..x * 3 + 3].copy_from_slice(&rgb);
 }
 
-/// CGB 15-bit color (5 bits per channel) to display RGB, with the color
-/// correction taken from the Gambatte emulator.
-fn cgb_rgb(r: u8, g: u8, b: u8) -> [u8; 3] {
+/// CGB 15-bit color (5 bits per channel) to display RGB: either plain
+/// 5-to-8-bit expansion, or with the LCD color correction taken from the
+/// Gambatte emulator.
+fn cgb_rgb(r: u8, g: u8, b: u8, raw: bool) -> [u8; 3] {
+    if raw {
+        return [(r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2)];
+    }
     let (r, g, b) = (r as u32, g as u32, b as u32);
     [
         ((r * 13 + g * 2 + b) >> 1) as u8,
@@ -94,6 +98,10 @@ pub struct GPU {
     frame_buffers: [Vec<u8>; 2],
     #[rkyv(with = rkyv::with::Skip)]
     front: usize, // index of front buffer (0 or 1)
+    /// Host display preference, not state: CGB colors get the LCD color
+    /// correction (default) or are shown raw.
+    #[rkyv(with = rkyv::with::Skip)]
+    raw_cgb_colors: bool,
     bgprio: [PrioType; SCREEN_W],
     pub updated: bool,
     pub interrupt: u8,
@@ -159,6 +167,7 @@ impl GPU {
             first_frame: false,
             mode3_len: 172,
             first_line_after_on: false,
+            raw_cgb_colors: false,
             prev_stat_signal: false,
         }
     }
@@ -600,9 +609,9 @@ impl GPU {
             for p in 0..8 {
                 for c in 0..4 {
                     let [r, g, b] = self.cbgpal[p][c];
-                    luts.bg[p * 4 + c] = cgb_rgb(r, g, b);
+                    luts.bg[p * 4 + c] = cgb_rgb(r, g, b, self.raw_cgb_colors);
                     let [r, g, b] = self.csprit[p][c];
-                    luts.obj[p * 4 + c] = cgb_rgb(r, g, b);
+                    luts.obj[p * 4 + c] = cgb_rgb(r, g, b, self.raw_cgb_colors);
                 }
             }
         } else {
@@ -844,6 +853,11 @@ impl GPU {
     pub fn adopt_frame_buffers(&mut self, live: &mut GPU) {
         std::mem::swap(&mut self.frame_buffers, &mut live.frame_buffers);
         self.front = live.front;
+        self.raw_cgb_colors = live.raw_cgb_colors;
+    }
+
+    pub fn set_raw_cgb_colors(&mut self, raw: bool) {
+        self.raw_cgb_colors = raw;
     }
 
     /// Returns the current front (display) frame buffer.
@@ -950,5 +964,12 @@ mod tests {
         gpu.renderscan();
         let back = &gpu.frame_buffers[gpu.front ^ 1];
         assert_eq!(back[0], 255, "window must be blanked when LCDC.0 = 0 on DMG");
+    }
+
+    #[test]
+    fn raw_cgb_colors_expand_5_to_8_bits() {
+        assert_eq!(cgb_rgb(31, 31, 31, true), [255, 255, 255]);
+        assert_eq!(cgb_rgb(0, 16, 1, true), [0, 132, 8]);
+        assert_ne!(cgb_rgb(31, 0, 0, false), cgb_rgb(31, 0, 0, true), "correction mixes channels");
     }
 }

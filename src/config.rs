@@ -167,6 +167,8 @@ pub struct Config {
     #[serde(default)] pub screen_filter: ScreenFilter,
     /// Darken the edges of each Game Boy pixel, like the original LCD.
     #[serde(default)] pub lcd_grid: bool,
+    /// Apply the CGB LCD color correction (off = raw 15-bit colors).
+    #[serde(default = "default_true")] pub cgb_color_correction: bool,
 }
 
 /// How the 160x144 frame is scaled up to the window.
@@ -234,6 +236,7 @@ impl Default for Config {
             pause_on_focus_loss: false,
             screen_filter: ScreenFilter::default(),
             lcd_grid: false,
+            cgb_color_correction: true,
         }
     }
 }

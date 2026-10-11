@@ -847,6 +847,12 @@ impl Device {
         self.cpu.mmu.keypad.keydown(key);
     }
 
+    /// Show CGB colors with (default) or without LCD color correction.
+    /// Display-only; not part of save states.
+    pub fn set_cgb_color_correction(&mut self, on: bool) {
+        self.cpu.mmu.gpu.set_raw_cgb_colors(!on);
+    }
+
     /// Whether a rumble cartridge is currently driving its motor.
     pub fn rumble(&self) -> bool {
         self.cpu.mmu.mbc.rumble()

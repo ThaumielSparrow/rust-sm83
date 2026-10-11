@@ -63,6 +63,7 @@ struct Running {
     latest_frame: Option<Arc<Vec<u8>>>,
     renderoptions: RenderOptions,
     screen: ScreenRenderer,
+    cgb_color_correction: bool,
     running: bool,
     keybindings: KeyBindings,
     capturing: Option<rust_gbe::KeypadKey>,
@@ -425,6 +426,7 @@ impl RootApp {
                     lcd_grid: cfg.lcd_grid,
                 },
                 screen: ScreenRenderer::new(display),
+                cgb_color_correction: cfg.cgb_color_correction,
                 running: true,
                 keybindings: cfg.keybindings.clone(),
                 capturing: None,
@@ -468,6 +470,7 @@ impl RootApp {
             if let RootPhase::Running(running) = &self.phase {
                 let Running { sender, cheats, .. } = & **running;
                 let _ = sender.send(GBEvent::UpdateTurbo(cfg.turbo));
+                let _ = sender.send(GBEvent::SetColorCorrection(cfg.cgb_color_correction));
                 let _ = sender.send(GBEvent::UpdateVolume(perceptual_to_linear(cfg.volume)));
                 let _ = sender.send(GBEvent::SetCheats(crate::cheats::enabled_pokes(cheats)));
             }
@@ -1137,6 +1140,7 @@ impl ApplicationHandler<UserEvent> for RootApp {
                 let Running { sender,
                     texture,
                     screen,
+                    cgb_color_correction,
                     receiver,
                     ui_receiver,
                     save_slots,
@@ -1269,6 +1273,14 @@ impl ApplicationHandler<UserEvent> for RootApp {
                                     if ui.checkbox(&mut renderoptions.lcd_grid, "LCD grid").changed() {
                                         let on = renderoptions.lcd_grid;
                                         crate::config::update_config(|c| c.lcd_grid = on);
+                                    }
+                                    if ui
+                                        .add_enabled(is_color_ro, egui::Checkbox::new(cgb_color_correction, "CGB color correction"))
+                                        .changed()
+                                    {
+                                        let on = *cgb_color_correction;
+                                        let _ = sender.send(GBEvent::SetColorCorrection(on));
+                                        crate::config::update_config(|c| c.cgb_color_correction = on);
                                     }
                                     if ui.checkbox(integer_scaling, "Integer scaling").changed() {
                                         let on = *integer_scaling;
