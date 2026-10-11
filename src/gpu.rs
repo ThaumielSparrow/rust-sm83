@@ -6,6 +6,12 @@ const VOAM_SIZE: usize = 0xA0;
 pub const SCREEN_W: usize = 160;
 pub const SCREEN_H: usize = 144;
 
+/// Dots before mode 3 at which the PPU already locks VRAM.
+const VRAM_LOCK_LEAD: u32 = 4;
+
+/// Dots at the start of lines 1-143 during which STAT still reads mode 0.
+const LINE_START_STAT_MODE0: u32 = 4;
+
 /// Dots by which the mode 0 STAT interrupt precedes the mode bits changing
 /// (calibrated against Mooneye intr_2_0_timing and hblank_ly_scx_timing).
 const MODE0_IRQ_LEAD: u32 = 1;
@@ -245,6 +251,19 @@ impl GPU {
         }
     }
 
+    /// Mode as STAT reports it: at the start of lines 1-143 the OAM scan has
+    /// begun (OAM is locked, the mode 2 IRQ fired) but STAT still reads mode
+    /// 0 for a moment (Mooneye lcdon_timing).
+    fn stat_mode_bits(&self) -> u8 {
+        if self.at_line_start() { 0 } else { self.mode }
+    }
+
+    /// The first dots of lines 1-143, where STAT still reads mode 0 and the
+    /// LY=LYC bit hasn't been re-evaluated for the new LY yet.
+    fn at_line_start(&self) -> bool {
+        self.mode == 2 && self.line > 0 && self.line < 144 && self.modeclock < LINE_START_STAT_MODE0
+    }
+
     /// Dot at which the mode 0 STAT interrupt is raised on this line.
     fn mode0_irq_dot(&self) -> u32 {
         81 + self.mode3_len - MODE0_IRQ_LEAD
@@ -297,7 +316,28 @@ impl GPU {
 
     /// The PPU owns VRAM while drawing (mode 3): CPU access is cut off.
     pub fn vram_blocked(&self) -> bool {
-        self.lcd_on && self.mode == 3
+        self.lcd_on
+            && (self.mode == 3
+                // The fetcher claims VRAM just before STAT reports mode 3.
+                || (self.mode == 2 && self.modeclock + VRAM_LOCK_LEAD > 80))
+    }
+
+    /// The M-cycle in which the PPU hands over from the OAM scan to drawing:
+    /// VRAM reads are already locked, but writes still land in both VRAM and
+    /// OAM (Mooneye lcdon_write_timing).
+    fn at_scan_handoff(&self) -> bool {
+        self.mode == 2 && self.modeclock + VRAM_LOCK_LEAD > 80 && self.modeclock <= 80
+    }
+
+    /// CPU writes lose VRAM a cycle after reads do.
+    pub fn vram_write_blocked(&self) -> bool {
+        self.vram_blocked() && !self.at_scan_handoff()
+    }
+
+    /// CPU writes to OAM still land in the first cycle of a line and in the
+    /// scan-to-draw handoff cycle; otherwise they're locked like reads.
+    pub fn oam_write_blocked(&self) -> bool {
+        self.oam_blocked() && !self.at_line_start() && !self.at_scan_handoff()
     }
 
     /// The PPU owns OAM while scanning and drawing (modes 2 and 3).
@@ -426,8 +466,8 @@ impl GPU {
                     | (if self.m2_inte { 0x20 } else { 0 })
                     | (if self.m1_inte { 0x10 } else { 0 })
                     | (if self.m0_inte { 0x08 } else { 0 })
-                    | (if self.lyc_match { 0x04 } else { 0 })
-                    | self.mode
+                    | (if self.lyc_match && !self.at_line_start() { 0x04 } else { 0 })
+                    | self.stat_mode_bits()
             }
             0xFF42 => self.scy,
             0xFF43 => self.scx,
