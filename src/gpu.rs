@@ -6,6 +6,9 @@ const VOAM_SIZE: usize = 0xA0;
 pub const SCREEN_W: usize = 160;
 pub const SCREEN_H: usize = 144;
 
+/// Dot position of line 0 right after the LCD is switched on.
+const LCD_ON_START_DOT: u32 = 4;
+
 /// Per-line RGB lookup tables (see `GPU::line_luts`).
 struct LineLuts {
     bg: [[u8; 3]; 32],
@@ -100,6 +103,9 @@ pub struct GPU {
     // Length of this line's mode 3 in dots (172 + SCX fine scroll, window
     // and sprite fetch penalties), fixed when mode 3 starts.
     mode3_len: u32,
+    /// Line 0 right after the LCD is switched on has no OAM scan: it stays
+    /// in mode 0 until mode 3.
+    first_line_after_on: bool,
     prev_stat_signal: bool,
 }
 
@@ -152,6 +158,7 @@ impl GPU {
             hblanking: false,
             first_frame: false,
             mode3_len: 172,
+            first_line_after_on: false,
             prev_stat_signal: false,
         }
     }
@@ -173,6 +180,7 @@ impl GPU {
             if self.modeclock >= 456 {
                 self.modeclock -= 456;
                 self.line = (self.line + 1) % 154;
+                self.first_line_after_on = false;
                 self.update_stat_signal();
 
                 // This is a VBlank line
@@ -184,7 +192,7 @@ impl GPU {
             // This is a normal line
             if self.line < 144 {
                 if self.modeclock <= 80 {
-                    if self.mode != 2 {
+                    if self.mode != 2 && !self.first_line_after_on {
                         self.change_mode(2);
                     }
                 } else if self.modeclock <= 80 + self.mode3_len {
@@ -276,7 +284,7 @@ impl GPU {
         let (expected_mode, next) = if self.line >= 144 {
             (1, 456)
         } else if self.modeclock <= 80 {
-            (2, 81)
+            (if self.first_line_after_on { 0 } else { 2 }, 81)
         } else if self.modeclock <= 80 + self.mode3_len {
             (3, 81 + self.mode3_len)
         } else {
@@ -445,9 +453,10 @@ impl GPU {
                     // Real hardware starts in mode 0 on enable before the first M2 scan;
                     // firing a STAT IRQ here breaks Pokemon Crystal, DKC, and others.
                     self.mode = 0;
-                    self.modeclock = 4;
+                    self.modeclock = LCD_ON_START_DOT;
                     self.line = 0;
                     self.first_frame = true;
+                    self.first_line_after_on = true;
                     // Set prev_stat_signal = true so that update_stat_signal() below
                     // sees no rising edge (0→1) regardless of the current signal value,
                     // suppressing any spurious IRQ on the enable transition.
