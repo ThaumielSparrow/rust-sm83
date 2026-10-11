@@ -292,7 +292,7 @@ mod mooneye {
         #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] acceptance_ppu_lcdon_write_timing_gs = "acceptance/ppu/lcdon_write_timing-GS.gb",
         acceptance_ppu_stat_irq_blocking = "acceptance/ppu/stat_irq_blocking.gb",
         #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] acceptance_ppu_stat_lyc_onoff = "acceptance/ppu/stat_lyc_onoff.gb",
-        #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] acceptance_ppu_vblank_stat_intr_gs = "acceptance/ppu/vblank_stat_intr-GS.gb",
+        acceptance_ppu_vblank_stat_intr_gs = "acceptance/ppu/vblank_stat_intr-GS.gb",
         acceptance_push_timing = "acceptance/push_timing.gb",
         acceptance_rapid_di_ei = "acceptance/rapid_di_ei.gb",
         acceptance_ret_cc_timing = "acceptance/ret_cc_timing.gb",
@@ -344,7 +344,7 @@ mod mooneye {
         misc_boot_div_cgbabcde = "misc/boot_div-cgbABCDE.gb",
         misc_boot_hwio_c = "misc/boot_hwio-C.gb",
         misc_boot_regs_cgb = "misc/boot_regs-cgb.gb",
-        #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] misc_ppu_vblank_stat_intr_c = "misc/ppu/vblank_stat_intr-C.gb",
+        misc_ppu_vblank_stat_intr_c = "misc/ppu/vblank_stat_intr-C.gb",
     ]);
 
     /// Not a test: runs every Mooneye ROM and prints a pass/fail table, to

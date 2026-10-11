@@ -6,6 +6,9 @@ const VOAM_SIZE: usize = 0xA0;
 pub const SCREEN_W: usize = 160;
 pub const SCREEN_H: usize = 144;
 
+/// Dot of line 143 at which CGB hardware raises the line-144 OAM STAT quirk.
+const CGB_VBLANK_OAM_QUIRK_DOT: u32 = 452;
+
 /// Dot position of line 0 right after the LCD is switched on.
 const LCD_ON_START_DOT: u32 = 4;
 
@@ -182,6 +185,15 @@ impl GPU {
 
         while ticksleft > 0 {
             let curticks = if ticksleft >= 80 { 80 } else { ticksleft };
+            // CGB hardware: the line-144 OAM STAT quirk fires one M-cycle
+            // before VBlank starts (Mooneye vblank_stat_intr-C).
+            if self.gbmode != GbMode::Classic
+                && self.line == 143
+                && self.modeclock < CGB_VBLANK_OAM_QUIRK_DOT
+                && self.modeclock + curticks >= CGB_VBLANK_OAM_QUIRK_DOT
+            {
+                self.update_stat_signal_with(true);
+            }
             self.modeclock += curticks;
             ticksleft -= curticks;
 
@@ -302,10 +314,22 @@ impl GPU {
         if self.mode != expected_mode {
             return 0;
         }
+        if self.gbmode != GbMode::Classic
+            && self.line == 143
+            && self.modeclock < CGB_VBLANK_OAM_QUIRK_DOT
+        {
+            return (next.min(CGB_VBLANK_OAM_QUIRK_DOT)) - self.modeclock;
+        }
         next - self.modeclock
     }
 
     fn update_stat_signal(&mut self) {
+        self.update_stat_signal_with(false);
+    }
+
+    /// `vblank_oam_quirk`: on entering line 144 the mode 2 (OAM) source also
+    /// fires, as if a scan were starting (DMG quirk, Mooneye vblank_stat_intr).
+    fn update_stat_signal_with(&mut self, vblank_oam_quirk: bool) {
         // Combined STAT line: OR of all enabled sources (Pan Docs §STAT register).
         // The signal is forced low while the LCD is off, so no STAT IRQ can fire
         // from register writes (FF41/FF45) during LCD-off, and a clean baseline
@@ -313,7 +337,7 @@ impl GPU {
         let signal = self.lcd_on
             && ((self.m0_inte && self.mode == 0)
                 || (self.m1_inte && self.mode == 1)
-                || (self.m2_inte && self.mode == 2)
+                || (self.m2_inte && (self.mode == 2 || vblank_oam_quirk))
                 || (self.lyc_inte && self.line == self.lyc));
         if signal && !self.prev_stat_signal {
             self.interrupt |= 0x02;
@@ -348,7 +372,8 @@ impl GPU {
             }
             _ => {}
         }
-        self.update_stat_signal();
+        let dmg = self.gbmode == GbMode::Classic;
+        self.update_stat_signal_with(dmg && mode == 1 && self.line == 144);
     }
 
     pub fn rb(&self, a: u16) -> u8 {
