@@ -25,11 +25,12 @@ pub(super) const SYSTEM_HOTKEY_HELP: &[(&str, &str)] = &[
     ("F5–F8", "Load State 1–4 (Ctrl: 5–8)"),
     ("F9", "FPS overlay"),
     ("F11", "Fullscreen"),
+    ("F12", "Screenshot"),
     ("Shift", "Turbo (hold)"),
     ("T", "Turbo (toggle)"),
     ("Backspace", "Rewind (hold)"),
     ("\\", "Rewind (step back)"),
-    ("Y", "Linear interpolation"),
+    ("Y", "Cycle screen filter"),
     ("P", "Pause"),
     ("M", "Mute"),
     ("Ctrl+R", "Reset"),
@@ -126,7 +127,7 @@ pub(super) fn draw_bind_window(bw: &mut AuxWindow, phase: &mut RootPhase, gilrs:
                             for k in keys {
                                 ui.label(key_label(k));
                                 let active = matches_capturing(*capturing, k);
-                                let val = binding_value(keybindings, k);
+                                let val = crate::input::binding_label(&binding_value(keybindings, k));
                                 let conflict = is_reserved_key_name(&val);
                                 let label = if active { "(press key)".to_string() } else { val.clone() };
                                 let mut button = egui::Button::new(label).min_size(egui::vec2(BIND_BUTTON_WIDTH, 0.0));
@@ -309,6 +310,23 @@ pub(super) fn draw_cheat_window(cw: &mut AuxWindow, phase: &mut RootPhase) {
         });
         height
     });
+}
+
+/// Bind a key captured in the rebind UI: stored by physical position when it
+/// has one. Refused (false) if either what it types or where it sits is a
+/// reserved system key, since system actions take precedence on both.
+pub(super) fn assign_captured_key(
+    keybindings: &mut KeyBindings,
+    kp: rust_gbe::KeypadKey,
+    logical: &winit::keyboard::Key<&str>,
+    physical: &winit::keyboard::PhysicalKey,
+) -> bool {
+    let logical = key_to_string(logical);
+    if is_reserved_key_name(&logical) {
+        return false;
+    }
+    let value = crate::input::physical_binding(physical).unwrap_or(logical);
+    keybindings.assign(kp, value)
 }
 
 pub(super) fn key_to_string(key: &winit::keyboard::Key<&str>) -> String {

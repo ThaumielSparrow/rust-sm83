@@ -74,11 +74,12 @@ impl KeyBindings {
         }
     }
 
-    /// Bind `value` to `k`. Reserved system keys are refused (returns false).
+    /// Bind `value` (a logical key name or a `Code:` physical binding) to `k`.
+    /// Reserved system keys are refused (returns false).
     /// If another Game Boy button already uses `value`, the two swap so no
     /// key ends up driving two buttons.
     pub fn assign(&mut self, k: KeypadKey, value: String) -> bool {
-        if crate::input::is_reserved_key_name(&value) {
+        if crate::input::is_reserved_key_name(&crate::input::binding_label(&value)) {
             return false;
         }
         let old = self.slot_mut(k).clone();
@@ -103,8 +104,9 @@ impl KeyBindings {
 
 impl Default for KeyBindings {
     fn default() -> Self { Self {
-        a: "X".into(), b: "Z".into(), start: "Enter".into(), select: "Space".into(),
-        up: "ArrowUp".into(), down: "ArrowDown".into(), left: "ArrowLeft".into(), right: "ArrowRight".into() } }
+        // Physical positions, so the defaults sit in the same place on any layout.
+        a: "Code:KeyX".into(), b: "Code:KeyZ".into(), start: "Code:Enter".into(), select: "Code:Space".into(),
+        up: "Code:ArrowUp".into(), down: "Code:ArrowDown".into(), left: "Code:ArrowLeft".into(), right: "Code:ArrowRight".into() } }
 }
 
 /// Controller bindings, kept separate from keyboard bindings. Both maps store
@@ -404,7 +406,7 @@ mod tests {
         let cfg: Config = serde_json::from_str("{}").expect("parse");
         assert_eq!(cfg.scale, Config::default().scale);
         assert_eq!(cfg.volume, 100);
-        assert_eq!(cfg.keybindings.a, "X");
+        assert_eq!(cfg.keybindings.a, "Code:KeyX");
     }
 
     #[test]
@@ -427,10 +429,11 @@ mod tests {
     fn assign_refuses_reserved_and_swaps_duplicates() {
         let mut kb = KeyBindings::default();
         assert!(!kb.assign(KeypadKey::A, "F1".into()), "F1 is a reserved save key");
-        assert_eq!(kb.a, "X");
-        assert!(kb.assign(KeypadKey::A, "Z".into()));
-        assert_eq!(kb.a, "Z");
-        assert_eq!(kb.b, "X", "B previously held Z and takes A's old key");
+        assert!(!kb.assign(KeypadKey::A, "Code:KeyT".into()), "physical T is reserved too");
+        assert_eq!(kb.a, "Code:KeyX");
+        assert!(kb.assign(KeypadKey::A, "Code:KeyZ".into()));
+        assert_eq!(kb.a, "Code:KeyZ");
+        assert_eq!(kb.b, "Code:KeyX", "B previously held Z and takes A's old key");
     }
 
     #[test]

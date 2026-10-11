@@ -202,20 +202,15 @@ pub(super) fn perceptual_to_linear(v: u8) -> f32 {
 // Dynamic mapping using current keybindings
 pub(super) fn dynamic_winit_to_keypad(
     key: winit::keyboard::Key<&str>,
+    physical: &winit::keyboard::PhysicalKey,
     bindings: &KeyBindings,
 ) -> Option<rust_gbe::KeypadKey> {
-    // Single lookup path: render the key to its string form and compare against
-    // each binding. This lets a user bind A to "ArrowUp" or Up to "X" without
-    // duplicating per-NamedKey checks.
-    let key_str = key_to_string(&key);
-    let key_upper = key_str.to_uppercase();
-    if key_upper == bindings.a.to_uppercase() { return Some(rust_gbe::KeypadKey::A); }
-    if key_upper == bindings.b.to_uppercase() { return Some(rust_gbe::KeypadKey::B); }
-    if key_upper == bindings.start.to_uppercase() { return Some(rust_gbe::KeypadKey::Start); }
-    if key_upper == bindings.select.to_uppercase() { return Some(rust_gbe::KeypadKey::Select); }
-    if key_upper == bindings.up.to_uppercase() { return Some(rust_gbe::KeypadKey::Up); }
-    if key_upper == bindings.down.to_uppercase() { return Some(rust_gbe::KeypadKey::Down); }
-    if key_upper == bindings.left.to_uppercase() { return Some(rust_gbe::KeypadKey::Left); }
-    if key_upper == bindings.right.to_uppercase() { return Some(rust_gbe::KeypadKey::Right); }
-    None
+    use rust_gbe::KeypadKey::*;
+    // Bindings are either physical positions ("Code:KeyX") or, from older
+    // configs, logical key names; match either form.
+    let logical = key_to_string(&key);
+    let physical = crate::input::physical_binding(physical);
+    [A, B, Start, Select, Up, Down, Left, Right].into_iter().find(|&k| {
+        crate::input::binding_matches(&binding_value(bindings, k), &logical, physical.as_deref())
+    })
 }

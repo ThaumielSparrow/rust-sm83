@@ -66,6 +66,48 @@ pub const RESERVED_KEYS: &[&str] = &[
     "Backspace","\\",                        // rewind hold / step back
 ];
 
+/// Bindings starting with this name a physical key position (winit `KeyCode`),
+/// so they work the same on every keyboard layout (e.g. AZERTY). Bindings
+/// without it are logical key names, as written by older versions.
+pub const PHYSICAL_PREFIX: &str = "Code:";
+
+/// The binding string for a physical key, if it has a known code.
+pub fn physical_binding(key: &winit::keyboard::PhysicalKey) -> Option<String> {
+    match key {
+        winit::keyboard::PhysicalKey::Code(code) => Some(format!("{PHYSICAL_PREFIX}{code:?}")),
+        _ => None,
+    }
+}
+
+/// Short display name for a binding: "Code:KeyX" -> "X", "Code:Digit1" ->
+/// "1", "Code:ShiftLeft" -> "Shift"; logical names are shown as stored.
+pub fn binding_label(binding: &str) -> String {
+    let Some(code) = binding.strip_prefix(PHYSICAL_PREFIX) else {
+        return binding.to_string();
+    };
+    if let Some(letter) = code.strip_prefix("Key") {
+        return letter.to_string();
+    }
+    if let Some(digit) = code.strip_prefix("Digit") {
+        return digit.to_string();
+    }
+    match code {
+        "ShiftLeft" | "ShiftRight" => "Shift".into(),
+        "Backslash" => "\\".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether `binding` is triggered by a key with this logical name and
+/// physical binding string.
+pub fn binding_matches(binding: &str, logical: &str, physical: Option<&str>) -> bool {
+    if binding.starts_with(PHYSICAL_PREFIX) {
+        physical == Some(binding)
+    } else {
+        binding.eq_ignore_ascii_case(logical)
+    }
+}
+
 pub fn is_reserved_key_name(name: &str) -> bool {
     // Case-insensitive for letters
     let upper = name.to_uppercase();
@@ -77,6 +119,22 @@ mod tests {
     use super::*;
     use winit::event::ElementState::{Pressed, Released};
     use winit::keyboard::{Key, NamedKey};
+
+    #[test]
+    fn physical_bindings_match_by_position_and_label_readably() {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+        let x = physical_binding(&PhysicalKey::Code(KeyCode::KeyX)).unwrap();
+        assert_eq!(x, "Code:KeyX");
+        assert_eq!(binding_label(&x), "X");
+        assert_eq!(binding_label("Code:ShiftLeft"), "Shift");
+        assert_eq!(binding_label("Enter"), "Enter");
+        // Physical binding: matches the position whatever the layout types.
+        assert!(binding_matches(&x, "Q", Some("Code:KeyX")));
+        assert!(!binding_matches(&x, "X", Some("Code:KeyC")));
+        // Legacy logical binding: matches the typed key, case-insensitively.
+        assert!(binding_matches("x", "X", Some("Code:KeyC")));
+        assert!(is_reserved_key_name(&binding_label("Code:KeyT")));
+    }
 
     #[test]
     fn ctrl_function_keys_address_slots_5_to_8() {

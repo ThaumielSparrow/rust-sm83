@@ -23,7 +23,7 @@ Files written next to the ROM: `<rom>.gbsave` (battery RAM, interchangeable with
 
 ### Emulator Keybinds:
 
-Emulator keybinds are configurable and can be adjusted from Settings > Keybindings while the emulator is running.
+Emulator keybinds are configurable and can be adjusted from Settings > Keybindings while the emulator is running. Bindings follow the physical key position, so the defaults sit in the same place on AZERTY and other layouts.
 
 `A`: `X`
 

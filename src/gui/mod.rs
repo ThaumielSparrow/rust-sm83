@@ -286,7 +286,7 @@ impl RootApp {
                             }
                         } else if let Some(kp) = *capturing
                             && !keyevent.repeat
-                            && keybindings.assign(kp, key_to_string(&logical.as_ref()))
+                            && assign_captured_key(keybindings, kp, &logical.as_ref(), &keyevent.physical_key)
                         {
                             // A refused (reserved) key leaves capture active.
                             *capturing = None;
@@ -1034,7 +1034,7 @@ impl ApplicationHandler<UserEvent> for RootApp {
                     }
                     if matches!(state, winit::event::ElementState::Pressed)
                         && !keyevent.repeat
-                        && keybindings.assign(kp, key_to_string(&logical.as_ref()))
+                        && assign_captured_key(keybindings, kp, &logical.as_ref(), &keyevent.physical_key)
                     {
                         // A refused (reserved) key leaves capture active.
                         *capturing = None;
@@ -1122,12 +1122,12 @@ impl ApplicationHandler<UserEvent> for RootApp {
                         }
                     }
                     (Pressed, wkey) => {
-                        if let Some(k) = dynamic_winit_to_keypad(wkey, keybindings) {
+                        if let Some(k) = dynamic_winit_to_keypad(wkey, &keyevent.physical_key, keybindings) {
                             let _ = sender.send(GBEvent::KeyDown(k));
                         }
                     }
                     (Released, wkey) => {
-                        if let Some(k) = dynamic_winit_to_keypad(wkey, keybindings) {
+                        if let Some(k) = dynamic_winit_to_keypad(wkey, &keyevent.physical_key, keybindings) {
                             let _ = sender.send(GBEvent::KeyUp(k));
                         }
                     }
