@@ -105,6 +105,11 @@ impl Timer {
         }
     }
 
+    /// The 16-bit system counter (DIV is its upper byte).
+    pub fn internal_counter(&self) -> u16 {
+        self.internal_counter
+    }
+
     /// Set the divider's full 16-bit counter (post-boot state).
     pub fn set_internal_counter(&mut self, value: u16) {
         self.internal_counter = value;

@@ -10,6 +10,9 @@ use crate::StrResult;
 const WRAM_SIZE: usize = 0x8000;
 const ZRAM_SIZE: usize = 0x7F;
 
+/// T-cycles by which serial clock edges lead the system counter's bit 8.
+const SERIAL_CLOCK_LEAD: u32 = 4;
+
 #[derive(PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 enum DMAType {
     NoDMA,
@@ -212,7 +215,17 @@ impl MMU {
         let gputicks = ticks / cpudivider + vramticks;
         let cputicks = ticks + vramticks * cpudivider;
 
+        let counter_before = self.timer.internal_counter() as u32;
         self.timer.do_cycle(cputicks);
+        if self.serial.transferring() {
+            // The serial clock is system-counter bit 8 (8192 Hz): one shift
+            // per falling edge, i.e. per multiple of 512 crossed. Its edges
+            // lead our counter by one M-cycle (calibrated against Mooneye
+            // boot_sclk_align).
+            let phase = counter_before + SERIAL_CLOCK_LEAD;
+            let edges = ((phase + cputicks) >> 9) - (phase >> 9);
+            self.serial.clock(edges);
+        }
         self.intf |= self.timer.interrupt;
         self.timer.interrupt = 0;
 
@@ -248,7 +261,12 @@ impl MMU {
             return 0;
         }
         let gpu = self.gpu.ticks_until_event().saturating_mul(self.gbspeed as u32);
-        gpu.min(self.timer.ticks_until_event())
+        let serial = if self.serial.transferring() {
+            512 - ((self.timer.internal_counter() as u32 + SERIAL_CLOCK_LEAD) & 0x1FF)
+        } else {
+            u32::MAX
+        };
+        gpu.min(self.timer.ticks_until_event()).min(serial)
     }
 
     pub fn rb(&mut self, address: u16) -> u8 {
@@ -318,6 +336,11 @@ impl MMU {
             0xFF00 => self.keypad.wb(value),
             0xFF01..=0xFF02 => self.serial.wb(address, value),
             0xFF04 => {
+                // Resetting the counter while bit 8 is high is a falling
+                // edge of the serial clock.
+                if (self.timer.internal_counter() as u32 + SERIAL_CLOCK_LEAD) & 0x100 != 0 {
+                    self.serial.clock(1);
+                }
                 self.timer.wb(address, value);
                 // The DIV-APU frame sequencer is tapped off DIV; resetting DIV
                 // must reset the APU's frame-sequencer phase too.
