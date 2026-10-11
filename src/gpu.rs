@@ -97,6 +97,9 @@ pub struct GPU {
     pub gbmode: GbMode,
     hblanking: bool,
     first_frame: bool,
+    // Length of this line's mode 3 in dots (172 + SCX fine scroll, window
+    // and sprite fetch penalties), fixed when mode 3 starts.
+    mode3_len: u32,
     prev_stat_signal: bool,
 }
 
@@ -148,6 +151,7 @@ impl GPU {
             vrambank: 0,
             hblanking: false,
             first_frame: false,
+            mode3_len: 172,
             prev_stat_signal: false,
         }
     }
@@ -183,7 +187,7 @@ impl GPU {
                     if self.mode != 2 {
                         self.change_mode(2);
                     }
-                } else if self.modeclock <= (80 + 172) {
+                } else if self.modeclock <= 80 + self.mode3_len {
                     // 252 cycles
                     if self.mode != 3 {
                         self.change_mode(3);
@@ -196,6 +200,51 @@ impl GPU {
                 }
             }
         }
+    }
+
+    /// Mode 3 length for the current line (Pan Docs "Mode 3 length"):
+    /// 172 dots, plus SCX % 8 discarded pixels, plus 6 if the window is
+    /// drawn, plus a per-sprite fetch penalty (calibrated against Mooneye
+    /// intr_2_mode0_timing_sprites).
+    fn compute_mode3_len(&self) -> u32 {
+        let mut len = 172 + (self.scx & 7) as u32;
+        let window = self.win_on && self.wy_trigger && self.winx <= 166;
+        if window {
+            len += 6;
+        }
+        if !self.sprite_on {
+            return len;
+        }
+        let line = self.line as i32;
+        let height = self.sprite_size as i32;
+        // Background tiles whose fetch a sprite already stalled.
+        let mut stalled_tiles = [false; 32];
+        let mut count = 0;
+        for i in 0..40 {
+            let y = self.voam[i * 4] as i32 - 16;
+            if line < y || line >= y + height {
+                continue;
+            }
+            count += 1;
+            if count > 10 {
+                break;
+            }
+            let oam_x = self.voam[i * 4 + 1] as u32;
+            if oam_x >= 168 {
+                continue; // fully off the right edge: not fetched
+            }
+            // Position in fetcher coordinates (the first, partly hidden BG
+            // tile starts at 0). The first sprite in a BG tile stalls that
+            // tile's fetch for up to 5 dots; every sprite costs 6 more.
+            let pos = oam_x + (self.scx & 7) as u32;
+            let tile = (pos / 8) as usize;
+            if !stalled_tiles[tile] {
+                stalled_tiles[tile] = true;
+                len += 5 - (pos % 8).min(5);
+            }
+            len += 6;
+        }
+        len
     }
 
     /// Move the PPU to `dots` into line 0 (its position when the boot ROM
@@ -218,8 +267,8 @@ impl GPU {
             (1, 456)
         } else if self.modeclock <= 80 {
             (2, 81)
-        } else if self.modeclock <= 80 + 172 {
-            (3, 253)
+        } else if self.modeclock <= 80 + self.mode3_len {
+            (3, 81 + self.mode3_len)
         } else {
             (0, 456)
         };
@@ -268,6 +317,7 @@ impl GPU {
                     self.wy_trigger = true;
                     self.wy_pos = -1;
                 }
+                self.mode3_len = self.compute_mode3_len();
             }
             _ => {}
         }

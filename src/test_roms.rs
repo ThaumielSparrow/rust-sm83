@@ -285,7 +285,7 @@ mod mooneye {
         acceptance_ppu_intr_1_2_timing_gs = "acceptance/ppu/intr_1_2_timing-GS.gb",
         #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] acceptance_ppu_intr_2_0_timing = "acceptance/ppu/intr_2_0_timing.gb",
         acceptance_ppu_intr_2_mode0_timing = "acceptance/ppu/intr_2_mode0_timing.gb",
-        #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] acceptance_ppu_intr_2_mode0_timing_sprites = "acceptance/ppu/intr_2_mode0_timing_sprites.gb",
+        acceptance_ppu_intr_2_mode0_timing_sprites = "acceptance/ppu/intr_2_mode0_timing_sprites.gb",
         acceptance_ppu_intr_2_mode3_timing = "acceptance/ppu/intr_2_mode3_timing.gb",
         #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] acceptance_ppu_intr_2_oam_ok_timing = "acceptance/ppu/intr_2_oam_ok_timing.gb",
         #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] acceptance_ppu_lcdon_timing_gs = "acceptance/ppu/lcdon_timing-GS.gb",
@@ -410,6 +410,7 @@ fn bench() {
         println!("{path}: 60 emulated s in {secs:.3} s ({:.0}x realtime)", 60.0 / secs);
     }
 }
+
 
 
 
