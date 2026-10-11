@@ -28,6 +28,10 @@ pub trait MBC: Send {
     /// Move ROM bytes back in after a rom-less restore.
     fn set_rom(&mut self, rom: Vec<u8>);
 
+    /// Advance cartridge hardware clocked by the system (the MBC3 RTC) by
+    /// `ticks` real-time T-cycles (4.194304 MHz).
+    fn tick(&mut self, _ticks: u32) {}
+
     /// MBC5 rumble carts: whether the motor is currently driven.
     fn rumble(&self) -> bool {
         false
@@ -116,6 +120,9 @@ impl MBC for MbcState {
     }
     fn rumble(&self) -> bool {
         dispatch!(self, m => m.rumble())
+    }
+    fn tick(&mut self, ticks: u32) {
+        dispatch!(self, m => m.tick(ticks))
     }
 }
 
@@ -222,6 +229,10 @@ impl MBC for FileBackedMBC {
         self.mbc.rumble()
     }
 
+    fn tick(&mut self, ticks: u32) {
+        self.mbc.tick(ticks)
+    }
+
     fn take_rom(&mut self) -> Vec<u8> {
         self.mbc.take_rom()
     }
@@ -261,11 +272,23 @@ impl Cartridge {
             && self.dumpram().len() == other.dumpram().len()
     }
 
-    /// A decoded save state carries the battery-save path from when it was
-    /// written; keep writing to the live cartridge's path instead.
-    pub fn adopt_save_path(&mut self, live: &Cartridge) {
-        if let (Cartridge::FileBacked(dst), Cartridge::FileBacked(src)) = (self, live) {
+    /// Carry what belongs to the physical cartridge, not the saved console
+    /// state, over to a cartridge decoded from a save state: the battery-save
+    /// path (the state has the one from when it was written) and the RTC,
+    /// which keeps running on the cart regardless of console state.
+    pub fn adopt_live_state(&mut self, live: &Cartridge) {
+        if let (Cartridge::FileBacked(dst), Cartridge::FileBacked(src)) = (&mut *self, live) {
             dst.rampath = src.rampath.clone();
+        }
+        if let (MbcState::Mbc3(dst), MbcState::Mbc3(src)) = (self.state_mut(), live.state()) {
+            dst.set_rtc_state(src.rtc_state());
+        }
+    }
+
+    fn state_mut(&mut self) -> &mut MbcState {
+        match self {
+            Cartridge::Memory(mbc) => mbc,
+            Cartridge::FileBacked(fb) => &mut fb.mbc,
         }
     }
 }
@@ -338,6 +361,13 @@ impl MBC for Cartridge {
         match self {
             Cartridge::Memory(mbc) => mbc.rumble(),
             Cartridge::FileBacked(mbc) => mbc.rumble(),
+        }
+    }
+
+    fn tick(&mut self, ticks: u32) {
+        match self {
+            Cartridge::Memory(mbc) => mbc.tick(ticks),
+            Cartridge::FileBacked(mbc) => mbc.tick(ticks),
         }
     }
 

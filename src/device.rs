@@ -691,6 +691,27 @@ mod test {
     }
 
     #[test]
+    fn restoring_a_state_keeps_the_cartridge_clock() {
+        let mut rom = test_rom();
+        rom[0x147] = 0x10; // MBC3+TIMER+RAM+BATTERY
+        rom[0x149] = 0x02;
+        let cart = mbc::Cartridge::from_buffer(rom, true).unwrap();
+        let mut device = Device { cpu: CPU::new(cart, None).unwrap(), save_state: None };
+        let snap = device.snapshot_rewind().unwrap();
+        // ~3 emulated seconds pass on the cart's clock.
+        for _ in 0..3 {
+            device.cpu.mmu.mbc.tick(4_194_304);
+        }
+        device.restore_rewind(&snap).unwrap();
+        // Latch and read the seconds register.
+        device.write_byte(0x0000, 0x0A);
+        device.write_byte(0x6000, 0x00);
+        device.write_byte(0x6000, 0x01);
+        device.write_byte(0x4000, 0x08);
+        assert_eq!(device.read_byte(0xA000), 3, "RTC must not rewind with the state");
+    }
+
+    #[test]
     fn slot_save_path_falls_back_to_file_backed_rom_directory() {
         let rom_dir =
             std::env::temp_dir().join(format!("rust_gbe_slot_rom_dir_test_{}", std::process::id()));
@@ -1031,7 +1052,7 @@ impl Device {
     /// carrying the immutable ROM and the live audio player across the swap.
     /// Shared by slot-load and rewind restore.
     fn install_decoded_cpu(&mut self, mut decoded: CPU) {
-        decoded.mmu.mbc.adopt_save_path(&self.cpu.mmu.mbc);
+        decoded.mmu.mbc.adopt_live_state(&self.cpu.mmu.mbc);
         let rom = self.cpu.mmu.mbc.take_rom(); // zero-copy move from outgoing CPU
         decoded.mmu.mbc.set_rom(rom);
         decoded.mmu.gpu.adopt_frame_buffers(&mut self.cpu.mmu.gpu);

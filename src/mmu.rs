@@ -225,6 +225,8 @@ impl MMU {
 
         let _ = self.sound.as_mut().map_or((), |s| s.do_cycle(gputicks));
 
+        self.mbc.tick(gputicks);
+
         self.intf |= self.serial.interrupt;
         self.serial.interrupt = 0;
 
