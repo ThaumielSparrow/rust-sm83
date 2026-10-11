@@ -39,9 +39,9 @@ Emulator keybinds are configurable and can be adjusted from Settings > Keybindin
 
 These are reserved keybinds for system functionality and cannot be adjusted through config menu.
 
-`F1-F4`: Save state, slots 1-4
+`F1-F4`: Save state, slots 1-4 (`Ctrl+F1-F4`: slots 5-8)
 
-`F5-F8`: Load state, slots 1-4
+`F5-F8`: Load state, slots 1-4 (`Ctrl+F5-F8`: slots 5-8)
 
 `F9`: Toggle FPS overlay
 

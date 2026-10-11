@@ -29,17 +29,19 @@ pub fn system_action_for(
     use winit::event::ElementState::{Pressed, Released};
     use SystemAction::*;
     let ctrl = modifiers.control_key();
+    let bank = if ctrl { 4 } else { 0 };
     match (state, key) {
         // Ctrl+R: reset emulator
         (Pressed, Key::Character("r" | "R")) if ctrl => Some(Reset),
-        (Pressed, Key::Named(NamedKey::F1)) => Some(SaveState(1)),
-        (Pressed, Key::Named(NamedKey::F2)) => Some(SaveState(2)),
-        (Pressed, Key::Named(NamedKey::F3)) => Some(SaveState(3)),
-        (Pressed, Key::Named(NamedKey::F4)) => Some(SaveState(4)),
-        (Pressed, Key::Named(NamedKey::F5)) => Some(LoadState(1)),
-        (Pressed, Key::Named(NamedKey::F6)) => Some(LoadState(2)),
-        (Pressed, Key::Named(NamedKey::F7)) => Some(LoadState(3)),
-        (Pressed, Key::Named(NamedKey::F8)) => Some(LoadState(4)),
+        // F1-F4 save / F5-F8 load slots 1-4; with Ctrl, slots 5-8.
+        (Pressed, Key::Named(NamedKey::F1)) => Some(SaveState(1 + bank)),
+        (Pressed, Key::Named(NamedKey::F2)) => Some(SaveState(2 + bank)),
+        (Pressed, Key::Named(NamedKey::F3)) => Some(SaveState(3 + bank)),
+        (Pressed, Key::Named(NamedKey::F4)) => Some(SaveState(4 + bank)),
+        (Pressed, Key::Named(NamedKey::F5)) => Some(LoadState(1 + bank)),
+        (Pressed, Key::Named(NamedKey::F6)) => Some(LoadState(2 + bank)),
+        (Pressed, Key::Named(NamedKey::F7)) => Some(LoadState(3 + bank)),
+        (Pressed, Key::Named(NamedKey::F8)) => Some(LoadState(4 + bank)),
         (Pressed, Key::Named(NamedKey::F9)) => Some(ToggleFpsOverlay),
         (Pressed, Key::Named(NamedKey::F11)) => Some(ToggleFullscreen),
         (Pressed, Key::Named(NamedKey::F12)) => Some(Screenshot),
@@ -75,6 +77,19 @@ mod tests {
     use super::*;
     use winit::event::ElementState::{Pressed, Released};
     use winit::keyboard::{Key, NamedKey};
+
+    #[test]
+    fn ctrl_function_keys_address_slots_5_to_8() {
+        let ctrl = ModifiersState::CONTROL;
+        assert_eq!(
+            system_action_for(&Key::Named(NamedKey::F2), Pressed, ctrl),
+            Some(SystemAction::SaveState(6))
+        );
+        assert_eq!(
+            system_action_for(&Key::Named(NamedKey::F8), Pressed, ctrl),
+            Some(SystemAction::LoadState(8))
+        );
+    }
 
     #[test]
     fn f12_is_a_reserved_screenshot_key() {

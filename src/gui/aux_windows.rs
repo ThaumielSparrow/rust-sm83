@@ -21,8 +21,8 @@ pub(super) const BIND_WINDOW_WIDTH: f32 = 440.0;
 /// Read-only reference of fixed keyboard system hotkeys, shown in the
 /// keybindings window's Keyboard tab so they're discoverable in-app.
 pub(super) const SYSTEM_HOTKEY_HELP: &[(&str, &str)] = &[
-    ("F1–F4", "Save State 1–4"),
-    ("F5–F8", "Load State 1–4"),
+    ("F1–F4", "Save State 1–4 (Ctrl: 5–8)"),
+    ("F5–F8", "Load State 1–4 (Ctrl: 5–8)"),
     ("F9", "FPS overlay"),
     ("F11", "Fullscreen"),
     ("Shift", "Turbo (hold)"),

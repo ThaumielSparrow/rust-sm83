@@ -382,7 +382,7 @@ impl RootApp {
         }
         let _ = cpu.romname();
         let save_slots = SaveSlotCache::from_paths(
-            (1..=4)
+            (1..=8)
                 .map(|slot| (slot, cpu.save_state_slot_path(slot)))
                 .collect(),
         );
