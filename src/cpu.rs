@@ -661,7 +661,7 @@ fn op_ret(cpu: &mut CPU, op: u8) -> u32 {
 fn op_rst(cpu: &mut CPU, op: u8) -> u32 { let target = match op { 0xC7 => 0x00, 0xCF => 0x08, 0xD7 => 0x10, 0xDF => 0x18, 0xE7 => 0x20, 0xEF => 0x28, 0xF7 => 0x30, 0xFF => 0x38, _ => unreachable!() }; let pc = cpu.reg.pc; cpu.pushstack(pc); cpu.reg.pc = target; 4 }
 
 // Misc single opcodes: DAA(0x27), CPL(0x2F), SCF(0x37), CCF(0x3F), DI(0xF3), EI(0xFB), STOP(0x10)
-fn op_misc(cpu: &mut CPU, op: u8) -> u32 { match op { 0x27 => { cpu.alu_daa(); 1 }, 0x2F => { cpu.reg.a = !cpu.reg.a; cpu.reg.flag(H,true); cpu.reg.flag(N,true); 1 }, 0x37 => { cpu.reg.flag(C,true); cpu.reg.flag(H,false); cpu.reg.flag(N,false); 1 }, 0x3F => { let c = cpu.reg.getflag(C); cpu.reg.flag(C,!c); cpu.reg.flag(H,false); cpu.reg.flag(N,false); 1 }, 0xF3 => { cpu.ime = false; cpu.setei = 0; 1 }, 0xFB => { cpu.setei = 2; 1 }, 0x10 => {
+fn op_misc(cpu: &mut CPU, op: u8) -> u32 { match op { 0x27 => { cpu.alu_daa(); 1 }, 0x2F => { cpu.reg.a = !cpu.reg.a; cpu.reg.flag(H,true); cpu.reg.flag(N,true); 1 }, 0x37 => { cpu.reg.flag(C,true); cpu.reg.flag(H,false); cpu.reg.flag(N,false); 1 }, 0x3F => { let c = cpu.reg.getflag(C); cpu.reg.flag(C,!c); cpu.reg.flag(H,false); cpu.reg.flag(N,false); 1 }, 0xF3 => { cpu.ime = false; cpu.setei = 0; 1 }, 0xFB => { if cpu.setei == 0 && !cpu.ime { cpu.setei = 2; } 1 }, 0x10 => {
     // STOP is a two-byte opcode (10 00). Consume the operand.
     let _ = cpu.fetchbyte();
     // Speed switch only applies on CGB when KEY1 bit 0 is set.
@@ -813,6 +813,20 @@ mod test {
         }
         assert!(!cpu.ime);
         assert_eq!(cpu.reg.pc, 0x104, "no interrupt should have been dispatched");
+    }
+
+    #[test]
+    fn second_ei_does_not_extend_the_delay() {
+        // EI; EI; NOP with an interrupt pending: IME turns on after the
+        // instruction following the *first* EI, so the third step dispatches.
+        let mut cpu = cpu_with_code(&[0xFB, 0xFB, 0x00]);
+        cpu.reg.sp = 0xDFF0;
+        cpu.mmu.inte = 0x01;
+        cpu.mmu.intf = 0x01;
+        cpu.do_cycle(); // EI
+        cpu.do_cycle(); // EI
+        cpu.do_cycle(); // dispatch
+        assert_eq!(cpu.reg.pc, 0x0040);
     }
 
     #[test]

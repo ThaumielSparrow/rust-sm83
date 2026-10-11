@@ -263,7 +263,7 @@ mod mooneye {
         acceptance_call_timing2 = "acceptance/call_timing2.gb",
         acceptance_di_timing_gs = "acceptance/di_timing-GS.gb",
         acceptance_div_timing = "acceptance/div_timing.gb",
-        #[ignore = "CPU timing edge case (needs investigation)"] acceptance_ei_sequence = "acceptance/ei_sequence.gb",
+        acceptance_ei_sequence = "acceptance/ei_sequence.gb",
         acceptance_ei_timing = "acceptance/ei_timing.gb",
         acceptance_halt_ime0_ei = "acceptance/halt_ime0_ei.gb",
         acceptance_halt_ime0_nointr_timing = "acceptance/halt_ime0_nointr_timing.gb",
