@@ -6,6 +6,10 @@ const VOAM_SIZE: usize = 0xA0;
 pub const SCREEN_W: usize = 160;
 pub const SCREEN_H: usize = 144;
 
+/// Dots by which the mode 0 STAT interrupt precedes the mode bits changing
+/// (calibrated against Mooneye intr_2_0_timing and hblank_ly_scx_timing).
+const MODE0_IRQ_LEAD: u32 = 1;
+
 /// Dot of line 143 at which CGB hardware raises the line-144 OAM STAT quirk.
 const CGB_VBLANK_OAM_QUIRK_DOT: u32 = 452;
 
@@ -198,6 +202,12 @@ impl GPU {
             {
                 self.update_stat_signal_with(true);
             }
+            if self.line < 144 && self.mode == 3 {
+                let dot = self.mode0_irq_dot();
+                if self.modeclock < dot && self.modeclock + curticks >= dot {
+                    self.update_stat_signal_full(false, true);
+                }
+            }
             self.modeclock += curticks;
             ticksleft -= curticks;
 
@@ -233,6 +243,11 @@ impl GPU {
                 }
             }
         }
+    }
+
+    /// Dot at which the mode 0 STAT interrupt is raised on this line.
+    fn mode0_irq_dot(&self) -> u32 {
+        81 + self.mode3_len - MODE0_IRQ_LEAD
     }
 
     /// Mode 3 length for the current line (Pan Docs "Mode 3 length"):
@@ -318,6 +333,9 @@ impl GPU {
         if self.mode != expected_mode {
             return 0;
         }
+        if self.line < 144 && self.mode == 3 && self.modeclock < self.mode0_irq_dot() {
+            return self.mode0_irq_dot() - self.modeclock;
+        }
         if self.gbmode != GbMode::Classic
             && self.line == 143
             && self.modeclock < CGB_VBLANK_OAM_QUIRK_DOT
@@ -334,6 +352,12 @@ impl GPU {
     /// `vblank_oam_quirk`: on entering line 144 the mode 2 (OAM) source also
     /// fires, as if a scan were starting (DMG quirk, Mooneye vblank_stat_intr).
     fn update_stat_signal_with(&mut self, vblank_oam_quirk: bool) {
+        self.update_stat_signal_full(vblank_oam_quirk, false);
+    }
+
+    /// `hblank_early`: the mode 0 source rises MODE0_IRQ_LEAD dots before
+    /// the mode bits switch to 0.
+    fn update_stat_signal_full(&mut self, vblank_oam_quirk: bool, hblank_early: bool) {
         // Combined STAT line: OR of all enabled sources (Pan Docs §STAT register).
         // The signal is forced low while the LCD is off, so no STAT IRQ can fire
         // from register writes (FF41/FF45) during LCD-off, and a clean baseline
@@ -342,7 +366,7 @@ impl GPU {
             self.lyc_match = self.line == self.lyc;
         }
         let signal = self.lcd_on
-            && ((self.m0_inte && self.mode == 0)
+            && ((self.m0_inte && (self.mode == 0 || hblank_early))
                 || (self.m1_inte && self.mode == 1)
                 || (self.m2_inte && (self.mode == 2 || vblank_oam_quirk))
                 || (self.lyc_inte && self.lyc_match));
