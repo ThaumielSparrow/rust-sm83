@@ -302,7 +302,7 @@ mod mooneye {
         acceptance_rst_timing = "acceptance/rst_timing.gb",
         acceptance_serial_boot_sclk_align_dmgabcmgb = "acceptance/serial/boot_sclk_align-dmgABCmgb.gb",
         acceptance_timer_div_write = "acceptance/timer/div_write.gb",
-        #[ignore = "TAC-write glitch needs sub-M-cycle (T-cycle) write timing"] acceptance_timer_rapid_toggle = "acceptance/timer/rapid_toggle.gb",
+        acceptance_timer_rapid_toggle = "acceptance/timer/rapid_toggle.gb",
         acceptance_timer_tim00 = "acceptance/timer/tim00.gb",
         acceptance_timer_tim00_div_trigger = "acceptance/timer/tim00_div_trigger.gb",
         acceptance_timer_tim01 = "acceptance/timer/tim01.gb",
@@ -411,6 +411,7 @@ fn bench() {
         println!("{path}: 60 emulated s in {secs:.3} s ({:.0}x realtime)", 60.0 / secs);
     }
 }
+
 
 
 

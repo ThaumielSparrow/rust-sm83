@@ -4,6 +4,9 @@ use crate::register::CpuFlag::{C, H, N, Z};
 use crate::register::Registers;
 use crate::StrResult;
 
+/// T-cycle within its M-cycle at which a TAC write takes effect.
+const TAC_WRITE_DOT: u32 = 2;
+
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CPU {
     pub(crate) reg: Registers,
@@ -122,6 +125,16 @@ impl CPU {
 
     /// Bus write taking one M-cycle, landing at the end of it.
     fn write(&mut self, address: u16, value: u8) {
+        if address == 0xFF07 {
+            // TAC: the timer's input mux switches partway through the write's
+            // M-cycle (Mooneye rapid_toggle).
+            self.mcycles += 1;
+            self.sync();
+            self.elapsed += self.mmu.do_cycle(TAC_WRITE_DOT);
+            self.mmu.wb(address, value);
+            self.pending_ticks += 4 - TAC_WRITE_DOT;
+            return;
+        }
         self.tick();
         if self.timing_sensitive(address) {
             self.sync();
