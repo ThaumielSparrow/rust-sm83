@@ -132,12 +132,13 @@ impl CPU {
     /// Whether an access can observe (or affect) peripheral timing, so the
     /// rest of the system must be brought up to date first. ROM / cart RAM,
     /// WRAM and HRAM can't: deferring the catch-up past them is unobservable,
-    /// and it saves a peripheral update on most accesses. While a VRAM DMA is
+    /// and it saves a peripheral update on most accesses. While a DMA is
     /// running it reads those regions during catch-up, so then every access
     /// syncs.
     fn timing_sensitive(&self, address: u16) -> bool {
         !matches!(address, 0x0000..=0x7FFF | 0xA000..=0xFDFF | 0xFF80..=0xFFFE)
             || self.mmu.vram_dma_active()
+            || self.mmu.oam_dma_busy()
     }
 
     fn write_word(&mut self, address: u16, value: u16) {

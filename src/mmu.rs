@@ -40,6 +40,13 @@ pub struct MMU {
     speed_switch_req: bool,
     undocumented_cgb_regs: [u8; 3], // 0xFF72, 0xFF73, 0xFF75
     oam_dma_source: u8,
+    // OAM DMA in flight: copies byte `oam_dma_index` from `oam_dma_base`
+    // each M-cycle. A FF46 write is pending (source, M-cycles left) during
+    // setup, while a running transfer continues.
+    oam_dma_active: bool,
+    oam_dma_base: u16,
+    oam_dma_index: u8,
+    oam_dma_pending: Option<(u16, u8)>,
 }
 
 fn fill_random(slice: &mut [u8], start: u32) {
@@ -83,6 +90,10 @@ impl MMU {
             hdma_len: 0xFF,
             undocumented_cgb_regs: [0; 3],
             oam_dma_source: 0xFF,
+            oam_dma_active: false,
+            oam_dma_base: 0,
+            oam_dma_index: 0,
+            oam_dma_pending: None,
         };
         fill_random(&mut res.wram, 42);
         if res.rb(0x0143) == 0xC0 {
@@ -122,6 +133,10 @@ impl MMU {
             hdma_len: 0xFF,
             undocumented_cgb_regs: [0; 3],
             oam_dma_source: 0xFF,
+            oam_dma_active: false,
+            oam_dma_base: 0,
+            oam_dma_index: 0,
+            oam_dma_pending: None,
         };
         fill_random(&mut res.wram, 42);
         res.determine_mode();
@@ -172,6 +187,12 @@ impl MMU {
     }
 
     pub fn do_cycle(&mut self, ticks: u32) -> u32 {
+        if self.oam_dma_busy() {
+            // OAM DMA runs on the CPU clock: one byte per M-cycle.
+            for _ in 0..ticks / 4 {
+                self.step_oam_dma();
+            }
+        }
         let cpudivider = self.gbspeed as u32;
         let vramticks = self.perform_vramdma();
         let gputicks = ticks / cpudivider + vramticks;
@@ -204,8 +225,8 @@ impl MMU {
     /// CPU T-cycles that can pass before any peripheral could raise an
     /// interrupt (used to fast-forward HALT). 0 means "don't skip".
     pub fn ticks_until_event(&self) -> u32 {
-        // HDMA blocks run on HBlank boundaries; keep them exact.
-        if self.hdma_status != DMAType::NoDMA {
+        // DMAs run per M-cycle / per HBlank; keep them exact.
+        if self.hdma_status != DMAType::NoDMA || self.oam_dma_busy() {
             return 0;
         }
         let gpu = self.gpu.ticks_until_event().saturating_mul(self.gbspeed as u32);
@@ -221,6 +242,8 @@ impl MMU {
             0xD000..=0xDFFF | 0xF000..=0xFDFF => {
                 self.wram[(self.wrambank * 0x1000) | address as usize & 0x0FFF]
             }
+            // OAM is on the DMA's bus while a transfer runs.
+            0xFE00..=0xFE9F if self.oam_dma_active => 0xFF,
             0xFE00..=0xFE9F => self.gpu.rb(address),
             0xFF00 => self.keypad.rb(),
             0xFF01..=0xFF02 => self.serial.rb(address),
@@ -267,6 +290,7 @@ impl MMU {
             0xD000..=0xDFFF | 0xF000..=0xFDFF => {
                 self.wram[(self.wrambank * 0x1000) | (address as usize & 0x0FFF)] = value
             }
+            0xFE00..=0xFE9F if self.oam_dma_active => {}
             0xFE00..=0xFE9F => self.gpu.wb(address, value),
             0xFF00 => self.keypad.wb(value),
             0xFF01..=0xFF02 => self.serial.wb(address, value),
@@ -335,13 +359,42 @@ impl MMU {
         self.speed_switch_req = false;
     }
 
+    /// FF46 write: (re)start an OAM DMA. Sources at E000 and up read the
+    /// WRAM they echo. Hardware has one setup M-cycle after the write's; since
+    /// CPU writes land at the end of their M-cycle here, that is two steps
+    /// (calibrated against Mooneye oam_dma_start / _restart / _timing).
     fn oamdma(&mut self, value: u8) {
         self.oam_dma_source = value;
         let base = (value as u16) << 8;
-        for i in 0..0xA0 {
-            let b = self.rb(base + i);
-            self.wb(0xFE00 + i, b);
+        let base = if base >= 0xE000 { base - 0x2000 } else { base };
+        self.oam_dma_pending = Some((base, 2));
+    }
+
+    /// Advance OAM DMA by one M-cycle.
+    fn step_oam_dma(&mut self) {
+        if self.oam_dma_active {
+            let i = self.oam_dma_index as u16;
+            let b = self.rb(self.oam_dma_base + i);
+            self.gpu.wb(0xFE00 + i, b);
+            self.oam_dma_index += 1;
+            if self.oam_dma_index as usize == 0xA0 {
+                self.oam_dma_active = false;
+            }
         }
+        if let Some((base, left)) = self.oam_dma_pending.take() {
+            if left > 1 {
+                self.oam_dma_pending = Some((base, left - 1));
+            } else {
+                self.oam_dma_active = true;
+                self.oam_dma_base = base;
+                self.oam_dma_index = 0;
+            }
+        }
+    }
+
+    /// True while an OAM DMA is being set up or transferring.
+    pub fn oam_dma_busy(&self) -> bool {
+        self.oam_dma_active || self.oam_dma_pending.is_some()
     }
 
     fn hdma_read(&self, a: u16) -> u8 {
