@@ -156,9 +156,19 @@ impl FileBackedMBC {
         File::open(&rompath)
             .and_then(|mut f| f.read_to_end(&mut data))
             .map_err(|_| "Could not read ROM")?;
+        Self::from_bytes(data, &rompath, skip_checksum)
+    }
+
+    /// ROM already in memory (e.g. unpacked from an archive); battery saves
+    /// go next to `save_base` as `<save_base>.gbsave`.
+    pub fn from_bytes(
+        data: Vec<u8>,
+        save_base: &path::Path,
+        skip_checksum: bool,
+    ) -> StrResult<FileBackedMBC> {
         let mut mbc = get_mbc(data, skip_checksum)?;
 
-        let rampath = rompath.with_extension("gbsave");
+        let rampath = save_base.with_extension("gbsave");
         // println!("DEBUG: FileBackedMBC will use save path: {}", rampath.display());
 
         if mbc.is_battery_backed() {
@@ -255,6 +265,14 @@ impl Cartridge {
 
     pub fn from_buffer(data: Vec<u8>, skip_checksum: bool) -> StrResult<Cartridge> {
         get_mbc(data, skip_checksum).map(Cartridge::Memory)
+    }
+
+    pub fn from_bytes_with_save(
+        data: Vec<u8>,
+        save_base: &path::Path,
+        skip_checksum: bool,
+    ) -> StrResult<Cartridge> {
+        FileBackedMBC::from_bytes(data, save_base, skip_checksum).map(Cartridge::FileBacked)
     }
 
     fn state(&self) -> &MbcState {

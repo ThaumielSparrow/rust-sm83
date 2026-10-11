@@ -762,6 +762,28 @@ impl Device {
         })
     }
 
+    /// ROM bytes loaded by the host (e.g. from an archive), with battery
+    /// saves kept next to `save_base` like a ROM file at that path.
+    pub fn new_from_bytes(
+        romdata: Vec<u8>,
+        save_base: &str,
+        skip_checksum: bool,
+        save_state: Option<String>,
+    ) -> StrResult<Device> {
+        let cart = mbc::Cartridge::from_bytes_with_save(romdata, Path::new(save_base), skip_checksum)?;
+        CPU::new(cart, None).map(|cpu| Device { cpu, save_state })
+    }
+
+    pub fn new_cgb_from_bytes(
+        romdata: Vec<u8>,
+        save_base: &str,
+        skip_checksum: bool,
+        save_state: Option<String>,
+    ) -> StrResult<Device> {
+        let cart = mbc::Cartridge::from_bytes_with_save(romdata, Path::new(save_base), skip_checksum)?;
+        CPU::new_cgb(cart, None).map(|cpu| Device { cpu, save_state })
+    }
+
     pub fn new_from_buffer(
         romdata: Vec<u8>,
         skip_checksum: bool,

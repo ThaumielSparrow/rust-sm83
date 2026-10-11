@@ -164,6 +164,41 @@ fn restore_compressed(cpu: &mut Device, payload: &[u8]) -> bool {
     }
 }
 
+/// Largest ROM we'll unpack from an archive (the biggest real carts are 8 MiB).
+const MAX_ROM_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Read a ROM file, or the first .gb/.gbc entry of a .zip archive.
+pub fn read_rom(path: &std::path::Path) -> Result<Vec<u8>, &'static str> {
+    let is_zip = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
+    if !is_zip {
+        return std::fs::read(path).map_err(|_| "Could not read ROM");
+    }
+    let file = std::fs::File::open(path).map_err(|_| "Could not read ROM")?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|_| "Not a valid zip archive")?;
+    for i in 0..archive.len() {
+        let Ok(entry) = archive.by_index(i) else { continue };
+        let is_rom = std::path::Path::new(entry.name())
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gb") || e.eq_ignore_ascii_case("gbc"));
+        if !entry.is_file() || !is_rom {
+            continue;
+        }
+        if entry.size() > MAX_ROM_SIZE {
+            return Err("ROM in archive is too large");
+        }
+        let mut data = Vec::with_capacity(entry.size() as usize);
+        use std::io::Read;
+        entry
+            .take(MAX_ROM_SIZE)
+            .read_to_end(&mut data)
+            .map_err(|_| "Could not unpack ROM from archive")?;
+        return Ok(data);
+    }
+    Err("No .gb or .gbc file in the archive")
+}
+
 /// Build a device for `filename`, preferring CGB mode. An invalid header
 /// checksum only produces a warning (it is common in ROM hacks and homebrew);
 /// on success the second element carries that warning for the GUI to show.
@@ -172,10 +207,13 @@ pub fn construct_cpu_auto(
 ) -> Result<(Box<Device>, Option<&'static str>), &'static str> {
     let rom_path = std::path::Path::new(filename);
     let save_state_str = rom_path.with_extension("state").to_string_lossy().to_string();
+    let rom = read_rom(rom_path)?;
     let build = |skip_checksum: bool| {
         // Try CGB first, fallback to classic
-        Device::new_cgb(filename, skip_checksum, Some(save_state_str.clone()))
-            .or_else(|_| Device::new(filename, skip_checksum, Some(save_state_str.clone())))
+        Device::new_cgb_from_bytes(rom.clone(), filename, skip_checksum, Some(save_state_str.clone()))
+            .or_else(|_| {
+                Device::new_from_bytes(rom.clone(), filename, skip_checksum, Some(save_state_str.clone()))
+            })
             .map(Box::new)
     };
     match build(false) {
@@ -544,6 +582,32 @@ mod tests {
         assert!(!should_capture(5, 2));
         assert!(should_capture(6, 2));
         assert!(!should_capture(10, 0), "interval 0 never captures");
+    }
+
+    #[test]
+    fn roms_load_from_zip_archives() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("rgbe-zip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip_path = dir.join("game.zip");
+        let rom = std::fs::read("test/cpu_instrs.gb").unwrap();
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+            let opts = zip::write::SimpleFileOptions::default();
+            z.start_file("readme.txt", opts).unwrap();
+            z.write_all(b"not a rom").unwrap();
+            z.start_file("Game (USA).GB", opts).unwrap();
+            z.write_all(&rom).unwrap();
+            z.finish().unwrap();
+        }
+        assert_eq!(read_rom(&zip_path).unwrap(), rom);
+        let (dev, _) = construct_cpu_auto(&zip_path.to_string_lossy()).unwrap();
+        assert_eq!(dev.romname(), "CPU_INSTRS");
+
+        let empty = dir.join("empty.zip");
+        zip::ZipWriter::new(std::fs::File::create(&empty).unwrap()).finish().unwrap();
+        assert_eq!(read_rom(&empty), Err("No .gb or .gbc file in the archive"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -15,7 +15,7 @@ On Linux systems, some system dependencies are required:
 
 ```sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libgtk-3-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libwayland-dev libxkbcommon-dev mesa-common-dev```
 
-Run with `cargo r --release`, or run the executable in `target\release`. Select your ROM using the GUI, drag it onto the window, or pass its path as the first argument.
+Run with `cargo r --release`, or run the executable in `target\release`. Select your ROM (.gb, .gbc, or a .zip containing one) using the GUI, drag it onto the window, or pass its path as the first argument.
 
 Supports saving in-game (battery-backed RAM) or with savestates. Gamepads are supported (bindings under Settings > Keybindings), as are GameShark RAM cheats (Emulation > Cheats).
 

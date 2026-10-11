@@ -723,7 +723,7 @@ impl RootApp {
 fn rom_path_is_supported(p: &Path) -> bool {
     matches!(
         p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()),
-        Some(ref ext) if ext == "gb" || ext == "gbc"
+        Some(ref ext) if ext == "gb" || ext == "gbc" || ext == "zip"
     )
 }
 
@@ -834,7 +834,7 @@ impl ApplicationHandler<UserEvent> for RootApp {
                 if *browse_requested {
                     *browse_requested = false;
                     if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("Game Boy ROMs", &["gb", "gbc"])
+                        .add_filter("Game Boy ROMs", &["gb", "gbc", "zip"])
                         .add_filter("All files", &["*"])
                         .set_directory(&rom_path)
                         .pick_file()
