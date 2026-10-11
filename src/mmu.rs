@@ -146,6 +146,13 @@ impl MMU {
         res.determine_mode();
         res.set_initial();
         res.gpu.set_post_boot_clock(0);
+        // DMG carts on CGB run the boot ROM's colorization path; this is
+        // where it leaves the divider (calibrated against Mooneye
+        // boot_div-cgbABCDE). Native CGB carts boot faster; their value
+        // isn't covered by a test ROM, so they keep starting from 0.
+        if res.gbmode == GbMode::ColorAsClassic {
+            res.timer.set_internal_counter(0x2674);
+        }
         Ok(res)
     }
 

@@ -340,7 +340,7 @@ mod mooneye {
     ]);
     rom_tests!(run_mooneye, true, "mooneye", [
         misc_bits_unused_hwio_c = "misc/bits/unused_hwio-C.gb",
-        #[ignore = "post-boot register/DIV state differs"] misc_boot_div_cgbabcde = "misc/boot_div-cgbABCDE.gb",
+        misc_boot_div_cgbabcde = "misc/boot_div-cgbABCDE.gb",
         misc_boot_hwio_c = "misc/boot_hwio-C.gb",
         misc_boot_regs_cgb = "misc/boot_regs-cgb.gb",
         #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] misc_ppu_vblank_stat_intr_c = "misc/ppu/vblank_stat_intr-C.gb",
@@ -410,5 +410,6 @@ fn bench() {
         println!("{path}: 60 emulated s in {secs:.3} s ({:.0}x realtime)", 60.0 / secs);
     }
 }
+
 
 
