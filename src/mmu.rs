@@ -28,7 +28,6 @@ pub struct MMU {
     pub timer: Timer,
     pub keypad: Keypad,
     pub gpu: GPU,
-    #[rkyv(with = rkyv::with::Skip)]
     pub sound: Option<Sound>,
     hdma_status: DMAType,
     hdma_src: u16,
@@ -90,6 +89,9 @@ impl MMU {
             return Err("This game does not work in Classic mode");
         }
         res.set_initial();
+        // Where the DMG boot ROM leaves the divider at PC=0x0100 (DIV = 0xAB),
+        // calibrated against Mooneye boot_div-dmgABCmgb.
+        res.timer.set_internal_counter(0xABC8);
         Ok(res)
     }
 
@@ -192,6 +194,22 @@ impl MMU {
         self.serial.interrupt = 0;
 
         return gputicks;
+    }
+
+    /// True while a CGB general-purpose or HBlank VRAM DMA is in progress.
+    pub fn vram_dma_active(&self) -> bool {
+        self.hdma_status != DMAType::NoDMA
+    }
+
+    /// CPU T-cycles that can pass before any peripheral could raise an
+    /// interrupt (used to fast-forward HALT). 0 means "don't skip".
+    pub fn ticks_until_event(&self) -> u32 {
+        // HDMA blocks run on HBlank boundaries; keep them exact.
+        if self.hdma_status != DMAType::NoDMA {
+            return 0;
+        }
+        let gpu = self.gpu.ticks_until_event().saturating_mul(self.gbspeed as u32);
+        gpu.min(self.timer.ticks_until_event())
     }
 
     pub fn rb(&mut self, address: u16) -> u8 {
@@ -396,7 +414,9 @@ impl MMU {
             self.hdma_status = DMAType::NoDMA;
         }
 
-        return 8;
+        // Pan Docs: each 16-byte block takes 8 M-cycles at single speed
+        // (16 at double speed), i.e. 32 dots either way. Callers count in dots.
+        return 32;
     }
 
     fn perform_gdma(&mut self) -> u32 {
@@ -406,7 +426,7 @@ impl MMU {
         }
 
         self.hdma_status = DMAType::NoDMA;
-        return len * 8;
+        return len * 32;
     }
 
     fn perform_vramdma_row(&mut self) {

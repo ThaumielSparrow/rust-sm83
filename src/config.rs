@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use rust_gbe::KeypadKey;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,7 @@ impl TurboSetting {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct KeyBindings {
     pub a: String,
     pub b: String,
@@ -56,6 +58,47 @@ pub struct KeyBindings {
     pub down: String,
     pub left: String,
     pub right: String,
+}
+
+impl KeyBindings {
+    fn slot_mut(&mut self, k: KeypadKey) -> &mut String {
+        match k {
+            KeypadKey::A => &mut self.a,
+            KeypadKey::B => &mut self.b,
+            KeypadKey::Start => &mut self.start,
+            KeypadKey::Select => &mut self.select,
+            KeypadKey::Up => &mut self.up,
+            KeypadKey::Down => &mut self.down,
+            KeypadKey::Left => &mut self.left,
+            KeypadKey::Right => &mut self.right,
+        }
+    }
+
+    /// Bind `value` to `k`. Reserved system keys are refused (returns false).
+    /// If another Game Boy button already uses `value`, the two swap so no
+    /// key ends up driving two buttons.
+    pub fn assign(&mut self, k: KeypadKey, value: String) -> bool {
+        if crate::input::is_reserved_key_name(&value) {
+            return false;
+        }
+        let old = self.slot_mut(k).clone();
+        for other in [
+            KeypadKey::A,
+            KeypadKey::B,
+            KeypadKey::Start,
+            KeypadKey::Select,
+            KeypadKey::Up,
+            KeypadKey::Down,
+            KeypadKey::Left,
+            KeypadKey::Right,
+        ] {
+            if other != k && *self.slot_mut(other) == value {
+                *self.slot_mut(other) = old.clone();
+            }
+        }
+        *self.slot_mut(k) = value;
+        true
+    }
 }
 
 impl Default for KeyBindings {
@@ -97,7 +140,10 @@ impl Default for GamepadBindings {
     }
 }
 
+/// Missing fields fall back to `Config::default()` (or their field-level
+/// default) so an older or hand-trimmed config.json still loads.
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct Config {
     pub keybindings: KeyBindings,
     pub scale: u32,
@@ -114,6 +160,18 @@ pub struct Config {
     #[serde(default)] pub dmg_palette_preset: DmgPalettePreset,
     #[serde(default="default_custom_palette")] pub dmg_palette_custom: [[u8; 3]; 4],
     #[serde(default)] pub gamepad: GamepadBindings,
+    /// Main window's last outer position (physical px), restored at startup.
+    #[serde(default)] pub window_pos: Option<(i32, i32)>,
+    /// Pause emulation while the window is in the background.
+    #[serde(default)] pub pause_on_focus_loss: bool,
+}
+
+static LOAD_WARNING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The message from the last `Config::load` that had to discard a corrupt
+/// file, if any. Cleared on read.
+pub fn take_load_warning() -> Option<String> {
+    LOAD_WARNING.lock().ok().and_then(|mut w| w.take())
 }
 
 fn default_volume() -> u8 { 100 }
@@ -136,14 +194,43 @@ impl Default for Config {
             dmg_palette_preset: DmgPalettePreset::default(),
             dmg_palette_custom: default_custom_palette(),
             gamepad: GamepadBindings::default(),
+            window_pos: None,
+            pause_on_focus_loss: false,
         }
     }
 }
 
 impl Config {
+    /// Load the config, or defaults if there is none. A file that exists but
+    /// doesn't parse is moved aside (never silently overwritten by the next
+    /// save) and a warning is queued for `take_load_warning`.
     pub fn load(path: &PathBuf) -> Self {
-        if let Ok(data) = fs::read_to_string(path) { if let Ok(cfg) = serde_json::from_str::<Config>(&data) { return cfg; } }
-        Config::default()
+        let Ok(data) = fs::read_to_string(path) else {
+            return Config::default();
+        };
+        match serde_json::from_str::<Config>(&data) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let backup = path.with_extension(format!("json.bad-{stamp}"));
+                let msg = match fs::rename(path, &backup) {
+                    Ok(()) => format!(
+                        "config.json was unreadable ({}); using defaults. The old file was kept as {}",
+                        e,
+                        backup.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                    Err(_) => format!("config.json was unreadable ({e}); using defaults"),
+                };
+                crate::log::warn(&msg);
+                if let Ok(mut w) = LOAD_WARNING.lock() {
+                    *w = Some(msg);
+                }
+                Config::default()
+            }
+        }
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let data = serde_json::to_string_pretty(self)
@@ -163,20 +250,62 @@ impl Config {
 
     /// Insert `p` at the front of recent_roms, deduplicating and truncating to 8.
     pub fn push_recent(&mut self, p: &Path) {
-        let s = p.to_string_lossy().into_owned();
-        self.recent_roms.retain(|x| x != &s);
-        self.recent_roms.insert(0, s);
-        self.recent_roms.truncate(8);
+        push_recent(&mut self.recent_roms, p);
     }
+}
+
+/// Insert `p` at the front of a recent-ROMs list, deduplicating and truncating to 8.
+pub fn push_recent(list: &mut Vec<String>, p: &Path) {
+    let s = p.to_string_lossy().into_owned();
+    list.retain(|x| x != &s);
+    list.insert(0, s);
+    list.truncate(8);
 }
 
 /// Load config, apply mutation, save. Used by GUI when a single setting changes —
 /// avoids each call site needing to know every Config field.
 pub fn update_config<F: FnOnce(&mut Config)>(f: F) {
-    let mut cfg = Config::load(&config_path());
+    // Apply on top of any not-yet-flushed debounced edits so none are lost.
+    let pending = PENDING.lock().ok().and_then(|mut p| p.take());
+    let mut cfg = pending.map(|(c, _)| c).unwrap_or_else(|| Config::load(&config_path()));
     f(&mut cfg);
     if let Err(e) = cfg.save(&config_path()) {
-        eprintln!("config save failed: {}", e);
+        crate::log::warn(format!("config save failed: {}", e));
+    }
+}
+
+/// Debounced edits: the config with changes applied, and when it last changed.
+static PENDING: std::sync::Mutex<Option<(Config, std::time::Instant)>> = std::sync::Mutex::new(None);
+
+/// How long a debounced edit waits for the next one before it is written.
+const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Like `update_config`, but for rapid-fire edits (slider drags, color
+/// pickers): changes are held in memory and written once they stop for
+/// `DEBOUNCE`, by `flush_pending_config`.
+pub fn update_config_debounced<F: FnOnce(&mut Config)>(f: F) {
+    if let Ok(mut pending) = PENDING.lock() {
+        let entry = pending
+            .get_or_insert_with(|| (Config::load(&config_path()), std::time::Instant::now()));
+        f(&mut entry.0);
+        entry.1 = std::time::Instant::now();
+    }
+}
+
+/// Write debounced edits that have settled, or all of them when `force`
+/// (on exit). Called regularly from the GUI loop.
+pub fn flush_pending_config(force: bool) {
+    let ready = PENDING.lock().ok().and_then(|mut p| {
+        if p.as_ref().is_some_and(|(_, at)| force || at.elapsed() >= DEBOUNCE) {
+            p.take()
+        } else {
+            None
+        }
+    });
+    if let Some((cfg, _)) = ready
+        && let Err(e) = cfg.save(&config_path())
+    {
+        crate::log::warn(format!("config save failed: {}", e));
     }
 }
 
@@ -227,6 +356,40 @@ mod tests {
         let back: Config = serde_json::from_str(&json).expect("parse");
         assert_eq!(back.cheats["ZELDA"].len(), 1);
         assert!(back.cheats["ZELDA"][0].enabled);
+    }
+
+    #[test]
+    fn empty_object_loads_as_defaults() {
+        let cfg: Config = serde_json::from_str("{}").expect("parse");
+        assert_eq!(cfg.scale, Config::default().scale);
+        assert_eq!(cfg.volume, 100);
+        assert_eq!(cfg.keybindings.a, "X");
+    }
+
+    #[test]
+    fn corrupt_config_is_moved_aside_not_lost() {
+        let dir = std::env::temp_dir().join(format!("rgbe-cfg-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        fs::write(&path, "{ not json").unwrap();
+        let cfg = Config::load(&path);
+        assert_eq!(cfg.scale, Config::default().scale);
+        assert!(!path.exists(), "corrupt file must be moved, not left to be overwritten");
+        let backups: Vec<_> = fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read_to_string(backups[0].path()).unwrap(), "{ not json");
+        assert!(take_load_warning().is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn assign_refuses_reserved_and_swaps_duplicates() {
+        let mut kb = KeyBindings::default();
+        assert!(!kb.assign(KeypadKey::A, "F1".into()), "F1 is a reserved save key");
+        assert_eq!(kb.a, "X");
+        assert!(kb.assign(KeypadKey::A, "Z".into()));
+        assert_eq!(kb.a, "Z");
+        assert_eq!(kb.b, "X", "B previously held Z and takes A's old key");
     }
 
     #[test]

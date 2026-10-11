@@ -6,6 +6,36 @@ const VOAM_SIZE: usize = 0xA0;
 pub const SCREEN_W: usize = 160;
 pub const SCREEN_H: usize = 144;
 
+/// Per-line RGB lookup tables (see `GPU::line_luts`).
+struct LineLuts {
+    bg: [[u8; 3]; 32],
+    obj: [[u8; 3]; 32],
+}
+
+fn put(line: &mut [u8], x: usize, rgb: [u8; 3]) {
+    line[x * 3..x * 3 + 3].copy_from_slice(&rgb);
+}
+
+/// CGB 15-bit color (5 bits per channel) to display RGB, with the color
+/// correction taken from the Gambatte emulator.
+fn cgb_rgb(r: u8, g: u8, b: u8) -> [u8; 3] {
+    let (r, g, b) = (r as u32, g as u32, b as u32);
+    [
+        ((r * 13 + g * 2 + b) >> 1) as u8,
+        ((g * 3 + b) << 1) as u8,
+        ((r * 3 + g * 2 + b * 11) >> 1) as u8,
+    ]
+}
+
+/// One 8-pixel row of a background or window tile.
+struct TileRow {
+    b1: u8,
+    b2: u8,
+    palnr: usize,
+    xflip: bool,
+    prio: bool,
+}
+
 #[derive(PartialEq, Copy, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 enum PrioType {
     Color0,
@@ -55,7 +85,11 @@ pub struct GPU {
     // Two reusable frame buffers (RGB bytes). We render into the back buffer and
     // swap at start of VBlank, flagging 'updated'. This allows the front buffer
     // to be read concurrently (e.g., by UI) without copying mid-frame.
+    // Not saved: they're output, and a decoded GPU takes the live one's via
+    // `adopt_frame_buffers` (the next frame is fully redrawn anyway).
+    #[rkyv(with = rkyv::with::Skip)]
     frame_buffers: [Vec<u8>; 2],
+    #[rkyv(with = rkyv::with::Skip)]
     front: usize, // index of front buffer (0 or 1)
     bgprio: [PrioType; SCREEN_W],
     pub updated: bool,
@@ -162,6 +196,29 @@ impl GPU {
                 }
             }
         }
+    }
+
+    /// Dots until the next mode or line change, i.e. the next point where an
+    /// interrupt could be raised. `u32::MAX` while the LCD is off; 0 if the
+    /// mode is out of step with the clock (it will be fixed on the next step,
+    /// which must not be skipped).
+    pub fn ticks_until_event(&self) -> u32 {
+        if !self.lcd_on {
+            return u32::MAX;
+        }
+        let (expected_mode, next) = if self.line >= 144 {
+            (1, 456)
+        } else if self.modeclock <= 80 {
+            (2, 81)
+        } else if self.modeclock <= 80 + 172 {
+            (3, 253)
+        } else {
+            (0, 456)
+        };
+        if self.mode != expected_mode {
+            return 0;
+        }
+        next - self.modeclock
     }
 
     fn update_stat_signal(&mut self) {
@@ -435,39 +492,47 @@ impl GPU {
             return;
         }
 
-        for x in 0..SCREEN_W {
-            self.setcolor(x, 255);
-            self.bgprio[x] = PrioType::Normal;
+        // Render straight into this line of the back buffer. Taking the Vec
+        // out (free) lets the draw functions borrow `self` alongside it.
+        let back = self.front ^ 1;
+        let mut fb = std::mem::take(&mut self.frame_buffers[back]);
+        let start = self.line as usize * SCREEN_W * 3;
+        let line = &mut fb[start..start + SCREEN_W * 3];
+        line.fill(255);
+        // A pixel the BG/window never draws counts as BG color 0, so
+        // "behind BG" sprites still show over it.
+        self.bgprio = [PrioType::Color0; SCREEN_W];
+
+        let luts = self.line_luts();
+        self.draw_bg(line, &luts);
+        self.draw_sprites(line, &luts);
+        self.frame_buffers[back] = fb;
+    }
+
+    /// RGB for every palette entry, built once per line instead of per pixel.
+    /// Index = palette * 4 + color number. DMG: BG uses 0-3, OBP0 0-3, OBP1 4-7.
+    fn line_luts(&self) -> LineLuts {
+        let mut luts = LineLuts { bg: [[0; 3]; 32], obj: [[0; 3]; 32] };
+        if self.gbmode == GbMode::Color {
+            for p in 0..8 {
+                for c in 0..4 {
+                    let [r, g, b] = self.cbgpal[p][c];
+                    luts.bg[p * 4 + c] = cgb_rgb(r, g, b);
+                    let [r, g, b] = self.csprit[p][c];
+                    luts.obj[p * 4 + c] = cgb_rgb(r, g, b);
+                }
+            }
+        } else {
+            for c in 0..4 {
+                luts.bg[c] = [self.palb[c]; 3];
+                luts.obj[c] = [self.pal0[c]; 3];
+                luts.obj[4 + c] = [self.pal1[c]; 3];
+            }
         }
-        self.draw_bg();
-        self.draw_sprites();
+        luts
     }
 
-    fn setcolor(&mut self, x: usize, color: u8) {
-        let buf = &mut self.frame_buffers[self.front ^ 1];
-        let base = self.line as usize * SCREEN_W * 3 + x * 3;
-        buf[base] = color;
-        buf[base + 1] = color;
-        buf[base + 2] = color;
-    }
-
-    fn setrgb(&mut self, x: usize, r: u8, g: u8, b: u8) {
-        // Gameboy Color RGB correction
-        // Taken from the Gambatte emulator
-        // assume r, g and b are between 0 and 1F
-        let buf = &mut self.frame_buffers[self.front ^ 1];
-        let baseidx = self.line as usize * SCREEN_W * 3 + x * 3;
-
-        let r = r as u32;
-        let g = g as u32;
-        let b = b as u32;
-
-        buf[baseidx + 0] = ((r * 13 + g * 2 + b) >> 1) as u8;
-        buf[baseidx + 1] = ((g * 3 + b) << 1) as u8;
-        buf[baseidx + 2] = ((r * 3 + g * 2 + b * 11) >> 1) as u8;
-    }
-
-    fn draw_bg(&mut self) {
+    fn draw_bg(&mut self, line: &mut [u8], luts: &LineLuts) {
         let drawbg = self.gbmode == GbMode::Color || self.lcdc0;
 
         let wx_trigger = self.winx <= 166;
@@ -478,98 +543,116 @@ impl GPU {
             -1
         };
 
-        if winy < 0 && !drawbg {
+        // DMG: LCDC.0 = 0 blanks both background and window.
+        if (winy < 0 || self.gbmode != GbMode::Color) && !drawbg {
             return;
         }
 
-        let wintiley = (winy as u16 >> 3) & 31;
+        // The window covers the screen from x = WX - 7 to the right edge.
+        let win_start = if winy >= 0 {
+            (self.winx as i32 - 7).max(0) as usize
+        } else {
+            SCREEN_W
+        };
 
-        let bgy = self.scy.wrapping_add(self.line);
-        let bgtiley = (bgy as u16 >> 3) & 31;
+        // Background, left of the window. One tile fetch per 8 pixels.
+        if drawbg {
+            let bgy = self.scy.wrapping_add(self.line);
+            let tiley = (bgy as u16 >> 3) & 31;
+            let mut x = 0;
+            while x < win_start {
+                let bgx = self.scx as usize + x;
+                let pixelx = bgx & 7;
+                let tilex = (bgx as u16 >> 3) & 31;
+                let row = self.fetch_tile_row(self.bg_tilemap, tiley, tilex, bgy as u16 & 7);
+                let n = (8 - pixelx).min(win_start - x);
+                for i in 0..n {
+                    self.put_bg_pixel(line, luts, x + i, &row, pixelx + i);
+                }
+                x += n;
+            }
+        }
 
-        for x in 0..SCREEN_W {
-            let winx = -((self.winx as i32) - 7) + (x as i32);
-            let bgx = self.scx as u32 + x as u32;
-
-            let (tilemapbase, tiley, tilex, pixely, pixelx) = if winy >= 0 && winx >= 0 {
-                (
-                    self.win_tilemap,
-                    wintiley,
-                    (winx as u16 >> 3),
-                    winy as u16 & 0x07,
-                    winx as u8 & 0x07,
-                )
-            } else if drawbg {
-                (
-                    self.bg_tilemap,
-                    bgtiley,
-                    (bgx as u16 >> 3) & 31,
-                    bgy as u16 & 0x07,
-                    bgx as u8 & 0x07,
-                )
-            } else {
-                continue;
-            };
-
-            let tilenr: u8 = self.rbvram0(tilemapbase + tiley * 32 + tilex);
-
-            let (palnr, vram1, xflip, yflip, prio) = if self.gbmode == GbMode::Color {
-                let flags = self.rbvram1(tilemapbase + tiley * 32 + tilex) as usize;
-                (
-                    flags & 0x07,
-                    flags & (1 << 3) != 0,
-                    flags & (1 << 5) != 0,
-                    flags & (1 << 6) != 0,
-                    flags & (1 << 7) != 0,
-                )
-            } else {
-                (0, false, false, false, false)
-            };
-
-            let tileaddress = self.tilebase
-                + (if self.tilebase == 0x8000 {
-                    tilenr as u16
-                } else {
-                    (tilenr as i8 as i16 + 128) as u16
-                }) * 16;
-
-            let a0 = match yflip {
-                false => tileaddress + (pixely * 2),
-                true => tileaddress + (14 - (pixely * 2)),
-            };
-
-            let (b1, b2) = match vram1 {
-                false => (self.rbvram0(a0), self.rbvram0(a0 + 1)),
-                true => (self.rbvram1(a0), self.rbvram1(a0 + 1)),
-            };
-
-            let xbit = match xflip {
-                true => pixelx,
-                false => 7 - pixelx,
-            } as u32;
-            let colnr = if b1 & (1 << xbit) != 0 { 1 } else { 0 }
-                | if b2 & (1 << xbit) != 0 { 2 } else { 0 };
-
-            self.bgprio[x] = if colnr == 0 {
-                PrioType::Color0
-            } else if prio {
-                PrioType::PrioFlag
-            } else {
-                PrioType::Normal
-            };
-            if self.gbmode == GbMode::Color {
-                let r = self.cbgpal[palnr][colnr][0];
-                let g = self.cbgpal[palnr][colnr][1];
-                let b = self.cbgpal[palnr][colnr][2];
-                self.setrgb(x as usize, r, g, b);
-            } else {
-                let color = self.palb[colnr];
-                self.setcolor(x, color);
+        // Window.
+        if win_start < SCREEN_W {
+            let tiley = (winy as u16 >> 3) & 31;
+            let pixely = winy as u16 & 0x07;
+            let mut x = win_start;
+            while x < SCREEN_W {
+                let wx = (x as i32 - (self.winx as i32 - 7)) as usize;
+                let pixelx = wx & 7;
+                let row = self.fetch_tile_row(self.win_tilemap, tiley, (wx >> 3) as u16, pixely);
+                let n = (8 - pixelx).min(SCREEN_W - x);
+                for i in 0..n {
+                    self.put_bg_pixel(line, luts, x + i, &row, pixelx + i);
+                }
+                x += n;
             }
         }
     }
 
-    fn draw_sprites(&mut self) {
+    /// Fetch one 8-pixel row of a BG/window tile: map entry, CGB attributes
+    /// and the two bitplanes.
+    fn fetch_tile_row(&self, tilemapbase: u16, tiley: u16, tilex: u16, pixely: u16) -> TileRow {
+        let mapaddr = tilemapbase + tiley * 32 + tilex;
+        let tilenr: u8 = self.rbvram0(mapaddr);
+
+        let (palnr, vram1, xflip, yflip, prio) = if self.gbmode == GbMode::Color {
+            let flags = self.rbvram1(mapaddr) as usize;
+            (
+                flags & 0x07,
+                flags & (1 << 3) != 0,
+                flags & (1 << 5) != 0,
+                flags & (1 << 6) != 0,
+                flags & (1 << 7) != 0,
+            )
+        } else {
+            (0, false, false, false, false)
+        };
+
+        let tileaddress = self.tilebase
+            + (if self.tilebase == 0x8000 {
+                tilenr as u16
+            } else {
+                (tilenr as i8 as i16 + 128) as u16
+            }) * 16;
+
+        let a0 = match yflip {
+            false => tileaddress + (pixely * 2),
+            true => tileaddress + (14 - (pixely * 2)),
+        };
+
+        let (b1, b2) = match vram1 {
+            false => (self.rbvram0(a0), self.rbvram0(a0 + 1)),
+            true => (self.rbvram1(a0), self.rbvram1(a0 + 1)),
+        };
+
+        TileRow { b1, b2, palnr, xflip, prio }
+    }
+
+    /// Draw pixel `pixelx` (0-7, before flipping) of `row` at screen column `x`.
+    fn put_bg_pixel(
+        &mut self,
+        line: &mut [u8],
+        luts: &LineLuts,
+        x: usize,
+        row: &TileRow,
+        pixelx: usize,
+    ) {
+        let xbit = if row.xflip { pixelx } else { 7 - pixelx };
+        let colnr = ((row.b1 >> xbit) & 1) as usize | ((((row.b2 >> xbit) & 1) as usize) << 1);
+
+        self.bgprio[x] = if colnr == 0 {
+            PrioType::Color0
+        } else if row.prio {
+            PrioType::PrioFlag
+        } else {
+            PrioType::Normal
+        };
+        put(line, x, luts.bg[row.palnr * 4 + colnr]);
+    }
+
+    fn draw_sprites(&mut self, out: &mut [u8], luts: &LineLuts) {
         if !self.sprite_on {
             return;
         }
@@ -598,7 +681,11 @@ impl GPU {
             sprites_to_draw[..sidx].sort_unstable_by(dmg_sprite_order);
         }
 
-        for &(spritex, spritey, i) in &sprites_to_draw[..sidx] {
+        // Sprites are drawn highest-priority first. The first opaque sprite
+        // pixel claims its column even when it ends up hidden behind the BG,
+        // so a lower-priority sprite can never show through it.
+        let mut claimed = [false; SCREEN_W];
+        for &(spritex, spritey, i) in sprites_to_draw[..sidx].iter().rev() {
             if spritex < -7 || spritex >= (SCREEN_W as i32) {
                 continue;
             }
@@ -639,6 +726,11 @@ impl GPU {
                 if colnr == 0 {
                     continue;
                 }
+                let px = (spritex + x) as usize;
+                if claimed[px] {
+                    continue;
+                }
+                claimed[px] = true;
 
                 if self.gbmode == GbMode::Color {
                     if self.lcdc0
@@ -647,20 +739,12 @@ impl GPU {
                     {
                         continue 'xloop;
                     }
-                    let r = self.csprit[c_palnr][colnr][0];
-                    let g = self.csprit[c_palnr][colnr][1];
-                    let b = self.csprit[c_palnr][colnr][2];
-                    self.setrgb((spritex + x) as usize, r, g, b);
+                    put(out, px, luts.obj[c_palnr * 4 + colnr]);
                 } else {
                     if belowbg && self.bgprio[(spritex + x) as usize] != PrioType::Color0 {
                         continue 'xloop;
                     }
-                    let color = if usepal1 {
-                        self.pal1[colnr]
-                    } else {
-                        self.pal0[colnr]
-                    };
-                    self.setcolor((spritex + x) as usize, color);
+                    put(out, px, luts.obj[(usepal1 as usize) * 4 + colnr]);
                 }
             }
         }
@@ -672,6 +756,13 @@ impl GPU {
 }
 
 impl GPU {
+    /// Take over `live`'s frame buffers after this GPU was decoded from a save
+    /// state (decoded buffers are empty).
+    pub fn adopt_frame_buffers(&mut self, live: &mut GPU) {
+        std::mem::swap(&mut self.frame_buffers, &mut live.frame_buffers);
+        self.front = live.front;
+    }
+
     /// Returns the current front (display) frame buffer.
     pub fn front_buffer(&self) -> &[u8] { &self.frame_buffers[self.front] }
 }
@@ -726,5 +817,55 @@ mod tests {
             !gpu.prev_stat_signal,
             "LCD disable must reset prev_stat_signal"
         );
+    }
+
+    /// Two sprites overlap; the higher-priority one (lower OAM index, same X)
+    /// is flagged behind-BG and the BG pixel is opaque. Hardware picks the
+    /// higher-priority sprite first and then hides it, so the BG must show —
+    /// the lower-priority sprite must not leak through (dmg-acid2).
+    #[test]
+    fn hidden_high_priority_sprite_masks_lower_sprites() {
+        let mut gpu = GPU::new();
+        gpu.wb(0xFF40, 0x93); // LCD, BG, sprites on; tile data at 0x8000
+        gpu.wb(0xFF47, 0xE4); // BGP identity
+        gpu.wb(0xFF48, 0xE4); // OBP0 identity
+        gpu.first_frame = false;
+        gpu.line = 0;
+        for a in 0x8000..0x8010 {
+            gpu.wb(a, 0xFF); // tile 0 (BG): color 3 everywhere
+        }
+        for a in (0x8010..0x8020).step_by(2) {
+            gpu.wb(a, 0xFF); // tile 1 (sprites): color 1 everywhere
+        }
+        // OAM 0: behind BG. OAM 1: normal. Same position.
+        for (i, flags) in [(0u16, 0x80u8), (1, 0x00)] {
+            let base = 0xFE00 + i * 4;
+            gpu.wb(base, 16);
+            gpu.wb(base + 1, 8);
+            gpu.wb(base + 2, 1);
+            gpu.wb(base + 3, flags);
+        }
+        gpu.renderscan();
+        let back = &gpu.frame_buffers[gpu.front ^ 1];
+        assert_eq!(back[0], 0, "BG color 3 should win over both sprites");
+    }
+
+    /// DMG with LCDC.0 = 0: neither BG nor window is drawn (white).
+    #[test]
+    fn dmg_lcdc0_off_hides_window() {
+        let mut gpu = GPU::new();
+        gpu.wb(0xFF40, 0xB0); // LCD on, window on, tile data 0x8000, BG off
+        gpu.wb(0xFF47, 0xE4);
+        gpu.wb(0xFF4A, 0); // WY
+        gpu.wb(0xFF4B, 7); // WX
+        gpu.first_frame = false;
+        gpu.line = 0;
+        gpu.wy_trigger = true;
+        for a in 0x8000..0x8010 {
+            gpu.wb(a, 0xFF);
+        }
+        gpu.renderscan();
+        let back = &gpu.frame_buffers[gpu.front ^ 1];
+        assert_eq!(back[0], 255, "window must be blanked when LCDC.0 = 0 on DMG");
     }
 }

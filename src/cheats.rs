@@ -34,6 +34,11 @@ pub fn parse_code(input: &str) -> Result<PokeOp, &'static str> {
     };
     let (ty, value, lo, hi) = (bytes[0], bytes[1], bytes[2], bytes[3]);
     let addr = u16::from_le_bytes([lo, hi]);
+    // GameShark pokes target cartridge RAM and WRAM. Anything below 0xA000
+    // is ROM, where a write is an MBC bank-switch command, not a poke.
+    if !(0xA000..=0xDFFF).contains(&addr) {
+        return Err("Address must be in RAM (A000-DFFF)");
+    }
     match ty {
         0x00 | 0x01 => Ok(PokeOp { bank: None, addr, value }),
         0x90..=0x97 => Ok(PokeOp { bank: Some(ty & 0x07), addr, value }),
@@ -107,6 +112,8 @@ mod tests {
         assert!(parse_code("01FF56D3AA").is_err(), "too long");
         assert!(parse_code("ZZFF56D3").is_err(), "not hex");
         assert!(parse_code("88FF56D3").is_err(), "unsupported type");
+        assert!(parse_code("01010020").is_err(), "ROM address (MBC register)");
+        assert!(parse_code("01FF80FF").is_err(), "outside cart RAM / WRAM");
     }
 
     #[test]

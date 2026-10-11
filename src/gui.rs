@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cpal::Stream;
 use gilrs::{Axis, EventType, Gilrs};
@@ -12,7 +12,7 @@ use rust_gbe::device::{read_save_state_preview, SaveStatePreview};
 use time::{Month, OffsetDateTime, UtcOffset};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Fullscreen, WindowId};
 
@@ -215,6 +215,8 @@ enum RootPhase {
         // Window height (logical px) last requested to fit the egui content,
         // used to avoid re-requesting the same size every frame.
         requested_height: Option<f32>,
+        /// Why the last ROM failed to load, shown under the path field.
+        load_error: Option<String>,
     },
     Running {
         texture: glium::texture::texture2d::Texture2d,
@@ -228,6 +230,11 @@ enum RootPhase {
         keybindings: KeyBindings,
         capturing: Option<rust_gbe::KeypadKey>,
         _audio: Option<Stream>,
+        /// Queue/health view of `_audio`; None when running on the null player.
+        audio_clock: Option<crate::audio::AudioClock>,
+        /// When to next try (re)opening an audio device, if the current one
+        /// failed or none was available.
+        audio_retry_at: Option<Instant>,
         // Timestamp of last Escape press. A single press will set this; a second press
         // within ESC_DOUBLE_PRESS_MS will trigger emulator exit. Kept here so the state
         // survives between key events.
@@ -258,6 +265,9 @@ enum RootPhase {
         toasts: ToastQueue,
         integer_scaling: bool,
         auto_resume: bool,
+        pause_on_focus_loss: bool,
+        /// True while paused because the window lost focus (resume on regain).
+        focus_paused: bool,
         cheats: Vec<crate::cheats::Cheat>,
         cheat_key: String,
         cheat_entry: String,
@@ -288,13 +298,40 @@ pub struct RootApp {
     bind_window: Option<AuxWindow>,
     /// Some while the cheats window is open.
     cheat_window: Option<AuxWindow>,
+    /// In-memory copy of `Config::recent_roms` so the menus don't re-read
+    /// config.json every frame.
+    recent_roms: Vec<String>,
+    /// Main window position, saved to config on exit.
+    window_pos: Option<(i32, i32)>,
+    /// Lets the emulator thread wake the (otherwise sleeping) event loop.
+    proxy: EventLoopProxy<UserEvent>,
+}
+
+/// How often to retry opening an audio device while there is none.
+const AUDIO_RETRY: Duration = Duration::from_secs(2);
+
+/// Custom event-loop events.
+#[derive(Debug)]
+pub enum UserEvent {
+    /// The emulator thread sent a frame or a `GuiEvent`, or exited.
+    /// `about_to_wait` does the actual draining.
+    Wake,
 }
 
 impl RootApp {
-    pub fn new(scale: u32, pending_rom: Option<PathBuf>) -> Self {
-        let default_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_string_lossy().to_string()))
+    pub fn new(scale: u32, pending_rom: Option<PathBuf>, proxy: EventLoopProxy<UserEvent>) -> Self {
+        let cfg = Config::load(&config_path());
+        // Start the picker in the folder of the most recent ROM.
+        let default_dir = cfg
+            .recent_roms
+            .first()
+            .and_then(|p| std::path::Path::new(p).parent())
+            .map(|p| p.to_string_lossy().to_string())
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|p| p.to_string_lossy().to_string()))
+            })
             .unwrap_or_else(|| ".".to_string());
         RootApp {
             window: None,
@@ -304,6 +341,7 @@ impl RootApp {
                 rom_path: default_dir,
                 browse_requested: false,
                 requested_height: None,
+                load_error: crate::config::take_load_warning(),
             },
             scale,
             pending_rom,
@@ -312,12 +350,15 @@ impl RootApp {
             gilrs: match Gilrs::new() {
                 Ok(g) => Some(g),
                 Err(e) => {
-                    eprintln!("gamepad support unavailable: {}", e);
+                    crate::log::warn(format!("gamepad support unavailable: {}", e));
                     None
                 }
             },
             bind_window: None,
             cheat_window: None,
+            recent_roms: cfg.recent_roms,
+            proxy,
+            window_pos: cfg.window_pos,
         }
     }
 
@@ -399,18 +440,11 @@ impl RootApp {
                             } else {
                                 close = true;
                             }
-                        } else if let Some(kp) = *capturing {
-                            let value = key_to_string(&logical.as_ref());
-                            match kp {
-                                rust_gbe::KeypadKey::A => keybindings.a = value.clone(),
-                                rust_gbe::KeypadKey::B => keybindings.b = value.clone(),
-                                rust_gbe::KeypadKey::Start => keybindings.start = value.clone(),
-                                rust_gbe::KeypadKey::Select => keybindings.select = value.clone(),
-                                rust_gbe::KeypadKey::Up => keybindings.up = value.clone(),
-                                rust_gbe::KeypadKey::Down => keybindings.down = value.clone(),
-                                rust_gbe::KeypadKey::Left => keybindings.left = value.clone(),
-                                rust_gbe::KeypadKey::Right => keybindings.right = value.clone(),
-                            }
+                        } else if let Some(kp) = *capturing
+                            && !keyevent.repeat
+                            && keybindings.assign(kp, key_to_string(&logical.as_ref()))
+                        {
+                            // A refused (reserved) key leaves capture active.
                             *capturing = None;
                             let bindings_clone = keybindings.clone();
                             crate::config::update_config(|c| c.keybindings = bindings_clone);
@@ -437,15 +471,11 @@ impl RootApp {
                     _ => None,
                 };
                 if let Some(p) = path {
-                    self.stop_emulator();
                     // Reset must boot fresh, not re-resume the just-flushed state.
                     self.start_game_from_path(p, false);
                 }
             }
             Some(PendingAction::LoadRom(p)) => {
-                if let RootPhase::Running { .. } = &self.phase {
-                    self.stop_emulator();
-                }
                 self.start_game_from_path(p, true);
             }
             None => {}
@@ -455,18 +485,33 @@ impl RootApp {
     /// `resume`: attempt to continue from the auto-save written at last
     /// shutdown. Reset passes false — it must not re-load the state that
     /// `stop_emulator` just flushed.
+    ///
+    /// If a game is already running it keeps running until the new ROM has
+    /// loaded, so a bad or missing file only produces an error toast.
     fn start_game_from_path(&mut self, rom_path: PathBuf, resume: bool) {
+        // Relaunching the running ROM (reset, or picking it from recents):
+        // stop first so the outgoing emulator flushes battery RAM and the
+        // auto-save before the new device reads them.
+        let same_rom =
+            matches!(&self.phase, RootPhase::Running { rom_path: cur, .. } if *cur == rom_path);
+        if same_rom {
+            self.stop_emulator();
+        }
         // Always run in (CGB-capable) mode; attempt CGB first, fallback to classic if needed.
         let filename = rom_path.to_string_lossy().to_string();
-        let (mut cpu, _) = match construct_cpu_auto(&filename) {
-            Some(pair) => pair,
-            None => {
-                self.exit_code = EXITCODE_CPULOADFAILS;
+        let (mut cpu, load_warning) = match construct_cpu_auto(&filename) {
+            Ok(pair) => pair,
+            Err(msg) => {
+                self.report_load_failure(&rom_path, msg);
                 return;
             }
         };
+        self.stop_emulator();
         let cfg = Config::load(&config_path());
         let mut toasts = ToastQueue::default();
+        if let Some(w) = load_warning {
+            toasts.push(w, ToastKind::Info);
+        }
         if resume && cfg.auto_resume && cpu.has_auto_save() {
             match cpu.load_auto_save() {
                 Ok(()) => toasts.push("Resumed last session", ToastKind::Success),
@@ -482,9 +527,11 @@ impl RootApp {
         // Enable audio by default; if no device is available, fall back to a
         // discarding player so the APU is still emulated (games poll NR52 etc.).
         let mut audio_stream = None;
-        if let Some((player, s)) = init_audio() {
+        let mut audio_clock = None;
+        if let Some((player, s, clock)) = init_audio() {
             cpu.enable_audio(player, true);
             audio_stream = Some(s);
+            audio_clock = Some(clock);
         } else {
             warn("Audio disabled: no output device available");
             cpu.enable_audio(crate::audio::null_player(), true);
@@ -498,7 +545,15 @@ impl RootApp {
         let (sender, recv_events) = mpsc::channel();
         let (frame_sender, frame_receiver) = mpsc::sync_channel(1);
         let (ui_sender, ui_receiver) = mpsc::channel();
-        let emu_thread = thread::spawn(move || run_cpu(cpu, frame_sender, recv_events, ui_sender));
+        let proxy = self.proxy.clone();
+        let wake = Box::new(move || {
+            let _ = proxy.send_event(UserEvent::Wake);
+        });
+        let thread_clock = audio_clock.clone();
+        let emu_thread = thread::spawn(move || {
+            run_cpu(cpu, frame_sender, recv_events, ui_sender, wake, thread_clock)
+        });
+        let audio_retry_at = audio_clock.is_none().then(|| Instant::now() + AUDIO_RETRY);
         if let Some(display) = &self.display {
             let texture = glium::texture::texture2d::Texture2d::empty_with_format(
                 display,
@@ -513,6 +568,7 @@ impl RootApp {
 
             // Push to recent ROMs.
             crate::config::update_config(|c| c.push_recent(&rom_path));
+            crate::config::push_recent(&mut self.recent_roms, &rom_path);
 
             self.phase = RootPhase::Running {
                 texture,
@@ -526,6 +582,8 @@ impl RootApp {
                 keybindings: cfg.keybindings.clone(),
                 capturing: None,
                 _audio: audio_stream,
+                audio_clock,
+                audio_retry_at,
                 last_escape: None,
                 turbo_toggle: false,
                 turbo_held: false,
@@ -552,6 +610,8 @@ impl RootApp {
                 toasts,
                 integer_scaling: cfg.integer_scaling,
                 auto_resume: cfg.auto_resume,
+                pause_on_focus_loss: cfg.pause_on_focus_loss,
+                focus_paused: false,
                 cheats,
                 cheat_key,
                 cheat_entry: String::new(),
@@ -572,10 +632,67 @@ impl RootApp {
         }
     }
 
+    /// Recover audio when the output device goes away (e.g. headphones
+    /// unplugged) or appears after starting without one: open the current
+    /// default device and hand the emulator a new player. APU state is kept.
+    fn maintain_audio(&mut self) {
+        let RootPhase::Running { sender, _audio, audio_clock, audio_retry_at, toasts, .. } =
+            &mut self.phase
+        else {
+            return;
+        };
+        if audio_clock.as_ref().is_some_and(|c| c.failed()) {
+            *_audio = None;
+            *audio_clock = None;
+            let _ = sender.send(GBEvent::SetAudio(crate::audio::null_player(), None));
+            *audio_retry_at = Some(Instant::now());
+        }
+        let Some(at) = *audio_retry_at else {
+            return;
+        };
+        if Instant::now() < at {
+            return;
+        }
+        match init_audio() {
+            Some((player, stream, clock)) => {
+                let _ = sender.send(GBEvent::SetAudio(player, Some(clock.clone())));
+                *_audio = Some(stream);
+                *audio_clock = Some(clock);
+                *audio_retry_at = None;
+                toasts.push("Audio device connected", ToastKind::Info);
+            }
+            None => *audio_retry_at = Some(Instant::now() + AUDIO_RETRY),
+        }
+    }
+
+    /// Surface a ROM that failed to load. A running game keeps running and
+    /// gets an error toast; otherwise fall back to the picker with the error.
+    fn report_load_failure(&mut self, rom_path: &std::path::Path, msg: &str) {
+        let name = rom_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| rom_path.display().to_string());
+        let text = format!("Couldn't load {name}: {msg}");
+        if let RootPhase::Running { toasts, emu_thread: Some(_), .. } = &mut self.phase {
+            toasts.push(text, ToastKind::Error);
+            return;
+        }
+        self.phase = RootPhase::Selecting {
+            rom_path: rom_path.to_string_lossy().into_owned(),
+            browse_requested: false,
+            requested_height: None,
+            load_error: Some(text),
+        };
+        if let Some(win) = &self.window {
+            win.set_fullscreen(None);
+            let _ = win.request_inner_size(winit::dpi::LogicalSize::new(600.0, 220.0));
+        }
+    }
+
     /// Send Shutdown to the emulator worker and join its thread. Leaves `self.phase`
     /// in `Running` (with `emu_thread = None`) so the caller can immediately transition
     /// to a new phase (Selecting or another Running via `start_game_from_path`).
-    fn stop_emulator(&mut self) {
+    pub fn stop_emulator(&mut self) {
         let handle = match &mut self.phase {
             RootPhase::Running { sender, emu_thread, .. } => {
                 let _ = sender.send(GBEvent::Shutdown);
@@ -589,7 +706,7 @@ impl RootApp {
     }
 
     /// Drain all pending gilrs events. Runs every about_to_wait iteration
-    /// (the event loop is ControlFlow::Poll). Outside the Running phase events
+    /// (on a short timer while a pad is connected). Outside the Running phase events
     /// are discarded so stale presses don't fire when a game starts.
     fn poll_gamepad(&mut self) {
         // Destructure self so phase fields and the other RootApp fields can be
@@ -662,6 +779,12 @@ impl RootApp {
                 EventType::AxisChanged(Axis::LeftStickY, v, _) => {
                     direction_mux.set_stick_y(v, &mut transitions);
                     any_activity |= !transitions.is_empty();
+                }
+                // An unplugged pad never sends its releases.
+                EventType::Disconnected => {
+                    release_held_inputs(sender, *turbo_toggle, turbo_held, rewinding);
+                    *direction_mux = DirectionMux::default();
+                    any_activity = true;
                 }
                 _ => {}
             }
@@ -955,13 +1078,24 @@ fn rom_path_is_supported(p: &Path) -> bool {
     )
 }
 
-impl ApplicationHandler for RootApp {
+impl ApplicationHandler<UserEvent> for RootApp {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
+        // Nothing to do here: about_to_wait runs next and drains the channels.
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             let (window, display) = glium::backend::glutin::SimpleWindowBuilder::new()
                 .with_title("Game Boy Emulator")
                 .with_inner_size(600, 220)
                 .build(event_loop);
+            // Restore the last position, unless that spot is no longer on
+            // any monitor (e.g. an unplugged second screen).
+            if let Some((x, y)) = self.window_pos
+                && position_on_a_monitor(&window, x, y)
+            {
+                window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+            }
             let egui_glium =
                 egui_glium::EguiGlium::new(egui::ViewportId::ROOT, &display, &window, &event_loop);
             self.egui_glium = Some(egui_glium);
@@ -982,6 +1116,10 @@ impl ApplicationHandler for RootApp {
         // catching any exit path that calls event_loop.exit() without first
         // going through CloseRequested. Idempotent — a no-op if already stopped.
         self.stop_emulator();
+        if let Some(pos) = self.window_pos {
+            crate::config::update_config(|c| c.window_pos = Some(pos));
+        }
+        crate::config::flush_pending_config(true);
     }
 
     fn window_event(
@@ -1004,10 +1142,19 @@ impl ApplicationHandler for RootApp {
             return;
         }
 
+        if let WindowEvent::Moved(p) = &event
+            && self.window.as_ref().is_some_and(|w| w.fullscreen().is_none())
+        {
+            self.window_pos = Some((p.x, p.y));
+        }
+
         // Pass events to egui in all phases (menus in Running phase)
         if let Some(egui_glium) = &mut self.egui_glium {
             let resp = egui_glium.on_event(self.window.as_ref().unwrap(), &event);
-            if resp.repaint {
+            // egui flags every RedrawRequested as needing a repaint; acting on
+            // that would redraw forever. Its real repaint requests are honored
+            // after painting (has_requested_repaint).
+            if resp.repaint && !matches!(event, WindowEvent::RedrawRequested) {
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -1031,6 +1178,7 @@ impl ApplicationHandler for RootApp {
                     rom_path,
                     browse_requested,
                     requested_height,
+                    load_error,
                 },
                 WindowEvent::RedrawRequested,
             ) => {
@@ -1047,7 +1195,7 @@ impl ApplicationHandler for RootApp {
                 }
                 let mut launch_path: Option<PathBuf> = None;
                 let mut quit_requested = false;
-                let recent_roms = Config::load(&config_path()).recent_roms;
+                let recent_roms = self.recent_roms.clone();
                 // Measured height of the egui content this frame (logical px),
                 // used to grow/shrink the window to fit the recent-ROMs list.
                 let mut content_height: f32 = 0.0;
@@ -1087,6 +1235,9 @@ impl ApplicationHandler for RootApp {
                             } else {
                                 ui.colored_label(egui::Color32::GREEN, "Path OK");
                             }
+                            if let Some(err) = load_error.as_deref() {
+                                ui.colored_label(egui::Color32::RED, err);
+                            }
                             if !recent_roms.is_empty() {
                                 ui.add_space(10.0);
                                 ui.label("Recent ROMs:");
@@ -1121,6 +1272,9 @@ impl ApplicationHandler for RootApp {
                     target.clear_color(0.1, 0.1, 0.1, 1.0);
                     egui_glium.paint(display, &mut target);
                     let _ = target.finish();
+                    if egui_glium.egui_ctx().has_requested_repaint() {
+                        window.request_redraw();
+                    }
 
                     // Resize the window to fit the content (the recent-ROMs list
                     // grows it past the initial 220px). Only request when the
@@ -1149,6 +1303,35 @@ impl ApplicationHandler for RootApp {
                 if rom_path_is_supported(&path) && path.is_file() {
                     *rom_path = path.to_string_lossy().into_owned();
                     self.start_game_from_path(path, true);
+                }
+            }
+            // Key-up events are lost while unfocused, so release everything
+            // held (buttons, momentary turbo, rewind) instead of letting it stick.
+            (
+                RootPhase::Running {
+                    sender,
+                    turbo_toggle,
+                    turbo_held,
+                    rewinding,
+                    paused,
+                    pause_on_focus_loss,
+                    focus_paused,
+                    ..
+                },
+                WindowEvent::Focused(focused),
+            ) => {
+                if !focused {
+                    release_held_inputs(sender, *turbo_toggle, turbo_held, rewinding);
+                    if *pause_on_focus_loss && !*paused {
+                        *paused = true;
+                        *focus_paused = true;
+                        let _ = sender.send(GBEvent::SetPaused(true));
+                    }
+                } else if *focus_paused {
+                    // Only undo our own pause, not one the user chose.
+                    *focus_paused = false;
+                    *paused = false;
+                    let _ = sender.send(GBEvent::SetPaused(false));
                 }
             }
             // Track modifier state so chords like Ctrl+R work.
@@ -1180,6 +1363,10 @@ impl ApplicationHandler for RootApp {
                     rewinding,
                     gamepad_capturing,
                     toasts,
+                    rom_path,
+                    is_color,
+                    dmg_palette_preset,
+                    dmg_palette_custom,
                     ..
                 },
                 WindowEvent::KeyboardInput {
@@ -1198,23 +1385,21 @@ impl ApplicationHandler for RootApp {
                         *capturing = None;
                         return;
                     }
-                    if matches!(state, winit::event::ElementState::Pressed) {
-                        let value = key_to_string(&logical.as_ref());
-                        match kp {
-                            rust_gbe::KeypadKey::A => keybindings.a = value.clone(),
-                            rust_gbe::KeypadKey::B => keybindings.b = value.clone(),
-                            rust_gbe::KeypadKey::Start => keybindings.start = value.clone(),
-                            rust_gbe::KeypadKey::Select => keybindings.select = value.clone(),
-                            rust_gbe::KeypadKey::Up => keybindings.up = value.clone(),
-                            rust_gbe::KeypadKey::Down => keybindings.down = value.clone(),
-                            rust_gbe::KeypadKey::Left => keybindings.left = value.clone(),
-                            rust_gbe::KeypadKey::Right => keybindings.right = value.clone(),
-                        }
+                    if matches!(state, winit::event::ElementState::Pressed)
+                        && !keyevent.repeat
+                        && keybindings.assign(kp, key_to_string(&logical.as_ref()))
+                    {
+                        // A refused (reserved) key leaves capture active.
                         *capturing = None;
                         let bindings_clone = keybindings.clone();
                         crate::config::update_config(|c| c.keybindings = bindings_clone);
                     }
                     return; // don't treat as game input
+                }
+                // OS key repeat would re-fire toggles (turbo, pause, mute),
+                // spam save-state writes and turn a held Esc into a quit.
+                if keyevent.repeat {
+                    return;
                 }
                 if let Some(action) =
                     crate::input::system_action_for(&logical.as_ref(), state, *modifiers)
@@ -1237,6 +1422,26 @@ impl ApplicationHandler for RootApp {
                             toasts,
                         },
                     );
+                    if outcome.screenshot {
+                        let palette = (!*is_color)
+                            .then(|| palette_for_preset(*dmg_palette_preset, dmg_palette_custom));
+                        match latest_frame.as_deref() {
+                            None => toasts.push("No frame to capture yet", ToastKind::Info),
+                            Some(frame) => match save_screenshot(rom_path, frame, palette.as_ref()) {
+                                Ok(path) => toasts.push(
+                                    format!(
+                                        "Screenshot saved: {}",
+                                        path.file_name().unwrap_or_default().to_string_lossy()
+                                    ),
+                                    ToastKind::Success,
+                                ),
+                                Err(e) => {
+                                    crate::log::warn(format!("screenshot failed: {e}"));
+                                    toasts.push("Screenshot failed", ToastKind::Error)
+                                }
+                            },
+                        }
+                    }
                     // Snapshot values we'll need outside the phase borrow.
                     let fs = *fullscreen;
                     let sc = self.scale;
@@ -1307,6 +1512,7 @@ impl ApplicationHandler for RootApp {
                     toasts,
                     integer_scaling,
                     auto_resume,
+                    pause_on_focus_loss,
                     ..
                 },
                 WindowEvent::RedrawRequested,
@@ -1323,7 +1529,7 @@ impl ApplicationHandler for RootApp {
                 let mut apply_fullscreen_now = false;
                 let mut open_keybindings = false;
                 let mut open_cheats = false;
-                let recent_roms = Config::load(&config_path()).recent_roms;
+                let recent_roms = self.recent_roms.clone();
                 if let (Some(display), Some(window), Some(egui_glium)) =
                     (&self.display, &self.window, &mut self.egui_glium)
                 {
@@ -1336,6 +1542,15 @@ impl ApplicationHandler for RootApp {
                                 ui.menu_button("File", |ui| {
                                     ui.menu_button("States", |ui| {
                                         show_states_menu(ui, sender, save_slots, latest_frame);
+                                        ui.separator();
+                                        if ui
+                                            .button("Undo Last Load")
+                                            .on_hover_text("Return to the state from just before the last slot load")
+                                            .clicked()
+                                        {
+                                            let _ = sender.send(GBEvent::UndoLoad);
+                                            ui.close();
+                                        }
                                     });
                                     ui.add_enabled_ui(!recent_roms.is_empty(), |ui| {
                                         ui.menu_button("Open Recent", |ui| {
@@ -1390,7 +1605,7 @@ impl ApplicationHandler for RootApp {
                                         crate::config::update_config(|c| c.fullscreen = fs);
                                     }
                                     ui.menu_button("Scale", |ui| {
-                                        for s in 1..=4 {
+                                        for s in 1..=8 {
                                             let selected = cur_scale == s;
                                             if ui.radio(selected, format!("{}x", s)).clicked() {
                                                 new_scale = Some(s);
@@ -1425,7 +1640,7 @@ impl ApplicationHandler for RootApp {
                                             }
                                             if custom_changed {
                                                 let pal = *dmg_palette_custom;
-                                                crate::config::update_config(|c| c.dmg_palette_custom = pal);
+                                                crate::config::update_config_debounced(|c| c.dmg_palette_custom = pal);
                                             }
                                         });
                                     });
@@ -1445,7 +1660,7 @@ impl ApplicationHandler for RootApp {
                                             let lin = perceptual_to_linear(*volume);
                                             let _ = sender.send(GBEvent::UpdateVolume(lin));
                                             let vol_now = *volume;
-                                            crate::config::update_config(|c| c.volume = vol_now);
+                                            crate::config::update_config_debounced(|c| c.volume = vol_now);
                                         }
                                         ui.label(format!("{}%", *volume));
                                     });
@@ -1463,6 +1678,10 @@ impl ApplicationHandler for RootApp {
                                     if ui.checkbox(auto_resume, "Resume last session on load").changed() {
                                         let on = *auto_resume;
                                         crate::config::update_config(|c| c.auto_resume = on);
+                                    }
+                                    if ui.checkbox(pause_on_focus_loss, "Pause when in background").changed() {
+                                        let on = *pause_on_focus_loss;
+                                        crate::config::update_config(|c| c.pause_on_focus_loss = on);
                                     }
                                     ui.separator();
                                     if ui.button("Keybindings...").clicked() { open_keybindings = true; }
@@ -1543,6 +1762,9 @@ impl ApplicationHandler for RootApp {
                     // Paint egui on top
                     egui_glium.paint(display, &mut target);
                     let _ = target.finish();
+                    if egui_glium.egui_ctx().has_requested_repaint() {
+                        window.request_redraw();
+                    }
 
                     if quit_requested {
                         event_loop.exit();
@@ -1615,6 +1837,14 @@ impl ApplicationHandler for RootApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_gamepad();
+        self.maintain_audio();
+        crate::config::flush_pending_config(false);
+        // gilrs has no wakeup hook, so poll it on a timer: often while a pad
+        // is connected and a game is running, rarely otherwise (hotplug).
+        let gamepad_live = matches!(self.phase, RootPhase::Running { .. })
+            && self.gilrs.as_ref().is_some_and(|g| g.gamepads().next().is_some());
+        let poll = Duration::from_millis(if gamepad_live { 4 } else { 250 });
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + poll));
         if let RootPhase::Running {
             receiver,
             ui_receiver,
@@ -1684,6 +1914,8 @@ fn request_save_state(
 struct SysOutcome {
     request_reset: bool,
     apply_fullscreen: bool,
+    /// Keyboard only: the caller has the ROM path and palette it needs.
+    screenshot: bool,
 }
 
 /// Borrowed `Running`-phase fields needed to execute a `SystemAction`.
@@ -1785,6 +2017,9 @@ fn handle_system_action(action: crate::input::SystemAction, ctx: &mut SysCtx) ->
         SystemAction::RewindStep => {
             let _ = ctx.sender.send(GBEvent::RewindStep);
         }
+        SystemAction::Screenshot => {
+            outcome.screenshot = true;
+        }
     }
     outcome
 }
@@ -1804,11 +2039,17 @@ fn drain_gui_events(
                 save_slots.mark_failed(slot);
                 toasts.push(format!("Save to slot {} failed", slot), ToastKind::Error);
             }
-            Ok(GuiEvent::LoadStateResult { slot, ok: true }) => {
+            Ok(GuiEvent::LoadStateResult { slot, error: None }) => {
                 toasts.push(format!("State {} loaded", slot), ToastKind::Success);
             }
-            Ok(GuiEvent::LoadStateResult { slot, ok: false }) => {
-                toasts.push(format!("Couldn't load state {}", slot), ToastKind::Error);
+            Ok(GuiEvent::LoadStateResult { slot, error: Some(e) }) => {
+                toasts.push(format!("Couldn't load state {slot}: {e}"), ToastKind::Error);
+            }
+            Ok(GuiEvent::UndoLoadResult { ok: true }) => {
+                toasts.push("Load undone", ToastKind::Success);
+            }
+            Ok(GuiEvent::UndoLoadResult { ok: false }) => {
+                toasts.push("Nothing to undo", ToastKind::Info);
             }
             Ok(GuiEvent::BatterySaveFailed) => {
                 toasts.push(
@@ -2105,8 +2346,84 @@ fn upload_frame_with_palette(
     }
 }
 
+/// Write the current frame as `<rom>-<date>-<time>.png` next to the ROM.
+/// `palette` maps DMG shades the same way the display does.
+fn save_screenshot(
+    rom_path: &std::path::Path,
+    frame: &[u8],
+    palette: Option<&DmgPalette>,
+) -> Result<PathBuf, String> {
+    let mut rgb = frame.to_vec();
+    if let Some(p) = palette {
+        apply_dmg_palette(&mut rgb, p);
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let t = local_datetime(secs);
+    let stem = rom_path.file_stem().unwrap_or_default().to_string_lossy();
+    let path = rom_path.with_file_name(format!(
+        "{stem}-{:04}{:02}{:02}-{:02}{:02}{:02}.png",
+        t.year(),
+        t.month() as u8,
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    ));
+    let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+    let mut encoder = png::Encoder::new(
+        std::io::BufWriter::new(file),
+        rust_gbe::SCREEN_W as u32,
+        rust_gbe::SCREEN_H as u32,
+    );
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .and_then(|mut w| w.write_image_data(&rgb))
+        .map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+/// Release everything an input source may be holding: all Game Boy buttons,
+/// momentary turbo and rewind. Used when key-up / button-up events can't
+/// arrive (window lost focus, gamepad unplugged).
+fn release_held_inputs(
+    sender: &mpsc::Sender<GBEvent>,
+    turbo_toggle: bool,
+    turbo_held: &mut bool,
+    rewinding: &mut bool,
+) {
+    use rust_gbe::KeypadKey::*;
+    for k in [A, B, Start, Select, Up, Down, Left, Right] {
+        let _ = sender.send(GBEvent::KeyUp(k));
+    }
+    if *turbo_held {
+        *turbo_held = false;
+        if !turbo_toggle {
+            let _ = sender.send(GBEvent::SpeedDown);
+        }
+    }
+    if *rewinding {
+        *rewinding = false;
+        let _ = sender.send(GBEvent::SetRewinding(false));
+    }
+}
+
 fn warn(message: &str) {
-    eprintln!("{}", message);
+    crate::log::warn(message);
+}
+
+fn position_on_a_monitor(window: &winit::window::Window, x: i32, y: i32) -> bool {
+    window.available_monitors().any(|m| {
+        let (pos, size) = (m.position(), m.size());
+        x >= pos.x
+            && y >= pos.y
+            && x < pos.x + size.width as i32
+            && y < pos.y + size.height as i32
+    })
 }
 
 fn set_window_size(window: &winit::window::Window, scale: u32) {
@@ -2199,6 +2516,27 @@ fn matches_capturing(capturing: Option<rust_gbe::KeypadKey>, k: rust_gbe::Keypad
 #[cfg(test)]
 mod tests {
     use super::fit_rect;
+
+    #[test]
+    fn screenshot_writes_palette_mapped_png_next_to_rom() {
+        let dir = std::env::temp_dir().join(format!("rgbe-shot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rom = dir.join("game.gb");
+        // DMG frame: all lightest shade (255).
+        let frame = vec![255u8; rust_gbe::SCREEN_W * rust_gbe::SCREEN_H * 3];
+        let pal = crate::palette::DmgPalette { colors: [[1, 2, 3], [0; 3], [0; 3], [0; 3]] };
+        let path = super::save_screenshot(&rom, &frame, Some(&pal)).unwrap();
+        assert_eq!(path.parent().unwrap(), dir);
+        assert!(path.file_name().unwrap().to_string_lossy().starts_with("game-"));
+
+        let decoder = png::Decoder::new(std::fs::File::open(&path).unwrap());
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!((info.width, info.height), (160, 144));
+        assert_eq!(&buf[..3], &[1, 2, 3], "DMG palette applied");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn fit_rect_preserves_aspect_fractional() {

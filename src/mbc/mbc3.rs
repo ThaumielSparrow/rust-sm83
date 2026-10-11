@@ -1,8 +1,7 @@
-use crate::mbc::{ram_banks, MBC};
+use crate::mbc::{ram_banks_with_ram, MBC};
 use crate::StrResult;
 
 use std::convert::TryInto;
-use std::io::prelude::*;
 use std::time;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -31,7 +30,7 @@ impl MBC3 {
             _ => false,
         };
         let rambanks = match subtype {
-            0x10 | 0x12 | 0x13 => ram_banks(data[0x149]),
+            0x10 | 0x12 | 0x13 => ram_banks_with_ram(data[0x149]),
             _ => 0,
         };
         let ramsize = rambanks * 0x2000;
@@ -188,37 +187,76 @@ impl MBC for MBC3 {
         self.has_battery
     }
 
+    /// Accepts three layouts:
+    /// - legacy rust-gbe: 8-byte big-endian `rtc_zero` prefix + RAM
+    /// - standard (BGB / VBA-M / SameBoy): RAM + 44- or 48-byte RTC footer
+    /// - plain RAM of any size (no RTC data)
     fn loadram(&mut self, ramdata: &[u8]) -> StrResult<()> {
-        if ramdata.len() != 8 + self.ram.len() {
-            return Err("Loaded ram is too small");
+        let ram_len = self.ram.len();
+        if ramdata.len() == 8 + ram_len {
+            let (int_bytes, rest) = ramdata.split_at(8);
+            let rtc = u64::from_be_bytes(int_bytes.try_into().unwrap());
+            if self.rtc_zero.is_some() {
+                self.rtc_zero = Some(rtc);
+            }
+            self.ram.copy_from_slice(rest);
+            return Ok(());
         }
 
-        let (int_bytes, rest) = ramdata.split_at(8);
-        let rtc = u64::from_be_bytes(int_bytes.try_into().unwrap());
-        if self.rtc_zero.is_some() {
-            self.rtc_zero = Some(rtc);
+        let n = ramdata.len().min(ram_len);
+        self.ram[..n].copy_from_slice(&ramdata[..n]);
+
+        let footer = &ramdata[n..];
+        if self.rtc_zero.is_some() && (footer.len() == 44 || footer.len() == 48) {
+            let reg = |i: usize| footer[i * 4];
+            let saved_at = if footer.len() == 48 {
+                u64::from_le_bytes(footer[40..48].try_into().unwrap())
+            } else {
+                u32::from_le_bytes(footer[40..44].try_into().unwrap()) as u64
+            };
+            for i in 0..5 {
+                self.rtc_ram[i] = reg(i);
+                self.rtc_ram_latch[i] = reg(5 + i);
+            }
+            let days = (((self.rtc_ram[4] & 0x01) as u64) << 8) | self.rtc_ram[3] as u64;
+            let elapsed = self.rtc_ram[0] as u64
+                + self.rtc_ram[1] as u64 * 60
+                + self.rtc_ram[2] as u64 * 3600
+                + days * 86400;
+            self.rtc_zero = Some(saved_at.saturating_sub(elapsed));
         }
-        self.ram = rest.to_vec();
         Ok(())
     }
 
+    /// Writes RAM followed by the standard 48-byte RTC footer (for RTC carts),
+    /// so `.gbsave` files are interchangeable with other emulators.
     fn dumpram(&self) -> Vec<u8> {
-        let rtc = match self.rtc_zero {
-            Some(t) => t,
-            None => 0,
-        };
-
-        let mut file = vec![];
-
-        let mut ok = true;
-        if ok {
-            let rtc_bytes = rtc.to_be_bytes();
-            ok = file.write_all(&rtc_bytes).is_ok();
-        };
-        if ok {
-            let _ = file.write_all(&*self.ram);
-        };
-
+        let mut file = self.ram.clone();
+        if self.rtc_zero.is_none() {
+            return file;
+        }
+        let now = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut regs = self.rtc_ram;
+        if regs[4] & 0x40 == 0 {
+            // Running clock: derive the live registers from rtc_zero.
+            let diff = now.saturating_sub(self.rtc_zero.unwrap_or(now));
+            let days = diff / 86400;
+            regs[0] = (diff % 60) as u8;
+            regs[1] = ((diff / 60) % 60) as u8;
+            regs[2] = ((diff / 3600) % 24) as u8;
+            regs[3] = days as u8;
+            regs[4] = (regs[4] & 0xFE) | ((days >> 8) & 0x01) as u8;
+            if days >= 512 {
+                regs[4] |= 0x80;
+            }
+        }
+        for r in regs.iter().chain(self.rtc_ram_latch.iter()) {
+            file.extend_from_slice(&(*r as u32).to_le_bytes());
+        }
+        file.extend_from_slice(&now.to_le_bytes());
         file
     }
 
@@ -256,5 +294,48 @@ mod test {
 
         // Must not panic.
         mbc.calc_rtc_reg();
+    }
+
+    fn rtc_cart() -> MBC3 {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x147] = 0x10; // MBC3+TIMER+RAM+BATTERY
+        rom[0x149] = 0x02; // 8 KiB RAM
+        MBC3::new(rom).unwrap()
+    }
+
+    #[test]
+    fn rtc_save_round_trips_through_standard_footer() {
+        let mut m = rtc_cart();
+        m.ram[0] = 0xAB;
+        let now = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let zero = now - (3 * 86400 + 5 * 3600 + 7);
+        m.rtc_zero = Some(zero);
+        let dump = m.dumpram();
+        assert_eq!(dump.len(), 0x2000 + 48);
+        let mut m2 = rtc_cart();
+        m2.loadram(&dump).unwrap();
+        assert_eq!(m2.ram[0], 0xAB);
+        assert_eq!(m2.rtc_zero, Some(zero));
+    }
+
+    #[test]
+    fn legacy_prefix_save_still_loads() {
+        let mut data = 1234u64.to_be_bytes().to_vec();
+        data.extend(std::iter::repeat_n(0x5A, 0x2000));
+        let mut m = rtc_cart();
+        m.loadram(&data).unwrap();
+        assert_eq!(m.rtc_zero, Some(1234));
+        assert_eq!(m.ram[0], 0x5A);
+    }
+
+    #[test]
+    fn short_plain_save_loads_what_fits() {
+        let mut m = rtc_cart();
+        m.loadram(&[7u8; 16]).unwrap();
+        assert_eq!(&m.ram[..16], &[7u8; 16]);
+        assert_eq!(m.ram[16], 0);
     }
 }

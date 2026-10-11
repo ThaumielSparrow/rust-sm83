@@ -46,5 +46,5 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
-      - name: Run tests (library)
-        run: cargo test --lib --verbose
+      - name: Run tests (library and frontend)
+        run: cargo test --all-targets --verbose

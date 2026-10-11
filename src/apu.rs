@@ -8,7 +8,9 @@ const WAVE_PATTERN: [[i32; 8]; 4] = [
 ];
 const CLOCKS_PER_SECOND: u32 = 1 << 22;
 const CLOCKS_PER_FRAME: u32 = CLOCKS_PER_SECOND / 512;
-const OUTPUT_SAMPLE_COUNT: usize = 2000; // this should be less than blip_buf::MAX_FRAME
+// Samples per AudioPlayer::play call (~12 ms at 44.1 kHz). Bounds output
+// latency from below; must be less than blip_buf::MAX_FRAME.
+const OUTPUT_SAMPLE_COUNT: usize = 512;
 const SWEEP_DELAY_ZERO_PERIOD: u8 = 8;
 
 // Additional delay on trigger of the wave channel (channel 3). In other emulators it is 6, but we
@@ -21,6 +23,7 @@ pub trait AudioPlayer: Send {
     fn underflowed(&self) -> bool;
 }
 
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct VolumeEnvelope {
     period: u8,
     goes_up: bool,
@@ -81,6 +84,7 @@ impl VolumeEnvelope {
     }
 }
 
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct LengthCounter {
     enabled: bool,
     value: u16,
@@ -135,6 +139,7 @@ impl LengthCounter {
     }
 }
 
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct SquareChannel {
     active: bool,
     dac_enabled: bool,
@@ -154,7 +159,8 @@ struct SquareChannel {
     sweep_negate: bool,
     sweep_did_negate: bool,
     volume_envelope: VolumeEnvelope,
-    blip: BlipBuf,
+    #[rkyv(with = rkyv::with::Skip)]
+    blip: Blip,
 }
 
 impl SquareChannel {
@@ -178,7 +184,7 @@ impl SquareChannel {
             sweep_negate: false,
             sweep_did_negate: false,
             volume_envelope: VolumeEnvelope::new(),
-            blip: blip,
+            blip: Blip(blip),
         }
     }
 
@@ -342,6 +348,7 @@ impl SquareChannel {
     }
 }
 
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct WaveChannel {
     active: bool,
     dac_enabled: bool,
@@ -355,7 +362,8 @@ struct WaveChannel {
     current_wave: u8,
     dmg_mode: bool,
     sample_recently_accessed: bool,
-    blip: BlipBuf,
+    #[rkyv(with = rkyv::with::Skip)]
+    blip: Blip,
 }
 
 impl WaveChannel {
@@ -373,7 +381,7 @@ impl WaveChannel {
             current_wave: 0,
             dmg_mode: dmg_mode,
             sample_recently_accessed: false,
-            blip: blip,
+            blip: Blip(blip),
         }
     }
 
@@ -538,6 +546,7 @@ impl WaveChannel {
     }
 }
 
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct NoiseChannel {
     active: bool,
     dac_enabled: bool,
@@ -549,7 +558,8 @@ struct NoiseChannel {
     state: u16,
     delay: u32,
     last_amp: i32,
-    blip: BlipBuf,
+    #[rkyv(with = rkyv::with::Skip)]
+    blip: Blip,
 }
 
 impl NoiseChannel {
@@ -565,7 +575,7 @@ impl NoiseChannel {
             state: 1,
             delay: 0,
             last_amp: 0,
-            blip: blip,
+            blip: Blip(blip),
         }
     }
 
@@ -657,13 +667,13 @@ impl NoiseChannel {
     }
 }
 
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Sound {
     on: bool,
     time: u32,
     prev_time: u32,
     next_time: u32,
     frame_step: u8,
-    output_period: u32,
     channel1: SquareChannel,
     channel2: SquareChannel,
     channel3: WaveChannel,
@@ -674,13 +684,79 @@ pub struct Sound {
     reg_ff25: u8,
     need_sync: bool,
     dmg_mode: bool,
+    #[rkyv(with = rkyv::with::Skip)]
+    output: Output,
+}
+
+/// Host-side audio output: everything in `Sound` that isn't emulated state.
+/// Skipped by save states; a decoded `Sound` takes the live one's output via
+/// `Sound::adopt_output`.
+struct Output {
     player: Box<dyn AudioPlayer>,
+    // Clocks per output chunk at the player's sample rate.
+    period: u32,
     // Reusable mixing scratch buffers to avoid per-call large stack allocations.
     mix_left: Vec<f32>,
     mix_right: Vec<f32>,
     mix_temp: Vec<i16>,
     // Master volume scalar 0.0 - 1.0 (after perceptual mapping from UI value)
     master_volume: f32,
+}
+
+impl Default for Output {
+    fn default() -> Self {
+        Output::new(Box::new(NullPlayer))
+    }
+}
+
+impl Output {
+    fn new(player: Box<dyn AudioPlayer>) -> Self {
+        let period =
+            (OUTPUT_SAMPLE_COUNT as u64 * CLOCKS_PER_SECOND as u64) / player.samples_rate() as u64;
+        Output {
+            player,
+            period: period as u32,
+            mix_left: vec![0.0; OUTPUT_SAMPLE_COUNT + 10],
+            mix_right: vec![0.0; OUTPUT_SAMPLE_COUNT + 10],
+            mix_temp: vec![0i16; OUTPUT_SAMPLE_COUNT + 10],
+            master_volume: 1.0,
+        }
+    }
+}
+
+/// Placeholder player for a decoded `Sound` before it adopts a live output.
+struct NullPlayer;
+
+impl AudioPlayer for NullPlayer {
+    fn play(&mut self, _: &[f32], _: &[f32]) {}
+    fn samples_rate(&self) -> u32 {
+        44_100
+    }
+    fn underflowed(&self) -> bool {
+        false
+    }
+}
+
+/// A channel's band-limited synthesis buffer (host output, not state).
+struct Blip(BlipBuf);
+
+impl Default for Blip {
+    fn default() -> Self {
+        Blip(create_blipbuf(44_100))
+    }
+}
+
+impl std::ops::Deref for Blip {
+    type Target = BlipBuf;
+    fn deref(&self) -> &BlipBuf {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Blip {
+    fn deref_mut(&mut self) -> &mut BlipBuf {
+        &mut self.0
+    }
 }
 
 impl Sound {
@@ -723,16 +799,12 @@ impl Sound {
         let blipbuf3 = create_blipbuf(player.samples_rate());
         let blipbuf4 = create_blipbuf(player.samples_rate());
 
-        let output_period =
-            (OUTPUT_SAMPLE_COUNT as u64 * CLOCKS_PER_SECOND as u64) / player.samples_rate() as u64;
-
         Sound {
             on: false,
             time: 0,
             prev_time: 0,
             next_time: CLOCKS_PER_FRAME,
             frame_step: 0,
-            output_period: output_period as u32,
             channel1: SquareChannel::new(blipbuf1, true),
             channel2: SquareChannel::new(blipbuf2, false),
             channel3: WaveChannel::new(blipbuf3, dmg_mode),
@@ -743,15 +815,39 @@ impl Sound {
             reg_ff25: 0x00,
             need_sync: false,
             dmg_mode: dmg_mode,
-            player: player,
-            mix_left: vec![0.0; OUTPUT_SAMPLE_COUNT + 10],
-            mix_right: vec![0.0; OUTPUT_SAMPLE_COUNT + 10],
-            mix_temp: vec![0i16; OUTPUT_SAMPLE_COUNT + 10],
-            master_volume: 1.0,
+            output: Output::new(player),
         }
     }
 
-    pub fn set_master_volume(&mut self, v: f32) { self.master_volume = v.clamp(0.0, 1.0); }
+    pub fn set_master_volume(&mut self, v: f32) { self.output.master_volume = v.clamp(0.0, 1.0); }
+
+    /// Switch to a new output device (e.g. the old one was unplugged),
+    /// keeping all APU state. The new device's sample rate may differ.
+    pub fn set_player(&mut self, player: Box<dyn AudioPlayer>) {
+        // Close the current output frame so `time` restarts at 0 under the
+        // new (possibly shorter) output period.
+        self.do_output();
+        let master_volume = self.output.master_volume;
+        self.output = Output::new(player);
+        self.output.master_volume = master_volume;
+        let rate = self.output.player.samples_rate();
+        self.channel1.blip = Blip(create_blipbuf(rate));
+        self.channel2.blip = Blip(create_blipbuf(rate));
+        self.channel3.blip = Blip(create_blipbuf(rate));
+        self.channel4.blip = Blip(create_blipbuf(rate));
+    }
+
+    /// Take over `live`'s host output (player, blip buffers, mix buffers,
+    /// volume) after this `Sound` was decoded from a save state, leaving
+    /// `live` with placeholders. Pending samples are discarded.
+    pub fn adopt_output(&mut self, live: &mut Sound) {
+        std::mem::swap(&mut self.output, &mut live.output);
+        std::mem::swap(&mut self.channel1.blip, &mut live.channel1.blip);
+        std::mem::swap(&mut self.channel2.blip, &mut live.channel2.blip);
+        std::mem::swap(&mut self.channel3.blip, &mut live.channel3.blip);
+        std::mem::swap(&mut self.channel4.blip, &mut live.channel4.blip);
+        self.clear_buffers();
+    }
 
     pub fn rb(&mut self, a: u16) -> u8 {
         self.run();
@@ -788,8 +884,8 @@ impl Sound {
                     _ => (),
                 }
             }
-            // Only allow further writes to the control register
-            if a != 0xFF26 {
+            // Only the control register and wave RAM stay writable while off.
+            if a != 0xFF26 && !(0xFF30..=0xFF3F).contains(&a) {
                 return;
             }
         }
@@ -836,10 +932,17 @@ impl Sound {
             return;
         }
 
-        self.time += cycles;
-
-        if self.time >= self.output_period {
-            self.do_output();
+        // Emit output at every period boundary: the blip buffers hold one
+        // period, so a long step (HALT fast-forward, a big CGB GDMA) must not
+        // run past it before draining.
+        let mut left = cycles;
+        while left > 0 {
+            let step = left.min(self.output.period.saturating_sub(self.time).max(1));
+            self.time += step;
+            left -= step;
+            if self.time >= self.output.period {
+                self.do_output();
+            }
         }
     }
 
@@ -858,7 +961,7 @@ impl Sound {
         self.time = 0;
         self.prev_time = 0;
 
-        if !self.need_sync || self.player.underflowed() {
+        if !self.need_sync || self.output.player.underflowed() {
             self.need_sync = false;
             self.mix_buffers();
         } else {
@@ -919,12 +1022,12 @@ impl Sound {
 
         while outputted < sample_count {
             // Reset only the range we'll fill this iteration.
-            self.mix_left.fill(0.0);
-            self.mix_right.fill(0.0);
+            self.output.mix_left.fill(0.0);
+            self.output.mix_right.fill(0.0);
             // temp buffer reused
-            let buf_left = &mut self.mix_left;
-            let buf_right = &mut self.mix_right;
-            let buf = &mut self.mix_temp;
+            let buf_left = &mut self.output.mix_left;
+            let buf_right = &mut self.output.mix_right;
+            let buf = &mut self.output.mix_temp;
 
             let count1 = self.channel1.blip.read_samples(buf, false);
             for (i, v) in buf[..count1].iter().enumerate() {
@@ -972,11 +1075,12 @@ impl Sound {
             debug_assert!(count1 == count3);
             debug_assert!(count1 == count4);
 
-            if self.master_volume != 1.0 {
+            let master_volume = self.output.master_volume;
+            if master_volume != 1.0 {
                 // Apply master volume scaling in-place
-                for i in 0..count1 { buf_left[i] *= self.master_volume; buf_right[i] *= self.master_volume; }
+                for i in 0..count1 { buf_left[i] *= master_volume; buf_right[i] *= master_volume; }
             }
-            self.player.play(&buf_left[..count1], &buf_right[..count1]);
+            self.output.player.play(&buf_left[..count1], &buf_right[..count1]);
 
             outputted += count1;
         }
@@ -1011,6 +1115,17 @@ mod tests {
         fn underflowed(&self) -> bool {
             false
         }
+    }
+
+    /// One call spanning several output periods (HALT fast-forward, a large
+    /// CGB GDMA) must drain the blip buffers per period instead of overflowing.
+    #[test]
+    fn long_step_spanning_many_output_periods_does_not_overflow() {
+        let mut s = Sound::new_dmg(Box::new(NoopPlayer));
+        s.set_on();
+        s.wb(0xFF12, 0xF0); // channel 1 DAC on
+        s.wb(0xFF14, 0x80); // trigger
+        s.do_cycle(s.output.period * 5 + 123);
     }
 
     /// reset_div() (FF04 write) must clear the frame-sequencer phase and

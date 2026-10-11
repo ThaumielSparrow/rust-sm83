@@ -16,20 +16,43 @@ pub enum GBEvent {
         thumbnail: Option<Arc<Vec<u8>>>,
     },
     LoadState(u8),
+    /// Go back to the state from just before the last LoadState.
+    UndoLoad,
     UpdateTurbo(crate::config::TurboSetting),
     UpdateVolume(f32), // master volume 0.0-1.0
     SetPaused(bool),
     SetRewinding(bool),
     RewindStep,
     SetCheats(Vec<crate::cheats::PokeOp>),
+    /// New audio output (the old device went away). `None` clock = null player.
+    SetAudio(Box<dyn rust_gbe::AudioPlayer>, Option<crate::audio::AudioClock>),
     Shutdown,
+}
+
+/// One Game Boy frame: 154 lines x 456 dots at 4.194304 MHz, ~16.74 ms (59.73 Hz).
+const FRAME_TICKS: u32 = 154 * 456;
+const FRAME_SECS: f64 = FRAME_TICKS as f64 / 4_194_304.0;
+/// Most the audio queue may stretch or shrink the frame period: +/-0.5%, an
+/// inaudible pitch change that absorbs the drift between the emulated clock
+/// and the sound card's.
+const AUDIO_RATE_CONTROL: f64 = 0.005;
+/// Below this fraction of its target the audio queue is about to underrun:
+/// skip the sleep and emulate ahead to refill it.
+const AUDIO_LOW_WATER: f64 = 0.5;
+
+/// Frame-period multiplier from the audio queue's fill (1.0 = on target):
+/// a fuller queue slows emulation slightly, an emptier one speeds it up.
+fn audio_rate_factor(fill_ratio: f64) -> f64 {
+    1.0 + AUDIO_RATE_CONTROL * (fill_ratio - 1.0).clamp(-1.0, 1.0)
 }
 
 pub enum GuiEvent {
     SaveStateSaved { slot: u8, preview: SaveStatePreview },
     SaveStateFailed { slot: u8 },
-    LoadStateResult { slot: u8, ok: bool },
+    /// `error` is None on success.
+    LoadStateResult { slot: u8, error: Option<&'static str> },
     BatterySaveFailed,
+    UndoLoadResult { ok: bool },
 }
 
 /// Number of emulated frames between background battery-RAM saves. At ~60 fps
@@ -88,6 +111,7 @@ fn try_send_frame(
     frame_buffers: &mut [Arc<Vec<u8>>],
     next_fb: &mut usize,
     sender: &SyncSender<Arc<Vec<u8>>>,
+    wake: &dyn Fn(),
 ) -> Result<(), ()> {
     for attempt in 0..frame_buffers.len() {
         let idx = (*next_fb + attempt) % frame_buffers.len();
@@ -96,6 +120,7 @@ fn try_send_frame(
             match sender.try_send(frame_buffers[idx].clone()) {
                 Ok(_) => {
                     *next_fb = (idx + 1) % frame_buffers.len();
+                    wake();
                     return Ok(());
                 }
                 Err(TrySendError::Disconnected(..)) => return Err(()),
@@ -125,56 +150,88 @@ fn restore_compressed(cpu: &mut Device, payload: &[u8]) -> bool {
         Ok(snap) => match cpu.restore_rewind(&snap) {
             Ok(()) => true,
             Err(e) => {
-                eprintln!("rewind restore failed: {}", e);
+                crate::log::warn(format!("rewind restore failed: {}", e));
                 false
             }
         },
         Err(_) => {
-            eprintln!("rewind decompress failed");
+            crate::log::warn(format!("rewind decompress failed"));
             false
         }
     }
 }
 
-pub fn construct_cpu_auto(filename: &str) -> Option<(Box<Device>, bool)> {
+/// Build a device for `filename`, preferring CGB mode. An invalid header
+/// checksum only produces a warning (it is common in ROM hacks and homebrew);
+/// on success the second element carries that warning for the GUI to show.
+pub fn construct_cpu_auto(
+    filename: &str,
+) -> Result<(Box<Device>, Option<&'static str>), &'static str> {
     let rom_path = std::path::Path::new(filename);
-    let save_state_path = rom_path.with_extension("state");
-    let save_state_str = save_state_path.to_string_lossy().to_string();
-    // Try CGB first, fallback to classic
-    match Device::new_cgb(filename, false, Some(save_state_str.clone())) {
-        Ok(cpu) => {
-            let is_color = cpu.is_cgb_mode();
-            Some((Box::new(cpu), is_color))
+    let save_state_str = rom_path.with_extension("state").to_string_lossy().to_string();
+    let build = |skip_checksum: bool| {
+        // Try CGB first, fallback to classic
+        Device::new_cgb(filename, skip_checksum, Some(save_state_str.clone()))
+            .or_else(|_| Device::new(filename, skip_checksum, Some(save_state_str.clone())))
+            .map(Box::new)
+    };
+    match build(false) {
+        Ok(cpu) => Ok((cpu, None)),
+        Err(rust_gbe::CHECKSUM_INVALID) => {
+            let cpu = build(true)?;
+            Ok((cpu, Some("ROM header checksum is invalid — loaded anyway")))
         }
-        Err(_) => match Device::new(filename, false, Some(save_state_str)) {
-            Ok(cpu) => {
-                let is_color = cpu.is_cgb_mode();
-                Some((Box::new(cpu), is_color))
-            }
-            Err(msg) => {
-                eprintln!("{}", msg);
-                None
-            }
-        },
+        Err(msg) => {
+            crate::log::warn(msg);
+            Err(msg)
+        }
     }
 }
 
-// Runs the emulation core loop. Sends video frames through a bounded channel.
+/// Emulator thread entry point. A panic in the core is caught so battery RAM
+/// can still be flushed; the panic hook in main.rs has already logged it, and
+/// dropping the channels tells the GUI the emulator is gone.
+///
+/// `wake` nudges the GUI's event loop, which sleeps until something happens:
+/// it is called after each frame or `GuiEvent` is sent, and on exit so the
+/// GUI notices the channels closing.
 pub fn run_cpu(
     mut cpu: Box<Device>,
     sender: SyncSender<Arc<Vec<u8>>>,
     receiver: Receiver<GBEvent>,
     ui_sender: Sender<GuiEvent>,
+    wake: Box<dyn Fn() + Send>,
+    audio: Option<crate::audio::AudioClock>,
 ) {
-    // limit_speed: when true we pace at 1x (approx 60 FPS / 16ms per frame)
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_loop(&mut cpu, sender, receiver, ui_sender, &*wake, audio)
+    }));
+    if result.is_err() {
+        // Skip the auto-save snapshot: it could capture a broken state.
+        let _ = cpu.save_battery_ram_silent();
+    }
+    wake();
+}
+
+// Runs the emulation core loop. Sends video frames through a bounded channel.
+fn run_loop(
+    cpu: &mut Device,
+    sender: SyncSender<Arc<Vec<u8>>>,
+    receiver: Receiver<GBEvent>,
+    ui_sender: Sender<GuiEvent>,
+    wake: &dyn Fn(),
+    mut audio: Option<crate::audio::AudioClock>,
+) {
+    // limit_speed: when true we pace at 1x (one GB frame per ~16.74 ms)
     // when false we apply turbo/slowmo pacing based on turbo_setting
     let mut limit_speed = true;
     // Will be updated from GUI shortly after thread spawn; start with Double as fallback
     let mut turbo_setting = crate::config::TurboSetting::Double;
-    let mut last_frame_instant = Instant::now();
+    // Deadline for the end of the current frame. Advanced by one period per
+    // frame (not reset to "now"), so sleep overshoot doesn't accumulate.
+    let mut next_deadline = Instant::now();
     let mut paused = false;
 
-    let base_waitticks = (4_194_304f64 / 1000.0 * 16.0).round() as u32; // ~16ms frame chunk
     let mut ticks = 0;
     let mut frame_count: u64 = 0;
 
@@ -199,6 +256,8 @@ pub fn run_cpu(
     let mut rewinding = false;
     let mut rewind_tick: u64 = 0;
     let mut cheats: Vec<crate::cheats::PokeOp> = Vec::new();
+    // State from just before the last successful slot load ("undo load").
+    let mut undo_load: Option<Vec<u8>> = None;
 
     'outer: loop {
         if rewinding {
@@ -210,12 +269,13 @@ pub fn run_cpu(
                     ring.pop_back();
                 }
                 if let Some(payload) = ring.back() {
-                    if restore_compressed(&mut cpu, payload)
+                    if restore_compressed(cpu, payload)
                         && try_send_frame(
                             cpu.get_gpu_data(),
                             &mut frame_buffers,
                             &mut next_fb,
                             &sender,
+                            wake,
                         )
                         .is_err()
                     {
@@ -226,7 +286,9 @@ pub fn run_cpu(
             }
         } else {
             // Normal forward execution.
-            let frame_target = base_waitticks;
+            // Exactly one GB frame per iteration (ticks carry over), so each
+            // iteration publishes one frame at a steady phase.
+            let frame_target = FRAME_TICKS;
             while !paused && ticks < frame_target {
                 ticks += cpu.do_cycle();
                 if cpu.check_and_reset_gpu_updated()
@@ -235,6 +297,7 @@ pub fn run_cpu(
                         &mut frame_buffers,
                         &mut next_fb,
                         &sender,
+                        wake,
                     )
                     .is_err()
                 {
@@ -245,18 +308,17 @@ pub fn run_cpu(
             if !paused {
                 ticks -= frame_target;
                 frame_count += 1;
-                apply_cheats(&mut cpu, &cheats);
+                apply_cheats(cpu, &cheats);
 
                 if should_capture(frame_count, REWIND_INTERVAL_FRAMES) {
-                    match cpu.snapshot_rewind() {
-                        Ok(snap) => {
-                            let compressed = lz4_flex::compress_prepend_size(&snap);
+                    match cpu.snapshot_rewind_with(lz4_flex::compress_prepend_size) {
+                        Ok(compressed) => {
                             if ring.len() == REWIND_CAPACITY {
                                 ring.pop_front();
                             }
                             ring.push_back(compressed);
                         }
-                        Err(e) => eprintln!("rewind snapshot failed: {}", e),
+                        Err(e) => crate::log::warn(format!("rewind snapshot failed: {}", e)),
                     }
                 }
 
@@ -272,6 +334,7 @@ pub fn run_cpu(
                     let save_result = cpu.save_battery_ram_silent();
                     if save_result.is_err() && battery_save_ok {
                         let _ = ui_sender.send(GuiEvent::BatterySaveFailed);
+                        wake();
                     }
                     battery_save_ok = save_result.is_ok();
                     ram_dirty = false;
@@ -293,29 +356,39 @@ pub fn run_cpu(
                         cpu.sync_audio();
                     }
                     GBEvent::SaveState { slot, thumbnail } => {
-                        println!("Attempting to save state to slot {}...", slot);
                         let thumbnail = thumbnail.as_deref().map(Vec::as_slice);
                         match cpu.save_state_slot(slot, thumbnail) {
                             Ok(preview) => {
                                 let _ = ui_sender.send(GuiEvent::SaveStateSaved { slot, preview });
+                        wake();
                             }
                             Err(e) => {
-                                eprintln!("Failed to save state to slot {}: {}", slot, e);
+                                crate::log::warn(format!("Failed to save state to slot {}: {}", slot, e));
                                 let _ = ui_sender.send(GuiEvent::SaveStateFailed { slot });
+                        wake();
                             }
                         }
                     }
                     GBEvent::LoadState(s) => {
-                        println!("Attempting to load state from slot {}...", s);
-                        let ok = match cpu.load_state_slot(s) {
-                            Ok(()) => true,
-                            Err(e) => {
-                                eprintln!("Failed to load state from slot {}: {}", s, e);
-                                false
+                        let before = cpu.snapshot_rewind().ok();
+                        let error = cpu.load_state_slot(s).err();
+                        match error {
+                            None => undo_load = before,
+                            Some(e) => {
+                                crate::log::warn(format!("Failed to load state from slot {}: {}", s, e))
                             }
-                        };
-                        let _ = ui_sender.send(GuiEvent::LoadStateResult { slot: s, ok });
+                        }
+                        let _ = ui_sender.send(GuiEvent::LoadStateResult { slot: s, error });
+                        wake();
                         ring.clear();
+                    }
+                    GBEvent::UndoLoad => {
+                        let ok = undo_load.take().is_some_and(|snap| cpu.restore_rewind(&snap).is_ok());
+                        if ok {
+                            ring.clear();
+                        }
+                        let _ = ui_sender.send(GuiEvent::UndoLoadResult { ok });
+                        wake();
                     }
                     GBEvent::UpdateTurbo(ts) => {
                         turbo_setting = ts;
@@ -344,7 +417,7 @@ pub fn run_cpu(
                             ring.pop_back();
                         }
                         if let Some(payload) = ring.back() {
-                            if restore_compressed(&mut cpu, payload) {
+                            if restore_compressed(cpu, payload) {
                                 // A disconnect here is caught next iteration in
                                 // the 'recv loop, which breaks 'outer cleanly.
                                 let _ = try_send_frame(
@@ -352,14 +425,19 @@ pub fn run_cpu(
                                     &mut frame_buffers,
                                     &mut next_fb,
                                     &sender,
+                                    wake,
                                 );
                             }
                         }
                     }
                     GBEvent::SetCheats(list) => cheats = list,
+                    GBEvent::SetAudio(player, clock) => {
+                        cpu.set_audio_player(player);
+                        audio = clock;
+                    }
                     GBEvent::Shutdown => {
                         if let Err(e) = cpu.flush_to_disk() {
-                            eprintln!("flush_to_disk failed: {}", e);
+                            crate::log::warn(format!("flush_to_disk failed: {}", e));
                         }
                         break 'outer;
                     }
@@ -367,47 +445,72 @@ pub fn run_cpu(
                 Err(TryRecvError::Empty) => break 'recv,
                 Err(TryRecvError::Disconnected) => {
                     if let Err(e) = cpu.flush_to_disk() {
-                        eprintln!("flush_to_disk failed: {}", e);
+                        crate::log::warn(format!("flush_to_disk failed: {}", e));
                     }
                     break 'outer;
                 }
             }
         }
 
-        // Timing / pacing
-        let target_frame_ms = if rewinding {
-            16.0 // rewind playback paced by REWIND_PLAYBACK_DIVISOR
-        } else if paused {
-            16.0 // keep checking events at ~60 Hz while paused
-        } else if limit_speed {
-            16.0 // baseline ~60 FPS
+        // Timing / pacing. Rewind playback and pause also tick at the frame
+        // rate (rewind steps are paced by REWIND_PLAYBACK_DIVISOR; pause just
+        // keeps polling events).
+        let realtime = rewinding || paused || limit_speed;
+        let period_secs = if realtime {
+            FRAME_SECS
         } else {
             match turbo_setting.multiplier() {
-                Some(m) => 16.0 / m, // m<1 => slow motion (>16ms), m>1 => faster (<16ms)
-                None => 0.0,         // uncapped
+                Some(m) => FRAME_SECS / m as f64, // m<1 => slow motion, m>1 => faster
+                None => 0.0,                      // uncapped
             }
         };
+        // At 1x the audio device is the master clock.
+        let fill = audio
+            .as_ref()
+            .filter(|_| limit_speed && !paused && !rewinding)
+            .map(|a| a.fill_ratio());
 
-        if target_frame_ms > 0.0 {
-            // Sleep to maintain target frame duration relative to last frame start
-            let elapsed = last_frame_instant.elapsed();
-            let target = Duration::from_secs_f64((target_frame_ms as f64) / 1000.0);
-            if elapsed < target {
-                std::thread::sleep(target - elapsed);
+        if period_secs > 0.0 {
+            let period = Duration::from_secs_f64(period_secs * fill.map_or(1.0, audio_rate_factor));
+            next_deadline += period;
+            let now = Instant::now();
+            if fill.is_some_and(|f| f < AUDIO_LOW_WATER) {
+                // About to underrun: run the next frame right away.
+                next_deadline = now;
+            } else if next_deadline > now {
+                std::thread::sleep(next_deadline - now);
+            } else if now - next_deadline > period * 4 {
+                // Fell far behind (stall, window drag): resync instead of
+                // sprinting to catch up.
+                next_deadline = now;
             }
         } else {
+            next_deadline = Instant::now();
             // Uncapped: still yield occasionally to avoid starving other threads
             if frame_count % 120 == 0 {
                 std::thread::yield_now();
             }
         }
-        last_frame_instant = Instant::now();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_rate_factor_is_bounded_and_steers_toward_target() {
+        assert_eq!(audio_rate_factor(1.0), 1.0);
+        assert!(audio_rate_factor(1.5) > 1.0, "full queue slows emulation");
+        assert!(audio_rate_factor(0.5) < 1.0, "empty queue speeds it up");
+        assert_eq!(audio_rate_factor(100.0), 1.0 + AUDIO_RATE_CONTROL);
+        assert_eq!(audio_rate_factor(0.0), 1.0 - AUDIO_RATE_CONTROL);
+    }
+
+    #[test]
+    fn frame_period_is_59_73_hz() {
+        assert!((1.0 / FRAME_SECS - 59.7275).abs() < 0.001);
+    }
 
     #[test]
     fn debounce_blocks_writes_until_threshold() {
@@ -455,9 +558,10 @@ mod tests {
 
         let snap = dev.snapshot_rewind().unwrap();
         let compressed = lz4_flex::compress_prepend_size(&snap);
+        // WRAM starts pseudo-random, so the gain is modest; it must not grow.
         assert!(
-            compressed.len() < snap.len() / 4,
-            "GB state should compress well: {} -> {}",
+            compressed.len() < snap.len(),
+            "GB state should compress: {} -> {}",
             snap.len(),
             compressed.len()
         );

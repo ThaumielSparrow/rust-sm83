@@ -271,19 +271,6 @@ impl MBC for FileBackedMBC {
     }
 }
 
-impl Drop for FileBackedMBC {
-    fn drop(&mut self) {
-        if self.mbc.is_battery_backed() {
-            // TODO: error handling
-            let mut file = match fs::File::create(&self.rampath) {
-                Ok(f) => f,
-                Err(..) => return,
-            };
-            let _ = file.write_all(&self.mbc.dumpram());
-        }
-    }
-}
-
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum Cartridge {
     Memory(MbcState),
@@ -297,6 +284,29 @@ impl Cartridge {
 
     pub fn from_buffer(data: Vec<u8>, skip_checksum: bool) -> StrResult<Cartridge> {
         get_mbc(data, skip_checksum).map(Cartridge::Memory)
+    }
+
+    fn state(&self) -> &MbcState {
+        match self {
+            Cartridge::Memory(mbc) => mbc,
+            Cartridge::FileBacked(fb) => &fb.mbc,
+        }
+    }
+
+    /// Whether `other` (typically decoded from a save state) has the same
+    /// mapper and cartridge-RAM layout. Save states don't carry the ROM, so
+    /// this is the guard against loading one game's state onto another.
+    pub fn same_layout(&self, other: &Cartridge) -> bool {
+        std::mem::discriminant(self.state()) == std::mem::discriminant(other.state())
+            && self.dumpram().len() == other.dumpram().len()
+    }
+
+    /// A decoded save state carries the battery-save path from when it was
+    /// written; keep writing to the live cartridge's path instead.
+    pub fn adopt_save_path(&mut self, live: &Cartridge) {
+        if let (Cartridge::FileBacked(dst), Cartridge::FileBacked(src)) = (self, live) {
+            dst.rampath = src.rampath.clone();
+        }
     }
 }
 
@@ -379,6 +389,13 @@ impl MBC for Cartridge {
     }
 }
 
+/// RAM banks for a cartridge whose type byte says it has RAM. A size byte of 0
+/// there is contradictory (Blargg's halt_bug.gb, some homebrew); give it one
+/// 8 KiB bank instead of silently dropping every RAM write.
+fn ram_banks_with_ram(v: u8) -> usize {
+    ram_banks(v).max(1)
+}
+
 fn ram_banks(v: u8) -> usize {
     match v {
         1 =>
@@ -404,6 +421,9 @@ fn rom_banks(v: u8) -> usize {
     }
 }
 
+/// Error returned when the cartridge header checksum doesn't match.
+pub const CHECKSUM_INVALID: &str = "Cartridge checksum is invalid";
+
 fn check_checksum(data: &[u8]) -> StrResult<()> {
     let mut value: u8 = 0;
     for i in 0x134..0x14D {
@@ -411,7 +431,7 @@ fn check_checksum(data: &[u8]) -> StrResult<()> {
     }
     match data[0x14D] == value {
         true => Ok(()),
-        false => Err("Cartridge checksum is invalid"),
+        false => Err(CHECKSUM_INVALID),
     }
 }
 

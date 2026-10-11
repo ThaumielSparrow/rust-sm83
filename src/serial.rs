@@ -3,6 +3,10 @@ pub struct Serial {
     data: u8,
     control: u8,
     pub interrupt: u8,
+    /// Bytes sent over the link port. Only recorded in test builds, where the
+    /// test-ROM harness reads Blargg's serial output from it.
+    #[rkyv(with = rkyv::with::Skip)]
+    pub output: Vec<u8>,
 }
 
 impl Serial {
@@ -12,6 +16,8 @@ impl Serial {
             0xFF02 => {
                 self.control = v;
                 if v & 0x81 == 0x81 {
+                    #[cfg(test)]
+                    self.output.push(self.data);
                     // No link/printer; emulate instant transfer complete.
                     self.interrupt = 0x8;
                     // No peer: bits shift in as 1s, leaving SB at 0xFF.
@@ -37,6 +43,7 @@ impl Serial {
             data: 0,
             control: 0,
             interrupt: 0,
+            output: Vec::new(),
         }
     }
 }

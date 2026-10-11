@@ -81,11 +81,10 @@ impl MBC for MBC2 {
     }
 
     fn loadram(&mut self, ramdata: &[u8]) -> StrResult<()> {
-        if ramdata.len() != self.ram.len() {
-            return Err("Loaded RAM has incorrect length");
-        }
-
-        self.ram = ramdata.to_vec();
+        // Accept saves of any size (other emulators pad or append footers):
+        // load whatever overlaps and leave the rest zeroed.
+        let n = ramdata.len().min(self.ram.len());
+        self.ram[..n].copy_from_slice(&ramdata[..n]);
 
         Ok(())
     }

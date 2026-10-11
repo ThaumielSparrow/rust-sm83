@@ -1,4 +1,4 @@
-use crate::mbc::{ram_banks, rom_banks, MBC};
+use crate::mbc::{ram_banks_with_ram, rom_banks, MBC};
 use crate::StrResult;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -19,8 +19,8 @@ pub struct MBC1 {
 impl MBC1 {
     pub fn new(data: Vec<u8>) -> StrResult<MBC1> {
         let (has_battery, rambanks) = match data[0x147] {
-            0x02 => (false, ram_banks(data[0x149])),
-            0x03 => (true, ram_banks(data[0x149])),
+            0x02 => (false, ram_banks_with_ram(data[0x149])),
+            0x03 => (true, ram_banks_with_ram(data[0x149])),
             _ => (false, 0),
         };
         let rombanks = rom_banks(data[0x148]);
@@ -125,11 +125,10 @@ impl MBC for MBC1 {
     }
 
     fn loadram(&mut self, ramdata: &[u8]) -> StrResult<()> {
-        if ramdata.len() != self.ram.len() {
-            return Err("Loaded RAM has incorrect length");
-        }
-
-        self.ram = ramdata.to_vec();
+        // Accept saves of any size (other emulators pad or append footers):
+        // load whatever overlaps and leave the rest zeroed.
+        let n = ramdata.len().min(self.ram.len());
+        self.ram[..n].copy_from_slice(&ramdata[..n]);
 
         Ok(())
     }

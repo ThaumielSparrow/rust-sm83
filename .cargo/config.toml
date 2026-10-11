@@ -1,2 +1,4 @@
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-cpu=native"]
+# x86-64-v2 (SSE4.2/POPCNT, ~2009+) rather than `native`, so a release .exe
+# built here also runs on other machines.
+rustflags = ["-C", "target-cpu=x86-64-v2"]

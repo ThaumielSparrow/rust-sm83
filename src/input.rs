@@ -16,6 +16,7 @@ pub enum SystemAction {
     ToggleFpsOverlay,
     RewindHold(bool), // true=press, false=release
     RewindStep,
+    Screenshot,
 }
 
 /// Static mapping of (winit Key + modifiers) to SystemAction. Modifiers matter for
@@ -41,6 +42,7 @@ pub fn system_action_for(
         (Pressed, Key::Named(NamedKey::F8)) => Some(LoadState(4)),
         (Pressed, Key::Named(NamedKey::F9)) => Some(ToggleFpsOverlay),
         (Pressed, Key::Named(NamedKey::F11)) => Some(ToggleFullscreen),
+        (Pressed, Key::Named(NamedKey::F12)) => Some(Screenshot),
         (Pressed, Key::Named(NamedKey::Shift)) => Some(TurboHold(true)),
         (Released, Key::Named(NamedKey::Shift)) => Some(TurboHold(false)),
         (Pressed, Key::Named(NamedKey::Backspace)) => Some(RewindHold(true)),
@@ -57,7 +59,7 @@ pub fn system_action_for(
 /// Keys reserved for emulator system actions (not allowed for gamepad bindings).
 pub const RESERVED_KEYS: &[&str] = &[
     "F1","F2","F3","F4","F5","F6","F7","F8", // save/load slots 1-4
-    "F9","F11",                              // FPS overlay, fullscreen
+    "F9","F11","F12",                        // FPS overlay, fullscreen, screenshot
     "Shift","T","Y","P","M",                 // turbo hold/toggle, interpolation, pause, mute
     "Backspace","\\",                        // rewind hold / step back
 ];
@@ -73,6 +75,16 @@ mod tests {
     use super::*;
     use winit::event::ElementState::{Pressed, Released};
     use winit::keyboard::{Key, NamedKey};
+
+    #[test]
+    fn f12_is_a_reserved_screenshot_key() {
+        let m = ModifiersState::empty();
+        assert_eq!(
+            system_action_for(&Key::Named(NamedKey::F12), Pressed, m),
+            Some(SystemAction::Screenshot)
+        );
+        assert!(is_reserved_key_name("F12"));
+    }
 
     #[test]
     fn backspace_maps_to_rewind_hold() {

@@ -13,7 +13,8 @@ pub struct Device {
     save_state: Option<String>,
 }
 
-const SAVE_STATE_MAGIC: &[u8; 8] = b"RGBEST04";
+// 05: APU state is saved; GPU frame buffers are not.
+const SAVE_STATE_MAGIC: &[u8; 8] = b"RGBEST05";
 const SAVE_STATE_HEADER_LEN: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,6 +107,9 @@ fn encode_cpu_state_with_preview(
 
 fn decode_cpu_state(data: &[u8]) -> StrResult<CPU> {
     if !data.starts_with(SAVE_STATE_MAGIC) {
+        if data.starts_with(b"RGBEST") {
+            return Err("Save state is from an older version and can't be loaded");
+        }
         return Err("Unsupported save state format");
     }
     let payload = parse_save_state(data)
@@ -281,16 +285,16 @@ mod test {
     }
 
     #[test]
-    fn v4_magic_is_used_for_writes() {
+    fn v5_magic_is_used_for_writes() {
         let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
         let cpu = CPU::new(cart, None).unwrap();
         let data = encode_cpu_state(&cpu).unwrap();
-        assert!(data.starts_with(b"RGBEST04"), "writes must use V4 magic");
+        assert!(data.starts_with(b"RGBEST05"), "writes must use V5 magic");
     }
 
     #[test]
     fn old_format_saves_are_rejected() {
-        for magic in [b"RGBEST01", b"RGBEST02", b"RGBEST03"] {
+        for magic in [b"RGBEST01", b"RGBEST02", b"RGBEST03", b"RGBEST04"] {
             let mut fake = Vec::from(magic as &[u8]);
             fake.extend_from_slice(&[0u8; 64]);
             assert!(
@@ -356,7 +360,7 @@ mod test {
         let thumbnail = vec![9; crate::gpu::SCREEN_W * crate::gpu::SCREEN_H * 3];
 
         let preview = device.save_state_slot(4, Some(&thumbnail)).unwrap();
-        let slot_path = save_dir.join("save_state_4.sav");
+        let slot_path = save_dir.join("game.slot4.state");
         let data = std::fs::read(&slot_path).unwrap();
         assert!(data.starts_with(SAVE_STATE_MAGIC));
         assert_eq!(read_save_state_preview(&slot_path).unwrap(), preview);
@@ -485,8 +489,52 @@ mod test {
 
         assert_eq!(
             device.save_state_slot_path(3),
-            save_dir.join("save_state_3.sav")
+            save_dir.join("game.slot3.state")
         );
+    }
+
+    #[test]
+    fn legacy_shared_slot_is_read_until_a_per_rom_slot_exists() {
+        let save_dir =
+            std::env::temp_dir().join(format!("rust_gbe_legacy_slot_test_{}", std::process::id()));
+        std::fs::create_dir_all(&save_dir).unwrap();
+        let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
+        let mut device = Device {
+            cpu: CPU::new(cart, None).unwrap(),
+            save_state: Some(save_dir.join("game.state").to_string_lossy().to_string()),
+        };
+        let legacy = save_dir.join("save_state_1.sav");
+        std::fs::write(&legacy, encode_cpu_state(&device.cpu).unwrap()).unwrap();
+
+        assert_eq!(device.save_state_slot_path(1), legacy);
+        device.load_state_slot(1).unwrap();
+
+        device.save_state_slot(1, None).unwrap();
+        assert_eq!(device.save_state_slot_path(1), save_dir.join("game.slot1.state"));
+        let _ = std::fs::remove_dir_all(&save_dir);
+    }
+
+    #[test]
+    fn state_from_a_different_cartridge_is_refused() {
+        let save_dir =
+            std::env::temp_dir().join(format!("rust_gbe_foreign_state_test_{}", std::process::id()));
+        std::fs::create_dir_all(&save_dir).unwrap();
+        let state = save_dir.join("game.state").to_string_lossy().to_string();
+
+        let mbc0 = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
+        let other = Device { cpu: CPU::new(mbc0, None).unwrap(), save_state: Some(state.clone()) };
+        other.save_state_slot(2, None).unwrap();
+
+        let mut rom = test_rom();
+        rom[0x147] = 0x03; // MBC1+RAM+BATTERY
+        rom[0x149] = 0x02; // 8 KiB RAM
+        let mbc1 = mbc::Cartridge::from_buffer(rom, true).unwrap();
+        let mut device = Device { cpu: CPU::new(mbc1, None).unwrap(), save_state: Some(state) };
+        device.write_byte(0xC000, 0x5A);
+
+        assert!(device.load_state_slot(2).is_err());
+        assert_eq!(device.read_byte(0xC000), 0x5A, "live state untouched");
+        let _ = std::fs::remove_dir_all(&save_dir);
     }
 
     #[test]
@@ -598,6 +646,50 @@ mod test {
         assert_eq!(device.romname(), "RKYVTEST", "ROM readable after restore");
     }
 
+    /// Counts samples played, to prove the live player survives a restore.
+    struct CountingPlayer(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl apu::AudioPlayer for CountingPlayer {
+        fn play(&mut self, left: &[f32], _: &[f32]) {
+            self.0.fetch_add(left.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        fn samples_rate(&self) -> u32 {
+            44_100
+        }
+        // Like a real device: the queue drains, so a post-restore sync resumes.
+        fn underflowed(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn restore_brings_back_apu_state_and_keeps_live_output() {
+        let cart = mbc::Cartridge::from_buffer(test_rom(), true).unwrap();
+        let mut device = Device { cpu: CPU::new(cart, None).unwrap(), save_state: None };
+        let played = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        device.enable_audio(Box::new(CountingPlayer(played.clone())), true);
+
+        device.write_byte(0xFF24, 0x35); // NR50
+        let snap = device.snapshot_rewind().unwrap();
+        device.write_byte(0xFF24, 0x77);
+
+        device.restore_rewind(&snap).unwrap();
+        assert_eq!(device.read_byte(0xFF24), 0x35, "APU registers restored");
+        assert_eq!(
+            device.get_gpu_data().len(),
+            crate::gpu::SCREEN_W * crate::gpu::SCREEN_H * 3,
+            "frame buffers carried over from the live GPU"
+        );
+
+        for _ in 0..100_000 {
+            device.do_cycle();
+        }
+        assert!(
+            played.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "audio keeps flowing to the live player after restore"
+        );
+    }
+
     #[test]
     fn slot_save_path_falls_back_to_file_backed_rom_directory() {
         let rom_dir =
@@ -615,7 +707,7 @@ mod test {
 
         assert_eq!(
             device.save_state_slot_path(2),
-            rom_dir.join("save_state_2.sav")
+            rom_dir.join("game.slot2.state")
         );
 
         let _ = std::fs::remove_file(rom_path);
@@ -699,7 +791,20 @@ impl Device {
         if is_on {
             if let Some(sound) = self.cpu.mmu.sound.as_mut() {
                 sound.set_on();
+                // MMU::set_initial ran before any Sound existed, so its
+                // post-boot NR50/NR51 writes were dropped. Without NR51 every
+                // channel stays unrouted until the game writes it itself.
+                sound.wb(0xFF24, 0x77);
+                sound.wb(0xFF25, 0xF3);
             }
+        }
+    }
+
+    /// Replace the audio output device (e.g. after a hot-unplug) without
+    /// resetting the APU. No-op when audio was never enabled.
+    pub fn set_audio_player(&mut self, player: Box<dyn apu::AudioPlayer>) {
+        if let Some(sound) = self.cpu.mmu.sound.as_mut() {
+            sound.set_player(player);
         }
     }
 
@@ -804,7 +909,34 @@ impl Device {
         self.cpu.write_wide(address, byte)
     }
 
+    /// Per-ROM slot file, `<rom>.slot{N}.state`, next to the ROM.
+    fn slot_path(&self, slot: u8) -> PathBuf {
+        let ext = format!("slot{slot}.state");
+        if let Some(path) = self.save_state.as_deref() {
+            return Path::new(path).with_extension(ext);
+        }
+        if let Some(path) = self.cpu.mmu.mbc.get_save_path() {
+            return Path::new(&path).with_extension(ext);
+        }
+        PathBuf::from(ext)
+    }
+
+    /// The slot file to read: the per-ROM file, or else a pre-existing legacy
+    /// `save_state_{N}.sav` (written by older builds and shared by every ROM
+    /// in the folder; `install_checked` rejects it if it's another game's).
+    /// Saving always writes the per-ROM file.
     pub fn save_state_slot_path(&self, slot: u8) -> PathBuf {
+        let path = self.slot_path(slot);
+        if !path.exists() {
+            let legacy = self.legacy_slot_path(slot);
+            if legacy.is_file() {
+                return legacy;
+            }
+        }
+        path
+    }
+
+    fn legacy_slot_path(&self, slot: u8) -> PathBuf {
         let filename = format!("save_state_{}.sav", slot);
 
         if let Some(path) = self.save_state.as_deref().and_then(parent_dir) {
@@ -841,7 +973,7 @@ impl Device {
                 }
             };
 
-        let save_path = self.save_state_slot_path(slot);
+        let save_path = self.slot_path(slot);
 
         match write_atomic(&save_path, &serialized_data) {
             Ok(_) => {
@@ -859,8 +991,14 @@ impl Device {
     /// excluded (see the rom-skip in the MBCs); the APU is excluded as usual.
     /// Returns the raw rkyv payload — no disk header, since these never hit disk.
     pub fn snapshot_rewind(&self) -> StrResult<Vec<u8>> {
+        self.snapshot_rewind_with(<[u8]>::to_vec)
+    }
+
+    /// Like `snapshot_rewind`, but hands the payload to `f` by reference
+    /// (e.g. to compress it) instead of copying it into a new Vec.
+    pub fn snapshot_rewind_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> StrResult<R> {
         rkyv::to_bytes::<rkyv::rancor::Error>(&self.cpu)
-            .map(|bytes| bytes.to_vec())
+            .map(|bytes| f(&bytes))
             .map_err(|_| "Failed to serialize rewind snapshot")
     }
 
@@ -873,13 +1011,35 @@ impl Device {
         Ok(())
     }
 
+    /// Like `install_decoded_cpu`, but refuses a state whose cartridge or
+    /// hardware mode doesn't match the running game (e.g. a state file from a
+    /// different ROM), which would otherwise run with the wrong mapper.
+    fn install_checked(&mut self, decoded: CPU) -> StrResult<()> {
+        if decoded.mmu.gbmode != self.cpu.mmu.gbmode
+            || !self.cpu.mmu.mbc.same_layout(&decoded.mmu.mbc)
+        {
+            return Err("Save state belongs to a different game");
+        }
+        self.install_decoded_cpu(decoded);
+        Ok(())
+    }
+
     /// Install a freshly-decoded (rom-less, audio-less) CPU as the live CPU,
     /// carrying the immutable ROM and the live audio player across the swap.
     /// Shared by slot-load and rewind restore.
     fn install_decoded_cpu(&mut self, mut decoded: CPU) {
+        decoded.mmu.mbc.adopt_save_path(&self.cpu.mmu.mbc);
         let rom = self.cpu.mmu.mbc.take_rom(); // zero-copy move from outgoing CPU
         decoded.mmu.mbc.set_rom(rom);
-        decoded.mmu.sound = self.cpu.mmu.sound.take(); // keep the cpal player alive
+        decoded.mmu.gpu.adopt_frame_buffers(&mut self.cpu.mmu.gpu);
+        // Restore the saved APU state but keep the live output (cpal player).
+        match (&mut decoded.mmu.sound, self.cpu.mmu.sound.as_mut()) {
+            (Some(saved), Some(live)) => saved.adopt_output(live),
+            // Saved without audio attached: keep the live APU as-is.
+            (None, Some(_)) => decoded.mmu.sound = self.cpu.mmu.sound.take(),
+            // No audio attached now: stay that way.
+            (_, None) => decoded.mmu.sound = None,
+        }
         self.cpu = decoded;
         self.sync_audio(); // drop any stale queued samples
     }
@@ -899,8 +1059,7 @@ impl Device {
         };
         let data = std::fs::read(path).map_err(|_| "No auto-save file")?;
         let cpu = decode_cpu_state(&data)?;
-        self.install_decoded_cpu(cpu);
-        Ok(())
+        self.install_checked(cpu)
     }
 
     pub fn load_state_slot(&mut self, slot: u8) -> StrResult<()> {
@@ -908,9 +1067,8 @@ impl Device {
         let save_path = self.save_state_slot_path(slot);
 
         match std::fs::read(&save_path) {
-            Ok(data) => match decode_cpu_state(&data) {
-                Ok(cpu) => {
-                    self.install_decoded_cpu(cpu);
+            Ok(data) => match decode_cpu_state(&data).and_then(|cpu| self.install_checked(cpu)) {
+                Ok(()) => {
                     println!("State loaded from slot {}", slot);
                     Ok(())
                 }
