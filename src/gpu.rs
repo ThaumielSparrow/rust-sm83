@@ -247,6 +247,16 @@ impl GPU {
         len
     }
 
+    /// The PPU owns VRAM while drawing (mode 3): CPU access is cut off.
+    pub fn vram_blocked(&self) -> bool {
+        self.lcd_on && self.mode == 3
+    }
+
+    /// The PPU owns OAM while scanning and drawing (modes 2 and 3).
+    pub fn oam_blocked(&self) -> bool {
+        self.lcd_on && (self.mode == 2 || self.mode == 3)
+    }
+
     /// Move the PPU to `dots` into line 0 (its position when the boot ROM
     /// hands over), with the mode that position implies.
     pub fn set_post_boot_clock(&mut self, dots: u32) {

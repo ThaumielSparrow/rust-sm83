@@ -252,14 +252,16 @@ impl MMU {
     pub fn rb(&mut self, address: u16) -> u8 {
         match address {
             0x0000..=0x7FFF => self.mbc.readrom(address),
+            0x8000..=0x9FFF if self.gpu.vram_blocked() => 0xFF,
             0x8000..=0x9FFF => self.gpu.rb(address),
             0xA000..=0xBFFF => self.mbc.readram(address),
             0xC000..=0xCFFF | 0xE000..=0xEFFF => self.wram[address as usize & 0x0FFF],
             0xD000..=0xDFFF | 0xF000..=0xFDFF => {
                 self.wram[(self.wrambank * 0x1000) | address as usize & 0x0FFF]
             }
-            // OAM is on the DMA's bus while a transfer runs.
-            0xFE00..=0xFE9F if self.oam_dma_active => 0xFF,
+            // OAM is on the DMA's bus while a transfer runs, and the PPU's
+            // during modes 2-3.
+            0xFE00..=0xFE9F if self.oam_dma_active || self.gpu.oam_blocked() => 0xFF,
             0xFE00..=0xFE9F => self.gpu.rb(address),
             0xFF00 => self.keypad.rb(),
             0xFF01..=0xFF02 => self.serial.rb(address),
@@ -302,13 +304,14 @@ impl MMU {
     pub fn wb(&mut self, address: u16, value: u8) {
         match address {
             0x0000..=0x7FFF => self.mbc.writerom(address, value),
+            0x8000..=0x9FFF if self.gpu.vram_blocked() => {}
             0x8000..=0x9FFF => self.gpu.wb(address, value),
             0xA000..=0xBFFF => self.mbc.writeram(address, value),
             0xC000..=0xCFFF | 0xE000..=0xEFFF => self.wram[address as usize & 0x0FFF] = value,
             0xD000..=0xDFFF | 0xF000..=0xFDFF => {
                 self.wram[(self.wrambank * 0x1000) | (address as usize & 0x0FFF)] = value
             }
-            0xFE00..=0xFE9F if self.oam_dma_active => {}
+            0xFE00..=0xFE9F if self.oam_dma_active || self.gpu.oam_blocked() => {}
             0xFE00..=0xFE9F => self.gpu.wb(address, value),
             0xFF00 => self.keypad.wb(value),
             0xFF01..=0xFF02 => self.serial.wb(address, value),

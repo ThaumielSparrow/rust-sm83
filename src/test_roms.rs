@@ -287,7 +287,7 @@ mod mooneye {
         acceptance_ppu_intr_2_mode0_timing = "acceptance/ppu/intr_2_mode0_timing.gb",
         acceptance_ppu_intr_2_mode0_timing_sprites = "acceptance/ppu/intr_2_mode0_timing_sprites.gb",
         acceptance_ppu_intr_2_mode3_timing = "acceptance/ppu/intr_2_mode3_timing.gb",
-        #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] acceptance_ppu_intr_2_oam_ok_timing = "acceptance/ppu/intr_2_oam_ok_timing.gb",
+        acceptance_ppu_intr_2_oam_ok_timing = "acceptance/ppu/intr_2_oam_ok_timing.gb",
         #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] acceptance_ppu_lcdon_timing_gs = "acceptance/ppu/lcdon_timing-GS.gb",
         #[ignore = "PPU timing (fixed mode 3 length, STAT edge cases)"] acceptance_ppu_lcdon_write_timing_gs = "acceptance/ppu/lcdon_write_timing-GS.gb",
         acceptance_ppu_stat_irq_blocking = "acceptance/ppu/stat_irq_blocking.gb",
