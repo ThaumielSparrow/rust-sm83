@@ -212,7 +212,7 @@ mod blargg {
         mem_timing = "mem_timing.gb",
         mem_timing_2 = "mem_timing-2.gb",
         halt_bug = "halt_bug.gb",
-        #[ignore = "subtest 01 (register behaviour) fails"] dmg_sound = "dmg_sound.gb",
+        dmg_sound = "dmg_sound.gb",
     ]);
     mod cgb {
         use super::*;

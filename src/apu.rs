@@ -935,6 +935,12 @@ impl Sound {
                         }
                         self.wb(i, 0);
                     }
+                    if self.dmg_mode {
+                        // NR11/NR21 share their byte with the duty, which is
+                        // cleared like everything else.
+                        self.channel1.duty = 0;
+                        self.channel2.duty = 0;
+                    }
                 }
                 if !self.on && turn_on {
                     // Reset frame step when turning on
