@@ -164,6 +164,42 @@ pub struct Config {
     #[serde(default)] pub window_pos: Option<(i32, i32)>,
     /// Pause emulation while the window is in the background.
     #[serde(default)] pub pause_on_focus_loss: bool,
+    #[serde(default)] pub screen_filter: ScreenFilter,
+    /// Darken the edges of each Game Boy pixel, like the original LCD.
+    #[serde(default)] pub lcd_grid: bool,
+}
+
+/// How the 160x144 frame is scaled up to the window.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ScreenFilter {
+    /// Hard square pixels; uneven pixel widths at non-integer scales.
+    #[default]
+    Nearest,
+    /// Smooth, but blurry.
+    Bilinear,
+    /// Square pixels with only their edges blended: crisp at any scale.
+    SharpBilinear,
+}
+
+impl ScreenFilter {
+    pub fn all() -> &'static [ScreenFilter] {
+        &[ScreenFilter::Nearest, ScreenFilter::Bilinear, ScreenFilter::SharpBilinear]
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            ScreenFilter::Nearest => "Nearest",
+            ScreenFilter::Bilinear => "Bilinear",
+            ScreenFilter::SharpBilinear => "Sharp bilinear",
+        }
+    }
+    /// The next filter, for the cycle hotkey.
+    pub fn next(&self) -> ScreenFilter {
+        match self {
+            ScreenFilter::Nearest => ScreenFilter::Bilinear,
+            ScreenFilter::Bilinear => ScreenFilter::SharpBilinear,
+            ScreenFilter::SharpBilinear => ScreenFilter::Nearest,
+        }
+    }
 }
 
 static LOAD_WARNING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -196,6 +232,8 @@ impl Default for Config {
             gamepad: GamepadBindings::default(),
             window_pos: None,
             pause_on_focus_loss: false,
+            screen_filter: ScreenFilter::default(),
+            lcd_grid: false,
         }
     }
 }

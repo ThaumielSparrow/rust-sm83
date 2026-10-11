@@ -2,9 +2,131 @@
 
 use super::*;
 
-#[derive(Default)]
 pub struct RenderOptions {
-    pub linear_interpolation: bool,
+    pub filter: crate::config::ScreenFilter,
+    pub lcd_grid: bool,
+}
+
+/// Draws the Game Boy frame texture into a viewport with the selected
+/// filter (see `SCREEN_FRAGMENT_SHADER`).
+pub(super) struct ScreenRenderer {
+    vertices: glium::VertexBuffer<ScreenVertex>,
+    program: glium::Program,
+}
+
+#[derive(Clone, Copy)]
+struct ScreenVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+}
+glium::implement_vertex!(ScreenVertex, position, uv);
+
+const SCREEN_VERTEX_SHADER: &str = r#"
+#version 140
+in vec2 position;
+in vec2 uv;
+out vec2 v_uv;
+void main() {
+    v_uv = uv;
+    gl_Position = vec4(position, 0.0, 1.0);
+}
+"#;
+
+/// filter_mode: 0 = nearest / bilinear (picked by the sampler), 1 = sharp
+/// bilinear (bilinear sampling, but only within a one-output-pixel band at
+/// each texel edge). `grid` darkens one output pixel along each texel's
+/// top and left edge.
+const SCREEN_FRAGMENT_SHADER: &str = r#"
+#version 140
+uniform sampler2D tex;
+uniform vec2 tex_size;
+uniform vec2 out_size;
+uniform int filter_mode;
+uniform float grid;
+in vec2 v_uv;
+out vec4 color;
+void main() {
+    vec2 texel = v_uv * tex_size;
+    vec2 scale = out_size / tex_size;
+    vec2 uv = v_uv;
+    if (filter_mode == 1) {
+        vec2 prescale = max(floor(scale), vec2(1.0));
+        vec2 base = floor(texel);
+        vec2 dist = fract(texel) - 0.5;
+        vec2 band = 0.5 - 0.5 / prescale;
+        vec2 f = (dist - clamp(dist, -band, band)) * prescale + 0.5;
+        uv = (base + f) / tex_size;
+    }
+    vec3 rgb = texture(tex, uv).rgb;
+    if (grid > 0.0) {
+        vec2 edge = fract(texel) * scale;
+        if (edge.x < 1.0 || edge.y < 1.0) {
+            rgb *= 1.0 - grid;
+        }
+    }
+    color = vec4(rgb, 1.0);
+}
+"#;
+
+impl ScreenRenderer {
+    pub(super) fn new(display: &glium::Display<glium::glutin::surface::WindowSurface>) -> Self {
+        // Full-viewport quad; v=0 is the frame's first (top) row.
+        let quad = [
+            ScreenVertex { position: [-1.0, -1.0], uv: [0.0, 1.0] },
+            ScreenVertex { position: [1.0, -1.0], uv: [1.0, 1.0] },
+            ScreenVertex { position: [-1.0, 1.0], uv: [0.0, 0.0] },
+            ScreenVertex { position: [1.0, 1.0], uv: [1.0, 0.0] },
+        ];
+        let vertices = glium::VertexBuffer::new(display, &quad).expect("screen quad");
+        let program = glium::Program::from_source(
+            display,
+            SCREEN_VERTEX_SHADER,
+            SCREEN_FRAGMENT_SHADER,
+            None,
+        )
+        .expect("screen shader");
+        ScreenRenderer { vertices, program }
+    }
+
+    /// Draw `texture` into the `(left, bottom, w, h)` viewport of `target`.
+    pub(super) fn draw(
+        &self,
+        target: &mut glium::Frame,
+        texture: &glium::texture::texture2d::Texture2d,
+        viewport: (u32, u32, u32, u32),
+        options: &RenderOptions,
+    ) {
+        use crate::config::ScreenFilter;
+        use glium::uniforms::{MagnifySamplerFilter, MinifySamplerFilter};
+        let (left, bottom, width, height) = viewport;
+        let (mag, min) = match options.filter {
+            ScreenFilter::Nearest => (MagnifySamplerFilter::Nearest, MinifySamplerFilter::Nearest),
+            _ => (MagnifySamplerFilter::Linear, MinifySamplerFilter::Linear),
+        };
+        let sampler = texture
+            .sampled()
+            .magnify_filter(mag)
+            .minify_filter(min)
+            .wrap_function(glium::uniforms::SamplerWrapFunction::Clamp);
+        let uniforms = glium::uniform! {
+            tex: sampler,
+            tex_size: [rust_gbe::SCREEN_W as f32, rust_gbe::SCREEN_H as f32],
+            out_size: [width as f32, height as f32],
+            filter_mode: if options.filter == ScreenFilter::SharpBilinear { 1i32 } else { 0i32 },
+            grid: if options.lcd_grid { 0.25f32 } else { 0.0f32 },
+        };
+        let params = glium::DrawParameters {
+            viewport: Some(glium::Rect { left, bottom, width, height }),
+            ..Default::default()
+        };
+        let _ = target.draw(
+            &self.vertices,
+            glium::index::NoIndices(glium::index::PrimitiveType::TriangleStrip),
+            &self.program,
+            &uniforms,
+            &params,
+        );
+    }
 }
 
 pub(super) struct FpsMeter {

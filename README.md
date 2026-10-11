@@ -53,7 +53,7 @@ These are reserved keybinds for system functionality and cannot be adjusted thro
 
 `Shift`: Hold turbo
 
-`Y`: Toggle interpolation
+`Y`: Cycle screen filter (nearest / bilinear / sharp bilinear; LCD grid in Display menu)
 
 `P`: Pause
 

@@ -62,6 +62,7 @@ struct Running {
     save_slots: SaveSlotCache,
     latest_frame: Option<Arc<Vec<u8>>>,
     renderoptions: RenderOptions,
+    screen: ScreenRenderer,
     running: bool,
     keybindings: KeyBindings,
     capturing: Option<rust_gbe::KeypadKey>,
@@ -419,7 +420,11 @@ impl RootApp {
                 ui_receiver,
                 save_slots,
                 latest_frame: None,
-                renderoptions: RenderOptions::default(),
+                renderoptions: RenderOptions {
+                    filter: cfg.screen_filter,
+                    lcd_grid: cfg.lcd_grid,
+                },
+                screen: ScreenRenderer::new(display),
                 running: true,
                 keybindings: cfg.keybindings.clone(),
                 capturing: None,
@@ -1131,6 +1136,7 @@ impl ApplicationHandler<UserEvent> for RootApp {
             ) => {
                 let Running { sender,
                     texture,
+                    screen,
                     receiver,
                     ui_receiver,
                     save_slots,
@@ -1251,7 +1257,19 @@ impl ApplicationHandler<UserEvent> for RootApp {
                                         }
                                     });
                                     ui.separator();
-                                    ui.checkbox(&mut renderoptions.linear_interpolation, "Linear interpolation (Y)");
+                                    ui.menu_button("Filter (Y)", |ui| {
+                                        for f in crate::config::ScreenFilter::all() {
+                                            if ui.radio(renderoptions.filter == *f, f.label()).clicked() {
+                                                renderoptions.filter = *f;
+                                                let f = *f;
+                                                crate::config::update_config(|c| c.screen_filter = f);
+                                            }
+                                        }
+                                    });
+                                    if ui.checkbox(&mut renderoptions.lcd_grid, "LCD grid").changed() {
+                                        let on = renderoptions.lcd_grid;
+                                        crate::config::update_config(|c| c.lcd_grid = on);
+                                    }
                                     if ui.checkbox(integer_scaling, "Integer scaling").changed() {
                                         let on = *integer_scaling;
                                         crate::config::update_config(|c| c.integer_scaling = on);
@@ -1376,24 +1394,10 @@ impl ApplicationHandler<UserEvent> for RootApp {
                     target.clear_color(0.0, 0.0, 0.0, 1.0);
                     // Render the frame aspect-correct and centered in the game area.
                     if game_area_height > 0 {
-                        let interpolation_type = if renderoptions.linear_interpolation {
-                            glium::uniforms::MagnifySamplerFilter::Linear
-                        } else {
-                            glium::uniforms::MagnifySamplerFilter::Nearest
-                        };
                         let (left, bottom, w, h) =
                             fit_rect(target_w, game_area_height, *integer_scaling);
                         if w > 0 && h > 0 {
-                            texture.as_surface().blit_whole_color_to(
-                                &target,
-                                &glium::BlitTarget {
-                                    left,
-                                    bottom: bottom + h, // top edge; negative height flips Y
-                                    width: w as i32,
-                                    height: -(h as i32),
-                                },
-                                interpolation_type,
-                            );
+                            screen.draw(&mut target, texture, (left, bottom, w, h), renderoptions);
                         }
                     }
 

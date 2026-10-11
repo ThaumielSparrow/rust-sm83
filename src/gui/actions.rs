@@ -69,7 +69,10 @@ pub(super) fn handle_system_action(action: crate::input::SystemAction, ctx: &mut
             );
         }
         SystemAction::ToggleInterpolation => {
-            ctx.renderoptions.linear_interpolation = !ctx.renderoptions.linear_interpolation;
+            let next = ctx.renderoptions.filter.next();
+            ctx.renderoptions.filter = next;
+            crate::config::update_config(|c| c.screen_filter = next);
+            ctx.toasts.push(format!("Filter: {}", next.label()), ToastKind::Info);
         }
         SystemAction::TogglePause => {
             *ctx.paused = !*ctx.paused;
