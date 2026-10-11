@@ -19,14 +19,6 @@ use winit::window::{Fullscreen, WindowId};
 use crate::config::GamepadBindings;
 use crate::gamepad::{BindTarget, BoundAction, DirectionMux, ResolvedBindings};
 
-pub const EXITCODE_SUCCESS: i32 = 0;
-pub const EXITCODE_CPULOADFAILS: i32 = 2;
-
-#[derive(Default)]
-pub struct RenderOptions {
-    pub linear_interpolation: bool,
-}
-
 use crate::audio::init_audio;
 use crate::config::{binding_value, config_path, Config, DmgPalettePreset, KeyBindings, TurboSetting};
 use crate::emulator::{construct_cpu_auto, run_cpu, GBEvent, GuiEvent};
@@ -34,178 +26,18 @@ use crate::input::is_reserved_key_name;
 use crate::palette::{apply_dmg_palette, palette_for_preset, DmgPalette};
 use crate::toast::{ToastKind, ToastQueue};
 
-struct SaveSlotUi {
-    slot: u8,
-    preview: Option<SaveStatePreview>,
-    texture: Option<egui::TextureHandle>,
-    saving: bool,
-    save_failed: bool,
-}
+mod actions;
+mod aux_windows;
+mod display;
+mod states;
 
-struct SaveSlotCache {
-    slots: Vec<SaveSlotUi>,
-}
+use actions::*;
+use aux_windows::*;
+use display::*;
+use states::*;
 
-impl SaveSlotCache {
-    fn from_paths(paths: Vec<(u8, PathBuf)>) -> Self {
-        let slots = paths
-            .into_iter()
-            .map(|(slot, path)| SaveSlotUi {
-                slot,
-                preview: read_save_state_preview(&path),
-                texture: None,
-                saving: false,
-                save_failed: false,
-            })
-            .collect();
-        SaveSlotCache { slots }
-    }
-
-    fn mark_saving(&mut self, slot: u8) {
-        if let Some(slot) = self.slot_mut(slot) {
-            slot.saving = true;
-            slot.save_failed = false;
-        }
-    }
-
-    fn mark_saved(&mut self, slot: u8, preview: SaveStatePreview) {
-        if let Some(slot) = self.slot_mut(slot) {
-            slot.preview = Some(preview);
-            slot.texture = None;
-            slot.saving = false;
-            slot.save_failed = false;
-        }
-    }
-
-    fn mark_failed(&mut self, slot: u8) {
-        if let Some(slot) = self.slot_mut(slot) {
-            slot.saving = false;
-            slot.save_failed = true;
-        }
-    }
-
-    fn slot_mut(&mut self, slot: u8) -> Option<&mut SaveSlotUi> {
-        self.slots.iter_mut().find(|entry| entry.slot == slot)
-    }
-}
-
-struct FpsMeter {
-    times: VecDeque<Instant>,
-    cap: usize,
-}
-
-impl FpsMeter {
-    fn new() -> Self {
-        Self { times: VecDeque::with_capacity(120), cap: 120 }
-    }
-    fn record(&mut self) {
-        if self.times.len() == self.cap {
-            self.times.pop_front();
-        }
-        self.times.push_back(Instant::now());
-    }
-    fn fps(&self) -> f32 {
-        if self.times.len() < 2 {
-            return 0.0;
-        }
-        let span = self
-            .times
-            .back()
-            .unwrap()
-            .duration_since(*self.times.front().unwrap())
-            .as_secs_f32();
-        if span <= 0.0 {
-            0.0
-        } else {
-            (self.times.len() - 1) as f32 / span
-        }
-    }
-}
-
-/// Which tab of the Keybindings window is visible.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BindTab {
-    Keyboard,
-    Controller,
-}
-
-/// Uniform width for binding-value buttons so rows in the keybindings grids line up.
-const BIND_BUTTON_WIDTH: f32 = 130.0;
-
-/// Fixed logical width of the keybindings window. Width is not auto-sized:
-/// full-width widgets (separators, wrapped labels) track the available width,
-/// so measuring it would chase the window size (see the height-only measure
-/// in `draw_bind_window`).
-const BIND_WINDOW_WIDTH: f32 = 440.0;
-
-/// Read-only reference of fixed keyboard system hotkeys, shown in the
-/// keybindings window's Keyboard tab so they're discoverable in-app.
-const SYSTEM_HOTKEY_HELP: &[(&str, &str)] = &[
-    ("F1–F4", "Save State 1–4"),
-    ("F5–F8", "Load State 1–4"),
-    ("F9", "FPS overlay"),
-    ("F11", "Fullscreen"),
-    ("Shift", "Turbo (hold)"),
-    ("T", "Turbo (toggle)"),
-    ("Backspace", "Rewind (hold)"),
-    ("\\", "Rewind (step back)"),
-    ("Y", "Linear interpolation"),
-    ("P", "Pause"),
-    ("M", "Mute"),
-    ("Ctrl+R", "Reset"),
-    ("Esc", "Exit (double-press)"),
-];
-
-/// A small auxiliary OS window (keybindings, cheats) with its own GL context
-/// and egui instance, height-fit to its content so it never has to squeeze
-/// into the game window at small scales.
-struct AuxWindow {
-    window: winit::window::Window,
-    display: glium::Display<glium::glutin::surface::WindowSurface>,
-    egui_glium: egui_glium::EguiGlium,
-    /// Last height requested to fit content; avoids re-requesting every frame.
-    requested_height: Option<f32>,
-}
-
-impl AuxWindow {
-    fn open(event_loop: &ActiveEventLoop, title: &str, width: f32, initial_height: u32) -> AuxWindow {
-        let (window, display) = glium::backend::glutin::SimpleWindowBuilder::new()
-            .with_title(title)
-            .with_inner_size(width as u32, initial_height)
-            .build(event_loop);
-        let egui_glium =
-            egui_glium::EguiGlium::new(egui::ViewportId::ROOT, &display, &window, &event_loop);
-        window.request_redraw();
-        AuxWindow { window, display, egui_glium, requested_height: None }
-    }
-
-    /// Run one egui frame (`ui_fn` draws and returns the measured content
-    /// height), paint, honor egui repaint requests, and fit the window height
-    /// to the content. Width stays fixed. Only re-requests a size when the
-    /// target changes so a denied/clamped request can't loop.
-    fn draw(&mut self, width: f32, mut ui_fn: impl FnMut(&egui::Context) -> f32) {
-        let mut content_height: f32 = 0.0;
-        self.egui_glium.run(&self.window, |ctx| {
-            content_height = ui_fn(ctx);
-        });
-        let mut target = self.display.draw();
-        target.clear_color(0.1, 0.1, 0.1, 1.0);
-        self.egui_glium.paint(&self.display, &mut target);
-        let _ = target.finish();
-        // Nothing else drives redraws of this window, so honor egui's repaint
-        // requests (collapsing-header animation, etc.) ourselves.
-        if self.egui_glium.egui_ctx().has_requested_repaint() {
-            self.window.request_redraw();
-        }
-        let desired = (content_height + 24.0).clamp(120.0, 800.0);
-        if self.requested_height.is_none_or(|h| (h - desired).abs() > 2.0) {
-            self.requested_height = Some(desired);
-            let _ = self
-                .window
-                .request_inner_size(winit::dpi::LogicalSize::new(width, desired));
-        }
-    }
-}
+pub const EXITCODE_SUCCESS: i32 = 0;
+pub const EXITCODE_CPULOADFAILS: i32 = 2;
 
 // Unified state machine for ROM selection and emulator run to ensure a single EventLoop
 enum RootPhase {
@@ -218,62 +50,65 @@ enum RootPhase {
         /// Why the last ROM failed to load, shown under the path field.
         load_error: Option<String>,
     },
-    Running {
-        texture: glium::texture::texture2d::Texture2d,
-        sender: mpsc::Sender<GBEvent>,
-        receiver: Receiver<Arc<Vec<u8>>>,
-        ui_receiver: Receiver<GuiEvent>,
-        save_slots: SaveSlotCache,
-        latest_frame: Option<Arc<Vec<u8>>>,
-        renderoptions: RenderOptions,
-        running: bool,
-        keybindings: KeyBindings,
-        capturing: Option<rust_gbe::KeypadKey>,
-        _audio: Option<Stream>,
-        /// Queue/health view of `_audio`; None when running on the null player.
-        audio_clock: Option<crate::audio::AudioClock>,
-        /// When to next try (re)opening an audio device, if the current one
-        /// failed or none was available.
-        audio_retry_at: Option<Instant>,
-        // Timestamp of last Escape press. A single press will set this; a second press
-        // within ESC_DOUBLE_PRESS_MS will trigger emulator exit. Kept here so the state
-        // survives between key events.
-        last_escape: Option<Instant>,
-        turbo_toggle: bool,
-        turbo_held: bool,
-        turbo_setting: TurboSetting,
-        volume: u8,
-        rom_path: PathBuf,
-        is_color: bool,
-        emu_thread: Option<JoinHandle<()>>,
-        modifiers: ModifiersState,
-        paused: bool,
-        pre_mute_volume: Option<u8>,
-        fullscreen: bool,
-        fps_overlay: bool,
-        fps_meter: FpsMeter,
-        dmg_palette_preset: DmgPalettePreset,
-        dmg_palette_custom: [[u8; 3]; 4],
-        // Scratch buffer reused across frames for host-side palette mapping in DMG mode.
-        palette_scratch: Vec<u8>,
-        gamepad_bindings: GamepadBindings,
-        resolved_gamepad: ResolvedBindings,
-        gamepad_capturing: Option<BindTarget>,
-        direction_mux: DirectionMux,
-        bind_tab: BindTab,
-        rewinding: bool,
-        toasts: ToastQueue,
-        integer_scaling: bool,
-        auto_resume: bool,
-        pause_on_focus_loss: bool,
-        /// True while paused because the window lost focus (resume on regain).
-        focus_paused: bool,
-        cheats: Vec<crate::cheats::Cheat>,
-        cheat_key: String,
-        cheat_entry: String,
-        cheat_entry_label: String,
-        cheat_error: Option<&'static str>,
-    },
+    Running(Box<Running>),
+}
+
+/// Everything the GUI holds for a running game.
+struct Running {
+    texture: glium::texture::texture2d::Texture2d,
+    sender: mpsc::Sender<GBEvent>,
+    receiver: Receiver<Arc<Vec<u8>>>,
+    ui_receiver: Receiver<GuiEvent>,
+    save_slots: SaveSlotCache,
+    latest_frame: Option<Arc<Vec<u8>>>,
+    renderoptions: RenderOptions,
+    running: bool,
+    keybindings: KeyBindings,
+    capturing: Option<rust_gbe::KeypadKey>,
+    _audio: Option<Stream>,
+    /// Queue/health view of `_audio`; None when running on the null player.
+    audio_clock: Option<crate::audio::AudioClock>,
+    /// When to next try (re)opening an audio device, if the current one
+    /// failed or none was available.
+    audio_retry_at: Option<Instant>,
+    // Timestamp of last Escape press. A single press will set this; a second press
+    // within ESC_DOUBLE_PRESS_MS will trigger emulator exit. Kept here so the state
+    // survives between key events.
+    last_escape: Option<Instant>,
+    turbo_toggle: bool,
+    turbo_held: bool,
+    turbo_setting: TurboSetting,
+    volume: u8,
+    rom_path: PathBuf,
+    is_color: bool,
+    emu_thread: Option<JoinHandle<()>>,
+    modifiers: ModifiersState,
+    paused: bool,
+    pre_mute_volume: Option<u8>,
+    fullscreen: bool,
+    fps_overlay: bool,
+    fps_meter: FpsMeter,
+    dmg_palette_preset: DmgPalettePreset,
+    dmg_palette_custom: [[u8; 3]; 4],
+    // Scratch buffer reused across frames for host-side palette mapping in DMG mode.
+    palette_scratch: Vec<u8>,
+    gamepad_bindings: GamepadBindings,
+    resolved_gamepad: ResolvedBindings,
+    gamepad_capturing: Option<BindTarget>,
+    direction_mux: DirectionMux,
+    bind_tab: BindTab,
+    rewinding: bool,
+    toasts: ToastQueue,
+    integer_scaling: bool,
+    auto_resume: bool,
+    pause_on_focus_loss: bool,
+    /// True while paused because the window lost focus (resume on regain).
+    focus_paused: bool,
+    cheats: Vec<crate::cheats::Cheat>,
+    cheat_key: String,
+    cheat_entry: String,
+    cheat_entry_label: String,
+    cheat_error: Option<&'static str>,
 }
 
 /// Actions requested while the emulator phase is mutably borrowed, deferred until
@@ -436,7 +271,8 @@ impl RootApp {
                 WindowEvent::KeyboardInput { event: keyevent, .. }
                     if keyevent.state == winit::event::ElementState::Pressed =>
                 {
-                    if let RootPhase::Running { keybindings, capturing, gamepad_capturing, .. } = phase {
+                    if let RootPhase::Running(running) = phase {
+                        let Running { keybindings, capturing, gamepad_capturing, .. } = &mut **running;
                         let logical = keyevent.logical_key.clone();
                         if let Key::Named(NamedKey::Escape) = logical.as_ref() {
                             if gamepad_capturing.is_some() {
@@ -473,7 +309,7 @@ impl RootApp {
         match action {
             Some(PendingAction::Reset) => {
                 let path = match &self.phase {
-                    RootPhase::Running { rom_path, .. } => Some(rom_path.clone()),
+                    RootPhase::Running(running) => Some(running.rom_path.clone()),
                     _ => None,
                 };
                 if let Some(p) = path {
@@ -499,7 +335,7 @@ impl RootApp {
         // stop first so the outgoing emulator flushes battery RAM and the
         // auto-save before the new device reads them.
         let same_rom =
-            matches!(&self.phase, RootPhase::Running { rom_path: cur, .. } if *cur == rom_path);
+            matches!(&self.phase, RootPhase::Running(running) if running.rom_path == rom_path);
         if same_rom {
             self.stop_emulator();
         }
@@ -576,7 +412,7 @@ impl RootApp {
             crate::config::update_config(|c| c.push_recent(&rom_path));
             crate::config::push_recent(&mut self.recent_roms, &rom_path);
 
-            self.phase = RootPhase::Running {
+            self.phase = RootPhase::Running(Box::new(Running {
                 texture,
                 sender,
                 receiver: frame_receiver,
@@ -623,8 +459,9 @@ impl RootApp {
                 cheat_entry: String::new(),
                 cheat_entry_label: String::new(),
                 cheat_error: None,
-            };
-            if let RootPhase::Running { sender, cheats, .. } = &self.phase {
+            }));
+            if let RootPhase::Running(running) = &self.phase {
+                let Running { sender, cheats, .. } = & **running;
                 let _ = sender.send(GBEvent::UpdateTurbo(cfg.turbo));
                 let _ = sender.send(GBEvent::UpdateVolume(perceptual_to_linear(cfg.volume)));
                 let _ = sender.send(GBEvent::SetCheats(crate::cheats::enabled_pokes(cheats)));
@@ -674,11 +511,10 @@ impl RootApp {
     /// unplugged) or appears after starting without one: open the current
     /// default device and hand the emulator a new player. APU state is kept.
     fn maintain_audio(&mut self) {
-        let RootPhase::Running { sender, _audio, audio_clock, audio_retry_at, toasts, .. } =
-            &mut self.phase
-        else {
+        let RootPhase::Running(running) = &mut self.phase else {
             return;
         };
+        let Running { sender, _audio, audio_clock, audio_retry_at, toasts, .. } = &mut **running;
         if audio_clock.as_ref().is_some_and(|c| c.failed()) {
             *_audio = None;
             *audio_clock = None;
@@ -711,8 +547,10 @@ impl RootApp {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| rom_path.display().to_string());
         let text = format!("Couldn't load {name}: {msg}");
-        if let RootPhase::Running { toasts, emu_thread: Some(_), .. } = &mut self.phase {
-            toasts.push(text, ToastKind::Error);
+        if let RootPhase::Running(running) = &mut self.phase
+            && running.emu_thread.is_some()
+        {
+            running.toasts.push(text, ToastKind::Error);
             return;
         }
         self.phase = RootPhase::Selecting {
@@ -733,9 +571,9 @@ impl RootApp {
     pub fn stop_emulator(&mut self) {
         self.rumble_effect = None;
         let handle = match &mut self.phase {
-            RootPhase::Running { sender, emu_thread, .. } => {
-                let _ = sender.send(GBEvent::Shutdown);
-                emu_thread.take()
+            RootPhase::Running(running) => {
+                let _ = running.sender.send(GBEvent::Shutdown);
+                running.emu_thread.take()
             }
             _ => None,
         };
@@ -757,8 +595,11 @@ impl RootApp {
         let mut transitions: Vec<(rust_gbe::KeypadKey, bool)> = Vec::new();
         let mut any_activity = false;
         while let Some(ev) = gilrs.next_event() {
-            let RootPhase::Running {
-                sender,
+            let RootPhase::Running(running) = &mut *phase
+            else {
+                continue;
+            };
+            let Running { sender,
                 save_slots,
                 latest_frame,
                 renderoptions,
@@ -775,11 +616,7 @@ impl RootApp {
                 gamepad_capturing,
                 direction_mux,
                 toasts,
-                ..
-            } = &mut *phase
-            else {
-                continue;
-            };
+                .. } = &mut **running;
             // (button, pressed) pairs to dispatch; axis events fill `transitions`.
             let mut hotkey: Option<(crate::gamepad::HotkeyAction, bool)> = None;
             transitions.clear();
@@ -873,241 +710,6 @@ impl RootApp {
             }
         }
     }
-}
-
-fn apply_window_mode(window: &winit::window::Window, scale: u32, fullscreen: bool) {
-    if fullscreen {
-        window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-    } else {
-        window.set_fullscreen(None);
-        set_window_size(window, scale);
-    }
-}
-
-/// Renders the keybindings UI into its own OS window and resizes the window
-/// to fit the active tab's content.
-fn draw_bind_window(bw: &mut AuxWindow, phase: &mut RootPhase, gilrs: Option<&Gilrs>) {
-    let RootPhase::Running {
-        keybindings,
-        capturing,
-        gamepad_bindings,
-        resolved_gamepad,
-        gamepad_capturing,
-        bind_tab,
-        ..
-    } = phase
-    else {
-        return;
-    };
-    let gilrs_available = gilrs.is_some();
-    let pad_name: Option<String> =
-        gilrs.and_then(|g| g.gamepads().next().map(|(_, p)| p.name().to_string()));
-    bw.draw(BIND_WINDOW_WIDTH, |ctx| {
-        let mut content_height: f32 = 0.0;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // CentralPanel expands to fill the window; measure a child scope
-            // (like the loader screen) so the resize below tracks content.
-            let content = ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(bind_tab, BindTab::Keyboard, "Keyboard");
-                    ui.selectable_value(bind_tab, BindTab::Controller, "Controller");
-                });
-                ui.separator();
-                let keys = [rust_gbe::KeypadKey::A, rust_gbe::KeypadKey::B, rust_gbe::KeypadKey::Start, rust_gbe::KeypadKey::Select,
-                    rust_gbe::KeypadKey::Up, rust_gbe::KeypadKey::Down, rust_gbe::KeypadKey::Left, rust_gbe::KeypadKey::Right];
-                let key_label = |k: rust_gbe::KeypadKey| match k { rust_gbe::KeypadKey::A=>"A", rust_gbe::KeypadKey::B=>"B", rust_gbe::KeypadKey::Start=>"Start", rust_gbe::KeypadKey::Select=>"Select", rust_gbe::KeypadKey::Up=>"Up", rust_gbe::KeypadKey::Down=>"Down", rust_gbe::KeypadKey::Left=>"Left", rust_gbe::KeypadKey::Right=>"Right" };
-                match *bind_tab {
-                    BindTab::Keyboard => {
-                        ui.label("Click a binding, then press a key (Esc to cancel capture). Reserved keys can't be used.");
-                        ui.add_space(4.0);
-                        egui::Grid::new("kb_bind_grid").num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
-                            for k in keys {
-                                ui.label(key_label(k));
-                                let active = matches_capturing(*capturing, k);
-                                let val = binding_value(keybindings, k);
-                                let conflict = is_reserved_key_name(&val);
-                                let label = if active { "(press key)".to_string() } else { val.clone() };
-                                let mut button = egui::Button::new(label).min_size(egui::vec2(BIND_BUTTON_WIDTH, 0.0));
-                                if conflict {
-                                    button = button.fill(egui::Color32::from_rgb(100,0,0));
-                                }
-                                if ui.add(button).clicked() {
-                                    *capturing = Some(k);
-                                    *gamepad_capturing = None; // keyboard capture replaces any gamepad capture
-                                }
-                                if conflict {
-                                    ui.colored_label(egui::Color32::RED, "Conflicts with system keybind");
-                                }
-                                ui.end_row();
-                            }
-                        });
-                        if capturing.is_some() && ui.button("Cancel Capture").clicked() { *capturing=None; }
-                        ui.add_space(4.0);
-                        egui::CollapsingHeader::new("System hotkeys (fixed)")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                egui::Grid::new("kb_hotkey_grid")
-                                    .num_columns(2)
-                                    .spacing([12.0, 4.0])
-                                    .show(ui, |ui| {
-                                        for (keys, action) in SYSTEM_HOTKEY_HELP {
-                                            ui.label(*keys);
-                                            ui.label(*action);
-                                            ui.end_row();
-                                        }
-                                    });
-                            });
-                    }
-                    BindTab::Controller => {
-                        match (&pad_name, gilrs_available) {
-                            (Some(n), _) => { ui.label(format!("Connected: {}", n)); }
-                            (None, true) => { ui.colored_label(egui::Color32::GRAY, "No controller detected"); }
-                            (None, false) => { ui.colored_label(egui::Color32::GRAY, "Controller unavailable"); }
-                        }
-                        ui.label("Click a binding, then press a controller button (Esc to cancel capture).");
-                        ui.add_space(4.0);
-                        egui::Grid::new("pad_bind_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                            for k in keys {
-                                ui.label(key_label(k));
-                                let name = crate::gamepad::keypad_key_name(k);
-                                let active = matches!(gamepad_capturing, Some(BindTarget::Gb(g)) if *g == k);
-                                let bound = gamepad_bindings.buttons.get(name).cloned().unwrap_or_else(|| "Unbound".to_string());
-                                let label = if active { "(press button)".to_string() } else { bound };
-                                if ui.add(egui::Button::new(label).min_size(egui::vec2(BIND_BUTTON_WIDTH, 0.0))).clicked() {
-                                    *gamepad_capturing = Some(BindTarget::Gb(k));
-                                    *capturing = None; // gamepad capture replaces any keyboard capture
-                                }
-                                ui.end_row();
-                            }
-                        });
-                        ui.add_space(4.0);
-                        egui::CollapsingHeader::new("System hotkeys").default_open(false).show(ui, |ui| {
-                            egui::Grid::new("pad_hotkey_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                                for action in crate::gamepad::HotkeyAction::all() {
-                                    ui.label(action.label());
-                                    let active = matches!(gamepad_capturing, Some(BindTarget::Hotkey(a)) if *a == action);
-                                    let bound = gamepad_bindings.hotkeys.get(action.name()).cloned().unwrap_or_else(|| "Unbound".to_string());
-                                    let label = if active { "(press button)".to_string() } else { bound };
-                                    if ui.add(egui::Button::new(label).min_size(egui::vec2(BIND_BUTTON_WIDTH, 0.0))).clicked() {
-                                        *gamepad_capturing = Some(BindTarget::Hotkey(action));
-                                        *capturing = None;
-                                    }
-                                    ui.end_row();
-                                }
-                            });
-                        });
-                        ui.horizontal(|ui| {
-                            if gamepad_capturing.is_some() && ui.button("Cancel Controller Capture").clicked() {
-                                *gamepad_capturing = None;
-                            }
-                            if ui.button("Reset Controller Defaults").clicked() {
-                                *gamepad_bindings = GamepadBindings::default();
-                                *resolved_gamepad = crate::gamepad::resolve(gamepad_bindings);
-                                *gamepad_capturing = None;
-                                let gb = gamepad_bindings.clone();
-                                crate::config::update_config(|c| c.gamepad = gb);
-                            }
-                        });
-                    }
-                }
-            });
-            content_height = content.response.rect.height();
-        });
-        content_height
-    });
-}
-
-const CHEAT_WINDOW_WIDTH: f32 = 420.0;
-
-/// Persist this game's cheat list and push the enabled pokes to the emulator.
-fn sync_cheats(sender: &mpsc::Sender<GBEvent>, key: &str, cheats: &[crate::cheats::Cheat]) {
-    let key_owned = key.to_string();
-    let list = cheats.to_vec();
-    crate::config::update_config(move |c| {
-        if list.is_empty() {
-            c.cheats.remove(&key_owned);
-        } else {
-            c.cheats.insert(key_owned, list);
-        }
-    });
-    let _ = sender.send(GBEvent::SetCheats(crate::cheats::enabled_pokes(cheats)));
-}
-
-/// Renders the cheat editor into its own OS window (AuxWindow shell).
-fn draw_cheat_window(cw: &mut AuxWindow, phase: &mut RootPhase) {
-    let RootPhase::Running {
-        cheats,
-        cheat_key,
-        cheat_entry,
-        cheat_entry_label,
-        cheat_error,
-        sender,
-        ..
-    } = phase
-    else {
-        return;
-    };
-    cw.draw(CHEAT_WINDOW_WIDTH, |ctx| {
-        let mut height: f32 = 0.0;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let content = ui.vertical(|ui| {
-                ui.label("GameShark codes (XXYYZZAA). Types 01 and 90–97 supported.");
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("Code:");
-                    ui.add(egui::TextEdit::singleline(cheat_entry).desired_width(90.0));
-                    ui.label("Label:");
-                    ui.add(egui::TextEdit::singleline(cheat_entry_label).desired_width(120.0));
-                    if ui.button("Add").clicked() {
-                        match crate::cheats::parse_code(cheat_entry) {
-                            Ok(_) => {
-                                cheats.push(crate::cheats::Cheat {
-                                    code: crate::cheats::normalize_code(cheat_entry),
-                                    label: cheat_entry_label.clone(),
-                                    enabled: true,
-                                });
-                                cheat_entry.clear();
-                                cheat_entry_label.clear();
-                                *cheat_error = None;
-                                sync_cheats(sender, cheat_key, cheats);
-                            }
-                            Err(e) => *cheat_error = Some(e),
-                        }
-                    }
-                });
-                if let Some(err) = *cheat_error {
-                    ui.colored_label(egui::Color32::RED, err);
-                }
-                ui.separator();
-                let mut changed = false;
-                let mut remove: Option<usize> = None;
-                for (i, cheat) in cheats.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.checkbox(&mut cheat.enabled, "").changed() {
-                            changed = true;
-                        }
-                        ui.monospace(&cheat.code);
-                        ui.label(&cheat.label);
-                        if ui.button("Delete").clicked() {
-                            remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = remove {
-                    cheats.remove(i);
-                    changed = true;
-                }
-                if changed {
-                    sync_cheats(sender, cheat_key, cheats);
-                }
-                if cheats.is_empty() {
-                    ui.colored_label(egui::Color32::GRAY, "No cheats yet.");
-                }
-            });
-            height = content.response.rect.height();
-        });
-        height
-    });
 }
 
 fn rom_path_is_supported(p: &Path) -> bool {
@@ -1347,18 +949,17 @@ impl ApplicationHandler<UserEvent> for RootApp {
             // Key-up events are lost while unfocused, so release everything
             // held (buttons, momentary turbo, rewind) instead of letting it stick.
             (
-                RootPhase::Running {
-                    sender,
+                RootPhase::Running(running),
+                WindowEvent::Focused(focused),
+            ) => {
+                let Running { sender,
                     turbo_toggle,
                     turbo_held,
                     rewinding,
                     paused,
                     pause_on_focus_loss,
                     focus_paused,
-                    ..
-                },
-                WindowEvent::Focused(focused),
-            ) => {
+                    .. } = &mut **running;
                 if !focused {
                     release_held_inputs(sender, *turbo_toggle, turbo_held, rewinding);
                     if *pause_on_focus_loss && !*paused {
@@ -1375,15 +976,19 @@ impl ApplicationHandler<UserEvent> for RootApp {
             }
             // Track modifier state so chords like Ctrl+R work.
             (
-                RootPhase::Running { modifiers, .. },
+                RootPhase::Running(running),
                 WindowEvent::ModifiersChanged(new_mods),
             ) => {
-                *modifiers = new_mods.state();
+                running.modifiers = new_mods.state();
             }
             // ESC double-press logic: require two presses within ESC_DOUBLE_PRESS_MS to exit.
             (
-                RootPhase::Running {
-                    sender,
+                RootPhase::Running(running),
+                WindowEvent::KeyboardInput {
+                    event: keyevent, ..
+                },
+            ) => {
+                let Running { sender,
                     save_slots,
                     latest_frame,
                     renderoptions,
@@ -1406,12 +1011,7 @@ impl ApplicationHandler<UserEvent> for RootApp {
                     is_color,
                     dmg_palette_preset,
                     dmg_palette_custom,
-                    ..
-                },
-                WindowEvent::KeyboardInput {
-                    event: keyevent, ..
-                },
-            ) => {
+                    .. } = &mut **running;
                 let state = keyevent.state;
                 let logical = keyevent.logical_key.clone();
                 if gamepad_capturing.is_some() && let (winit::event::ElementState::Pressed, Key::Named(NamedKey::Escape)) = (state, logical.as_ref()) {
@@ -1526,8 +1126,10 @@ impl ApplicationHandler<UserEvent> for RootApp {
                 }
             }
             (
-                RootPhase::Running {
-                    sender,
+                RootPhase::Running(running),
+                WindowEvent::RedrawRequested,
+            ) => {
+                let Running { sender,
                     texture,
                     receiver,
                     ui_receiver,
@@ -1552,10 +1154,7 @@ impl ApplicationHandler<UserEvent> for RootApp {
                     integer_scaling,
                     auto_resume,
                     pause_on_focus_loss,
-                    ..
-                },
-                WindowEvent::RedrawRequested,
-            ) => {
+                    .. } = &mut **running;
                 if !*running {
                     return;
                 }
@@ -1831,13 +1430,13 @@ impl ApplicationHandler<UserEvent> for RootApp {
                 if let Some(s) = new_scale {
                     self.scale = s;
                     crate::config::update_config(|c| c.scale = s);
-                    let fs = if let RootPhase::Running { fullscreen, .. } = &self.phase { *fullscreen } else { false };
+                    let fs = matches!(&self.phase, RootPhase::Running(running) if running.fullscreen);
                     if let Some(win) = &self.window {
                         apply_window_mode(win, s, fs);
                     }
                 }
                 if apply_fullscreen_now {
-                    let fs = if let RootPhase::Running { fullscreen, .. } = &self.phase { *fullscreen } else { false };
+                    let fs = matches!(&self.phase, RootPhase::Running(running) if running.fullscreen);
                     if let Some(win) = &self.window {
                         apply_window_mode(win, self.scale, fs);
                     }
@@ -1857,7 +1456,7 @@ impl ApplicationHandler<UserEvent> for RootApp {
             }
             // Drag-and-drop a ROM onto the running emulator: tear down and load the new one.
             (
-                RootPhase::Running { .. },
+                RootPhase::Running(_),
                 WindowEvent::DroppedFile(path),
             ) => {
                 if rom_path_is_supported(&path) && path.is_file() {
@@ -1880,12 +1479,13 @@ impl ApplicationHandler<UserEvent> for RootApp {
         crate::config::flush_pending_config(false);
         // gilrs has no wakeup hook, so poll it on a timer: often while a pad
         // is connected and a game is running, rarely otherwise (hotplug).
-        let gamepad_live = matches!(self.phase, RootPhase::Running { .. })
+        let gamepad_live = matches!(self.phase, RootPhase::Running(_))
             && self.gilrs.as_ref().is_some_and(|g| g.gamepads().next().is_some());
         let poll = Duration::from_millis(if gamepad_live { 4 } else { 250 });
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + poll));
-        if let RootPhase::Running {
-            receiver,
+        if let RootPhase::Running(running) = &mut self.phase
+        {
+            let Running { receiver,
             ui_receiver,
             save_slots,
             latest_frame,
@@ -1897,9 +1497,7 @@ impl ApplicationHandler<UserEvent> for RootApp {
             dmg_palette_custom,
             palette_scratch,
             toasts,
-            ..
-        } = &mut self.phase
-        {
+            .. } = &mut **running;
             if !*running {
                 return;
             }
@@ -1937,624 +1535,8 @@ impl ApplicationHandler<UserEvent> for RootApp {
     }
 }
 
-fn request_save_state(
-    sender: &mpsc::Sender<GBEvent>,
-    save_slots: &mut SaveSlotCache,
-    slot: u8,
-    latest_frame: &Option<Arc<Vec<u8>>>,
-) {
-    save_slots.mark_saving(slot);
-    let thumbnail = latest_frame.as_ref().map(Arc::clone);
-    if sender.send(GBEvent::SaveState { slot, thumbnail }).is_err() {
-        save_slots.mark_failed(slot);
-    }
-}
-
-/// Side effects of a system action that can't run while `self.phase` is
-/// mutably borrowed; the caller applies them after the borrow ends.
-#[derive(Default)]
-struct SysOutcome {
-    request_reset: bool,
-    apply_fullscreen: bool,
-    /// Keyboard only: the caller has the ROM path and palette it needs.
-    screenshot: bool,
-}
-
-/// Borrowed `Running`-phase fields needed to execute a `SystemAction`.
-/// Shared by the keyboard path (window_event) and the gamepad path
-/// (poll_gamepad) so dispatch logic exists exactly once.
-struct SysCtx<'a> {
-    sender: &'a mpsc::Sender<GBEvent>,
-    save_slots: &'a mut SaveSlotCache,
-    latest_frame: &'a Option<Arc<Vec<u8>>>,
-    renderoptions: &'a mut RenderOptions,
-    turbo_toggle: &'a mut bool,
-    turbo_held: &'a mut bool,
-    volume: &'a mut u8,
-    pre_mute_volume: &'a mut Option<u8>,
-    paused: &'a mut bool,
-    fullscreen: &'a mut bool,
-    fps_overlay: &'a mut bool,
-    rewinding: &'a mut bool,
-    toasts: &'a mut ToastQueue,
-}
-
-fn handle_system_action(action: crate::input::SystemAction, ctx: &mut SysCtx) -> SysOutcome {
-    use crate::input::SystemAction;
-    let mut outcome = SysOutcome::default();
-    match action {
-        SystemAction::SaveState(s) => {
-            request_save_state(ctx.sender, ctx.save_slots, s, ctx.latest_frame);
-        }
-        SystemAction::LoadState(s) => {
-            let _ = ctx.sender.send(GBEvent::LoadState(s));
-        }
-        SystemAction::TurboHold(press) => {
-            if press {
-                if !*ctx.turbo_toggle && !*ctx.turbo_held {
-                    let _ = ctx.sender.send(GBEvent::SpeedUp);
-                }
-                *ctx.turbo_held = true;
-            } else {
-                *ctx.turbo_held = false;
-                if !*ctx.turbo_toggle {
-                    let _ = ctx.sender.send(GBEvent::SpeedDown);
-                }
-            }
-        }
-        SystemAction::TurboToggle => {
-            *ctx.turbo_toggle = !*ctx.turbo_toggle;
-            if *ctx.turbo_toggle {
-                if !*ctx.turbo_held {
-                    let _ = ctx.sender.send(GBEvent::SpeedUp);
-                }
-            } else if !*ctx.turbo_held {
-                let _ = ctx.sender.send(GBEvent::SpeedDown);
-            }
-            ctx.toasts.push(
-                if *ctx.turbo_toggle { "Turbo on" } else { "Turbo off" },
-                ToastKind::Info,
-            );
-        }
-        SystemAction::ToggleInterpolation => {
-            ctx.renderoptions.linear_interpolation = !ctx.renderoptions.linear_interpolation;
-        }
-        SystemAction::TogglePause => {
-            *ctx.paused = !*ctx.paused;
-            let _ = ctx.sender.send(GBEvent::SetPaused(*ctx.paused));
-        }
-        SystemAction::Reset => {
-            outcome.request_reset = true;
-        }
-        SystemAction::ToggleFullscreen => {
-            *ctx.fullscreen = !*ctx.fullscreen;
-            let fs = *ctx.fullscreen;
-            crate::config::update_config(|c| c.fullscreen = fs);
-            outcome.apply_fullscreen = true;
-        }
-        SystemAction::ToggleMute => {
-            if let Some(restored) = ctx.pre_mute_volume.take() {
-                *ctx.volume = restored;
-            } else {
-                *ctx.pre_mute_volume = Some(*ctx.volume);
-                *ctx.volume = 0;
-            }
-            let _ = ctx.sender.send(GBEvent::UpdateVolume(perceptual_to_linear(*ctx.volume)));
-            let v = *ctx.volume;
-            crate::config::update_config(|c| c.volume = v);
-            ctx.toasts.push(
-                if *ctx.volume == 0 { "Muted" } else { "Volume restored" },
-                ToastKind::Info,
-            );
-        }
-        SystemAction::ToggleFpsOverlay => {
-            *ctx.fps_overlay = !*ctx.fps_overlay;
-            let on = *ctx.fps_overlay;
-            crate::config::update_config(|c| c.fps_overlay = on);
-        }
-        SystemAction::RewindHold(press) => {
-            *ctx.rewinding = press;
-            let _ = ctx.sender.send(GBEvent::SetRewinding(press));
-        }
-        SystemAction::RewindStep => {
-            let _ = ctx.sender.send(GBEvent::RewindStep);
-        }
-        SystemAction::Screenshot => {
-            outcome.screenshot = true;
-        }
-    }
-    outcome
-}
-
-fn drain_gui_events(
-    receiver: &Receiver<GuiEvent>,
-    save_slots: &mut SaveSlotCache,
-    toasts: &mut ToastQueue,
-    rumble: &mut Option<bool>,
-) {
-    loop {
-        match receiver.try_recv() {
-            Ok(GuiEvent::SaveStateSaved { slot, preview }) => {
-                save_slots.mark_saved(slot, preview);
-                toasts.push(format!("State saved to slot {}", slot), ToastKind::Success);
-            }
-            Ok(GuiEvent::SaveStateFailed { slot }) => {
-                save_slots.mark_failed(slot);
-                toasts.push(format!("Save to slot {} failed", slot), ToastKind::Error);
-            }
-            Ok(GuiEvent::LoadStateResult { slot, error: None }) => {
-                toasts.push(format!("State {} loaded", slot), ToastKind::Success);
-            }
-            Ok(GuiEvent::LoadStateResult { slot, error: Some(e) }) => {
-                toasts.push(format!("Couldn't load state {slot}: {e}"), ToastKind::Error);
-            }
-            Ok(GuiEvent::Rumble(on)) => *rumble = Some(on),
-            Ok(GuiEvent::UndoLoadResult { ok: true }) => {
-                toasts.push("Load undone", ToastKind::Success);
-            }
-            Ok(GuiEvent::UndoLoadResult { ok: false }) => {
-                toasts.push("Nothing to undo", ToastKind::Info);
-            }
-            Ok(GuiEvent::BatterySaveFailed) => {
-                toasts.push(
-                    "Battery save failed — check disk space and permissions",
-                    ToastKind::Error,
-                );
-            }
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => break,
-        }
-    }
-}
-
-fn show_states_menu(
-    ui: &mut egui::Ui,
-    sender: &mpsc::Sender<GBEvent>,
-    save_slots: &mut SaveSlotCache,
-    latest_frame: &Option<Arc<Vec<u8>>>,
-) {
-    ui.set_min_width(320.0);
-
-    let mut load_requested = None;
-    let mut save_requested = None;
-
-    for slot in &mut save_slots.slots {
-        let load_enabled = slot.preview.is_some() && !slot.saving;
-        let status = slot_status_text(slot);
-        let color = slot_status_color(slot);
-        let slot_number = slot.slot;
-
-        let row = ui.horizontal(|ui| {
-            let slot_response = ui.add_sized(
-                [58.0, 22.0],
-                egui::Label::new(egui::RichText::new(format!("Slot {}", slot_number)).strong()),
-            );
-            let status_response = ui.add_sized(
-                [138.0, 22.0],
-                egui::Label::new(egui::RichText::new(status).color(color)),
-            );
-
-            let load_response = ui.add_enabled(
-                load_enabled,
-                egui::Button::new("Load").min_size(egui::vec2(52.0, 22.0)),
-            );
-            let save_response = ui.add(egui::Button::new("Save").min_size(egui::vec2(52.0, 22.0)));
-            let hovered = slot_response.hovered()
-                || status_response.hovered()
-                || load_response.hovered()
-                || save_response.hovered();
-            let row_rect = slot_response
-                .rect
-                .union(status_response.rect)
-                .union(load_response.rect)
-                .union(save_response.rect);
-
-            (
-                load_response.clicked(),
-                save_response.clicked(),
-                hovered,
-                row_rect,
-            )
-        });
-
-        let (load_clicked, save_clicked, row_hovered, row_rect) = row.inner;
-        if slot.preview.is_some() && (row_hovered || row.response.hovered()) {
-            show_slot_preview_area(ui, slot, row_rect);
-        }
-
-        if load_clicked {
-            load_requested = Some(slot_number);
-        }
-        if save_clicked {
-            save_requested = Some(slot_number);
-        }
-    }
-
-    if let Some(slot) = load_requested {
-        let _ = sender.send(GBEvent::LoadState(slot));
-        ui.close();
-    }
-    if let Some(slot) = save_requested {
-        request_save_state(sender, save_slots, slot, latest_frame);
-        ui.close();
-    }
-}
-
-fn slot_status_text(slot: &SaveSlotUi) -> String {
-    if slot.saving {
-        "Saving...".to_string()
-    } else if slot.save_failed {
-        "Save failed".to_string()
-    } else if let Some(preview) = &slot.preview {
-        format_short_timestamp(preview.saved_at_unix_secs)
-    } else {
-        "Empty".to_string()
-    }
-}
-
-fn slot_status_color(slot: &SaveSlotUi) -> egui::Color32 {
-    if slot.save_failed {
-        egui::Color32::from_rgb(210, 72, 64)
-    } else if slot.preview.is_some() {
-        egui::Color32::from_rgb(190, 220, 190)
-    } else {
-        egui::Color32::GRAY
-    }
-}
-
-fn show_slot_preview_area(ui: &mut egui::Ui, slot: &mut SaveSlotUi, row_rect: egui::Rect) {
-    let preview_pos = save_slot_preview_position(ui.ctx(), row_rect);
-    egui::Area::new(egui::Id::new(("save-slot-preview", slot.slot)))
-        .order(egui::Order::Tooltip)
-        .fixed_pos(preview_pos)
-        .show(ui.ctx(), |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                show_slot_preview_contents(ui, slot);
-            });
-        });
-}
-
-fn save_slot_preview_position(ctx: &egui::Context, row_rect: egui::Rect) -> egui::Pos2 {
-    const PREVIEW_WIDTH: f32 = 260.0;
-    const PREVIEW_HEIGHT: f32 = 270.0;
-    const GAP: f32 = 10.0;
-
-    let content_rect = ctx.content_rect();
-    let fits_left = row_rect.left() - GAP - PREVIEW_WIDTH >= content_rect.left();
-    let fits_right = row_rect.right() + GAP + PREVIEW_WIDTH <= content_rect.right();
-    let clamp_x = |x: f32| {
-        x.clamp(
-            content_rect.left(),
-            (content_rect.right() - PREVIEW_WIDTH).max(content_rect.left()),
-        )
-    };
-    let clamp_y = |y: f32| {
-        y.clamp(
-            content_rect.top(),
-            (content_rect.bottom() - PREVIEW_HEIGHT).max(content_rect.top()),
-        )
-    };
-
-    if fits_left {
-        egui::pos2(
-            row_rect.left() - GAP - PREVIEW_WIDTH,
-            clamp_y(row_rect.top()),
-        )
-    } else if fits_right {
-        egui::pos2(row_rect.right() + GAP, clamp_y(row_rect.top()))
-    } else {
-        let below = row_rect.bottom() + GAP + PREVIEW_HEIGHT <= content_rect.bottom();
-        let y = if below {
-            row_rect.bottom() + GAP
-        } else {
-            row_rect.top() - GAP - PREVIEW_HEIGHT
-        };
-        egui::pos2(clamp_x(row_rect.left()), clamp_y(y))
-    }
-}
-
-fn show_slot_preview_contents(ui: &mut egui::Ui, slot: &mut SaveSlotUi) {
-    if let Some(preview) = &slot.preview {
-        ui.label(format!("Slot {}", slot.slot));
-        ui.label(format_full_timestamp(preview.saved_at_unix_secs));
-
-        if let Some(thumbnail_rgb) = preview.thumbnail_rgb.as_deref() {
-            if slot.texture.is_none() {
-                let image = egui::ColorImage::from_rgb(
-                    [
-                        preview.thumbnail_width as usize,
-                        preview.thumbnail_height as usize,
-                    ],
-                    thumbnail_rgb,
-                );
-                slot.texture = Some(ui.ctx().load_texture(
-                    format!("save-slot-{}-thumbnail", slot.slot),
-                    image,
-                    egui::TextureOptions::NEAREST,
-                ));
-            }
-
-            if let Some(texture) = &slot.texture {
-                ui.add(
-                    egui::Image::from_texture(texture)
-                        .max_width(240.0)
-                        .max_height(216.0),
-                );
-            }
-        } else {
-            ui.label("No preview available");
-        }
-    }
-}
-
-fn format_short_timestamp(saved_at_unix_secs: u64) -> String {
-    let datetime = local_datetime(saved_at_unix_secs);
-    format!(
-        "{} {} {:02}:{:02} {}",
-        month_abbrev(datetime.month()),
-        datetime.day(),
-        hour12(datetime.hour()),
-        datetime.minute(),
-        period(datetime.hour())
-    )
-}
-
-fn format_full_timestamp(saved_at_unix_secs: u64) -> String {
-    let datetime = local_datetime(saved_at_unix_secs);
-    format!(
-        "{} {}, {} {:02}:{:02}:{:02} {}",
-        month_abbrev(datetime.month()),
-        datetime.day(),
-        datetime.year(),
-        hour12(datetime.hour()),
-        datetime.minute(),
-        datetime.second(),
-        period(datetime.hour())
-    )
-}
-
-fn local_datetime(unix_secs: u64) -> OffsetDateTime {
-    let unix_secs = i64::try_from(unix_secs).unwrap_or(i64::MAX);
-    let datetime =
-        OffsetDateTime::from_unix_timestamp(unix_secs).unwrap_or(OffsetDateTime::UNIX_EPOCH);
-    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
-    datetime.to_offset(offset)
-}
-
-fn month_abbrev(month: Month) -> &'static str {
-    match month {
-        Month::January => "Jan",
-        Month::February => "Feb",
-        Month::March => "Mar",
-        Month::April => "Apr",
-        Month::May => "May",
-        Month::June => "Jun",
-        Month::July => "Jul",
-        Month::August => "Aug",
-        Month::September => "Sep",
-        Month::October => "Oct",
-        Month::November => "Nov",
-        Month::December => "Dec",
-    }
-}
-
-fn hour12(hour: u8) -> u8 {
-    match hour % 12 {
-        0 => 12,
-        hour => hour,
-    }
-}
-
-fn period(hour: u8) -> &'static str {
-    if hour < 12 {
-        "AM"
-    } else {
-        "PM"
-    }
-}
-
-fn upload_screen(texture: &mut glium::texture::texture2d::Texture2d, datavec: &[u8]) {
-    let rawimage2d = glium::texture::RawImage2d {
-        data: std::borrow::Cow::Borrowed(datavec),
-        width: rust_gbe::SCREEN_W as u32,
-        height: rust_gbe::SCREEN_H as u32,
-        format: glium::texture::ClientFormat::U8U8U8,
-    };
-    texture.write(
-        glium::Rect {
-            left: 0,
-            bottom: 0,
-            width: rust_gbe::SCREEN_W as u32,
-            height: rust_gbe::SCREEN_H as u32,
-        },
-        rawimage2d,
-    );
-}
-
-/// If `apply` is true, remap the four DMG grayscale shades in `datavec` via `pal` using `scratch`
-/// as a reusable buffer; otherwise upload the bytes directly.
-fn upload_frame_with_palette(
-    texture: &mut glium::texture::texture2d::Texture2d,
-    datavec: &[u8],
-    apply: bool,
-    pal: &DmgPalette,
-    scratch: &mut Vec<u8>,
-) {
-    if apply {
-        scratch.clear();
-        scratch.extend_from_slice(datavec);
-        apply_dmg_palette(scratch, pal);
-        upload_screen(texture, scratch);
-    } else {
-        upload_screen(texture, datavec);
-    }
-}
-
-/// Write the current frame as `<rom>-<date>-<time>.png` next to the ROM.
-/// `palette` maps DMG shades the same way the display does.
-fn save_screenshot(
-    rom_path: &std::path::Path,
-    frame: &[u8],
-    palette: Option<&DmgPalette>,
-) -> Result<PathBuf, String> {
-    let mut rgb = frame.to_vec();
-    if let Some(p) = palette {
-        apply_dmg_palette(&mut rgb, p);
-    }
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let t = local_datetime(secs);
-    let stem = rom_path.file_stem().unwrap_or_default().to_string_lossy();
-    let path = rom_path.with_file_name(format!(
-        "{stem}-{:04}{:02}{:02}-{:02}{:02}{:02}.png",
-        t.year(),
-        t.month() as u8,
-        t.day(),
-        t.hour(),
-        t.minute(),
-        t.second()
-    ));
-    let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
-    let mut encoder = png::Encoder::new(
-        std::io::BufWriter::new(file),
-        rust_gbe::SCREEN_W as u32,
-        rust_gbe::SCREEN_H as u32,
-    );
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder
-        .write_header()
-        .and_then(|mut w| w.write_image_data(&rgb))
-        .map_err(|e| e.to_string())?;
-    Ok(path)
-}
-
-/// Release everything an input source may be holding: all Game Boy buttons,
-/// momentary turbo and rewind. Used when key-up / button-up events can't
-/// arrive (window lost focus, gamepad unplugged).
-fn release_held_inputs(
-    sender: &mpsc::Sender<GBEvent>,
-    turbo_toggle: bool,
-    turbo_held: &mut bool,
-    rewinding: &mut bool,
-) {
-    use rust_gbe::KeypadKey::*;
-    for k in [A, B, Start, Select, Up, Down, Left, Right] {
-        let _ = sender.send(GBEvent::KeyUp(k));
-    }
-    if *turbo_held {
-        *turbo_held = false;
-        if !turbo_toggle {
-            let _ = sender.send(GBEvent::SpeedDown);
-        }
-    }
-    if *rewinding {
-        *rewinding = false;
-        let _ = sender.send(GBEvent::SetRewinding(false));
-    }
-}
-
 fn warn(message: &str) {
     crate::log::warn(message);
-}
-
-fn position_on_a_monitor(window: &winit::window::Window, x: i32, y: i32) -> bool {
-    window.available_monitors().any(|m| {
-        let (pos, size) = (m.position(), m.size());
-        x >= pos.x
-            && y >= pos.y
-            && x < pos.x + size.width as i32
-            && y < pos.y + size.height as i32
-    })
-}
-
-fn set_window_size(window: &winit::window::Window, scale: u32) {
-    // Add extra height for the menu bar (approximately 30 pixels at 1x scale)
-    let menu_bar_height = 30;
-    let _ = window.request_inner_size(winit::dpi::LogicalSize::<u32>::from((
-        rust_gbe::SCREEN_W as u32 * scale,
-        rust_gbe::SCREEN_H as u32 * scale + menu_bar_height,
-    )));
-}
-
-// Convert 0-100 slider value to linear gain (0.0-1.0) using a perceptual (log-like) curve.
-// 50 -> ~0.5 perceived loudness; we map percentage p to gain = (p/100)^(gamma) with gamma ~ 1.5
-// This softens high-end changes and gives finer control at low volumes.
-fn perceptual_to_linear(v: u8) -> f32 {
-    let p = (v as f32) / 100.0;
-    if p <= 0.0 {
-        0.0
-    } else {
-        p.powf(1.5)
-    } // simple gamma curve
-}
-
-// Dynamic mapping using current keybindings
-fn dynamic_winit_to_keypad(
-    key: winit::keyboard::Key<&str>,
-    bindings: &KeyBindings,
-) -> Option<rust_gbe::KeypadKey> {
-    // Single lookup path: render the key to its string form and compare against
-    // each binding. This lets a user bind A to "ArrowUp" or Up to "X" without
-    // duplicating per-NamedKey checks.
-    let key_str = key_to_string(&key);
-    let key_upper = key_str.to_uppercase();
-    if key_upper == bindings.a.to_uppercase() { return Some(rust_gbe::KeypadKey::A); }
-    if key_upper == bindings.b.to_uppercase() { return Some(rust_gbe::KeypadKey::B); }
-    if key_upper == bindings.start.to_uppercase() { return Some(rust_gbe::KeypadKey::Start); }
-    if key_upper == bindings.select.to_uppercase() { return Some(rust_gbe::KeypadKey::Select); }
-    if key_upper == bindings.up.to_uppercase() { return Some(rust_gbe::KeypadKey::Up); }
-    if key_upper == bindings.down.to_uppercase() { return Some(rust_gbe::KeypadKey::Down); }
-    if key_upper == bindings.left.to_uppercase() { return Some(rust_gbe::KeypadKey::Left); }
-    if key_upper == bindings.right.to_uppercase() { return Some(rust_gbe::KeypadKey::Right); }
-    None
-}
-
-fn key_to_string(key: &winit::keyboard::Key<&str>) -> String {
-    use winit::keyboard::{Key, NamedKey};
-    match key {
-        Key::Character(c) => c.to_uppercase(),
-        Key::Named(NamedKey::ArrowUp) => "ArrowUp".into(),
-        Key::Named(NamedKey::ArrowDown) => "ArrowDown".into(),
-        Key::Named(NamedKey::ArrowLeft) => "ArrowLeft".into(),
-        Key::Named(NamedKey::ArrowRight) => "ArrowRight".into(),
-        Key::Named(NamedKey::Enter) => "Enter".into(),
-        Key::Named(NamedKey::Space) => "Space".into(),
-        Key::Named(other) => format!("{other:?}"), // fallback to debug name
-        _ => "Unknown".into(),
-    }
-}
-
-/// Fit the GB frame into `avail_w` x `avail_h` preserving the 160:144 aspect.
-/// Returns (left, bottom, width, height) of the centered destination rect.
-/// With `integer_scaling`, the scale is floored to a whole multiple; below
-/// native size it falls back to a fractional aspect-preserving shrink.
-fn fit_rect(avail_w: u32, avail_h: u32, integer_scaling: bool) -> (u32, u32, u32, u32) {
-    let (nw, nh) = (rust_gbe::SCREEN_W as f64, rust_gbe::SCREEN_H as f64);
-    let mut scale = (avail_w as f64 / nw).min(avail_h as f64 / nh);
-    if integer_scaling && scale >= 1.0 {
-        scale = scale.floor();
-    }
-    let w = (nw * scale) as u32;
-    let h = (nh * scale) as u32;
-    ((avail_w.saturating_sub(w)) / 2, (avail_h.saturating_sub(h)) / 2, w, h)
-}
-
-fn matches_capturing(capturing: Option<rust_gbe::KeypadKey>, k: rust_gbe::KeypadKey) -> bool {
-    use rust_gbe::KeypadKey::*;
-    match (capturing, k) {
-        (Some(A), A)
-        | (Some(B), B)
-        | (Some(Start), Start)
-        | (Some(Select), Select)
-        | (Some(Up), Up)
-        | (Some(Down), Down)
-        | (Some(Left), Left)
-        | (Some(Right), Right) => true,
-        _ => false,
-    }
 }
 
 #[cfg(test)]
