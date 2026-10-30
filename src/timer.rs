@@ -1,3 +1,6 @@
+/// See `Timer::reloaded_window`.
+const RELOADED_WINDOW: u8 = 4;
+
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Timer {
     internal_counter: u16,
@@ -5,6 +8,9 @@ pub struct Timer {
     tma: u8,
     tac: u8,
     reload_pending: u8,
+    // T-cycles left in the M-cycle where TMA was just loaded into TIMA:
+    // TIMA writes are ignored then, and TMA writes go to TIMA as well.
+    reloaded_window: u8,
     prev_tima_input: bool,
     pub interrupt: u8,
 }
@@ -17,6 +23,7 @@ impl Timer {
             tma: 0,
             tac: 0,
             reload_pending: 0,
+            reloaded_window: 0,
             prev_tima_input: false,
             interrupt: 0,
         }
@@ -61,13 +68,19 @@ impl Timer {
             }
             0xFF05 => {
                 // Pan Docs: a TIMA write during the reload window cancels the
-                // reload — no TMA load, no IRQ. The written value takes effect
-                // immediately. Outside the window it is an ordinary write.
-                self.tima = v;
+                // reload — no TMA load, no IRQ. In the M-cycle where TMA is
+                // loaded the write is ignored. Otherwise an ordinary write.
+                if self.reloaded_window == 0 {
+                    self.tima = v;
+                }
                 self.reload_pending = 0;
             }
             0xFF06 => {
                 self.tma = v;
+                // Written while TMA is being loaded: TIMA gets the new value.
+                if self.reloaded_window > 0 {
+                    self.tima = v;
+                }
             }
             0xFF07 => {
                 // Changing TAC can also cause a falling edge on the monitored bit.
@@ -92,6 +105,17 @@ impl Timer {
         }
     }
 
+    /// The 16-bit system counter (DIV is its upper byte).
+    pub fn internal_counter(&self) -> u16 {
+        self.internal_counter
+    }
+
+    /// Set the divider's full 16-bit counter (post-boot state).
+    pub fn set_internal_counter(&mut self, value: u16) {
+        self.internal_counter = value;
+        self.prev_tima_input = false;
+    }
+
     fn selector_bit(tac: u8) -> u16 {
         match tac & 0x03 {
             0 => 9,
@@ -105,13 +129,78 @@ impl Timer {
     /// Advance the timer by `ticks` t-cycles. Sets `self.interrupt` if the
     /// timer interrupt fires; the MMU will OR this into `intf` after the call.
     pub fn do_cycle(&mut self, ticks: u32) {
+        if self.advance_bulk(ticks) {
+            return;
+        }
+        self.advance_ticks(ticks);
+    }
+
+    /// T-cycles until the edge that overflows TIMA (the timer's only
+    /// interrupt source). `u32::MAX` while stopped; 0 while a reload is in
+    /// flight or the input latch is out of step with the counter.
+    pub fn ticks_until_event(&self) -> u32 {
+        if self.reload_pending != 0 {
+            return 0;
+        }
+        let enabled = self.tac & 0x04 != 0;
+        let bit = Self::selector_bit(self.tac);
+        let counter = self.internal_counter as u32;
+        if self.prev_tima_input != (enabled && (counter >> bit) & 1 == 1) {
+            return 0;
+        }
+        if !enabled {
+            return u32::MAX;
+        }
+        // Falling edges happen when the counter reaches a multiple of `period`.
+        let period = 1u32 << (bit + 1);
+        let to_first_edge = period - counter % period;
+        to_first_edge + (0xFF - self.tima as u32) * period
+    }
+
+    /// Advance `ticks` T-cycles in O(1) when nothing tick-exact can happen in
+    /// the window: no reload pending, no TIMA overflow, and the latched input
+    /// agrees with the counter (a TAC/DIV write can leave them out of step,
+    /// which the per-tick path turns into a glitch increment). Returns false
+    /// without changing anything when the per-tick path is needed.
+    fn advance_bulk(&mut self, ticks: u32) -> bool {
+        if self.reload_pending != 0 {
+            return false;
+        }
+        let enabled = self.tac & 0x04 != 0;
+        let bit = Self::selector_bit(self.tac);
+        let counter = self.internal_counter as u32;
+        if self.prev_tima_input != (enabled && (counter >> bit) & 1 == 1) {
+            return false;
+        }
+        let end = counter + ticks;
+        self.reloaded_window = self.reloaded_window.saturating_sub(ticks.min(0xFF) as u8);
+        if enabled {
+            // Falling edges of the selected bit = multiples of 2^(bit+1) crossed.
+            // 0x10000 is such a multiple, so u16 wraparound needs no care.
+            let edges = (end >> (bit + 1)) - (counter >> (bit + 1));
+            let tima = self.tima as u32 + edges;
+            if tima > 0xFF {
+                return false;
+            }
+            self.tima = tima as u8;
+            self.prev_tima_input = (end >> bit) & 1 == 1;
+        }
+        self.internal_counter = end as u16;
+        true
+    }
+
+    fn advance_ticks(&mut self, ticks: u32) {
         for _ in 0..ticks {
             // Process reload window first (reload_pending counts down in t-cycles).
+            if self.reloaded_window > 0 {
+                self.reloaded_window -= 1;
+            }
             if self.reload_pending > 0 {
                 self.reload_pending -= 1;
                 if self.reload_pending == 0 {
                     self.tima = self.tma;
                     self.interrupt |= 0x04;
+                    self.reloaded_window = RELOADED_WINDOW;
                 }
             }
 

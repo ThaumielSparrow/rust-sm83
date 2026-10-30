@@ -32,6 +32,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libgtk-3-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libwayland-dev libxkbcommon-dev mesa-common-dev
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Cargo cache
         uses: actions/cache@v4
@@ -46,5 +48,8 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
-      - name: Run tests (library)
-        run: cargo test --lib --verbose
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests (library and frontend)
+        run: cargo test --all-targets --verbose

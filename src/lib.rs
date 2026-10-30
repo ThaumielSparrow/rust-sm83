@@ -1,6 +1,10 @@
+// CPU, MMU, GPU, MBC, HDMA... are the hardware's own names.
+#![allow(clippy::upper_case_acronyms)]
+
 pub use crate::gpu::{SCREEN_H, SCREEN_W};
 pub use crate::keypad::KeypadKey;
 pub use crate::apu::AudioPlayer;
+pub use crate::mbc::CHECKSUM_INVALID;
 
 pub mod device;
 
@@ -14,5 +18,8 @@ mod register;
 mod serial;
 mod apu;
 mod timer;
+
+#[cfg(test)]
+mod test_roms;
 
 pub type StrResult<T> = Result<T, &'static str>;

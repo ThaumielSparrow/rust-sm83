@@ -9,6 +9,8 @@ mod mbc1;
 mod mbc2;
 mod mbc3;
 mod mbc5;
+mod huc1;
+mod mbc7;
 
 pub trait MBC: Send {
     fn readrom(&self, a: u16) -> u8;
@@ -26,6 +28,19 @@ pub trait MBC: Send {
     fn take_rom(&mut self) -> Vec<u8>;
     /// Move ROM bytes back in after a rom-less restore.
     fn set_rom(&mut self, rom: Vec<u8>);
+
+    /// Advance cartridge hardware clocked by the system (the MBC3 RTC) by
+    /// `ticks` real-time T-cycles (4.194304 MHz).
+    fn tick(&mut self, _ticks: u32) {}
+
+    /// MBC7 accelerometer input from the host, in g per axis (x right,
+    /// y down when tilting the top away).
+    fn set_tilt(&mut self, _x: f32, _y: f32) {}
+
+    /// MBC5 rumble carts: whether the motor is currently driven.
+    fn rumble(&self) -> bool {
+        false
+    }
 
     fn get_save_path(&self) -> Option<String> {
         None // Default implementation for non-file-backed MBCs
@@ -60,107 +75,64 @@ pub enum MbcState {
     Mbc2(mbc2::MBC2),
     Mbc3(mbc3::MBC3),
     Mbc5(mbc5::MBC5),
+    HuC1(huc1::HuC1),
+    Mbc7(mbc7::MBC7),
+}
+
+/// Forward a call to whichever mapper the cartridge has.
+macro_rules! dispatch {
+    ($self:ident, $m:ident => $call:expr) => {
+        match $self {
+            MbcState::Mbc0($m) => $call,
+            MbcState::Mbc1($m) => $call,
+            MbcState::Mbc2($m) => $call,
+            MbcState::Mbc3($m) => $call,
+            MbcState::Mbc5($m) => $call,
+            MbcState::HuC1($m) => $call,
+            MbcState::Mbc7($m) => $call,
+        }
+    };
 }
 
 impl MBC for MbcState {
     fn readrom(&self, a: u16) -> u8 {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.readrom(a),
-            MbcState::Mbc1(mbc) => mbc.readrom(a),
-            MbcState::Mbc2(mbc) => mbc.readrom(a),
-            MbcState::Mbc3(mbc) => mbc.readrom(a),
-            MbcState::Mbc5(mbc) => mbc.readrom(a),
-        }
+        dispatch!(self, m => m.readrom(a))
     }
-
     fn readram(&self, a: u16) -> u8 {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.readram(a),
-            MbcState::Mbc1(mbc) => mbc.readram(a),
-            MbcState::Mbc2(mbc) => mbc.readram(a),
-            MbcState::Mbc3(mbc) => mbc.readram(a),
-            MbcState::Mbc5(mbc) => mbc.readram(a),
-        }
+        dispatch!(self, m => m.readram(a))
     }
-
     fn writerom(&mut self, a: u16, v: u8) {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.writerom(a, v),
-            MbcState::Mbc1(mbc) => mbc.writerom(a, v),
-            MbcState::Mbc2(mbc) => mbc.writerom(a, v),
-            MbcState::Mbc3(mbc) => mbc.writerom(a, v),
-            MbcState::Mbc5(mbc) => mbc.writerom(a, v),
-        }
+        dispatch!(self, m => m.writerom(a, v))
     }
-
     fn writeram(&mut self, a: u16, v: u8) {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.writeram(a, v),
-            MbcState::Mbc1(mbc) => mbc.writeram(a, v),
-            MbcState::Mbc2(mbc) => mbc.writeram(a, v),
-            MbcState::Mbc3(mbc) => mbc.writeram(a, v),
-            MbcState::Mbc5(mbc) => mbc.writeram(a, v),
-        }
+        dispatch!(self, m => m.writeram(a, v))
     }
-
     fn check_and_reset_ram_updated(&mut self) -> bool {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.check_and_reset_ram_updated(),
-            MbcState::Mbc1(mbc) => mbc.check_and_reset_ram_updated(),
-            MbcState::Mbc2(mbc) => mbc.check_and_reset_ram_updated(),
-            MbcState::Mbc3(mbc) => mbc.check_and_reset_ram_updated(),
-            MbcState::Mbc5(mbc) => mbc.check_and_reset_ram_updated(),
-        }
+        dispatch!(self, m => m.check_and_reset_ram_updated())
     }
-
     fn is_battery_backed(&self) -> bool {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.is_battery_backed(),
-            MbcState::Mbc1(mbc) => mbc.is_battery_backed(),
-            MbcState::Mbc2(mbc) => mbc.is_battery_backed(),
-            MbcState::Mbc3(mbc) => mbc.is_battery_backed(),
-            MbcState::Mbc5(mbc) => mbc.is_battery_backed(),
-        }
+        dispatch!(self, m => m.is_battery_backed())
     }
-
     fn loadram(&mut self, ramdata: &[u8]) -> StrResult<()> {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.loadram(ramdata),
-            MbcState::Mbc1(mbc) => mbc.loadram(ramdata),
-            MbcState::Mbc2(mbc) => mbc.loadram(ramdata),
-            MbcState::Mbc3(mbc) => mbc.loadram(ramdata),
-            MbcState::Mbc5(mbc) => mbc.loadram(ramdata),
-        }
+        dispatch!(self, m => m.loadram(ramdata))
     }
-
     fn dumpram(&self) -> Vec<u8> {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.dumpram(),
-            MbcState::Mbc1(mbc) => mbc.dumpram(),
-            MbcState::Mbc2(mbc) => mbc.dumpram(),
-            MbcState::Mbc3(mbc) => mbc.dumpram(),
-            MbcState::Mbc5(mbc) => mbc.dumpram(),
-        }
+        dispatch!(self, m => m.dumpram())
     }
-
     fn take_rom(&mut self) -> Vec<u8> {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.take_rom(),
-            MbcState::Mbc1(mbc) => mbc.take_rom(),
-            MbcState::Mbc2(mbc) => mbc.take_rom(),
-            MbcState::Mbc3(mbc) => mbc.take_rom(),
-            MbcState::Mbc5(mbc) => mbc.take_rom(),
-        }
+        dispatch!(self, m => m.take_rom())
     }
-
     fn set_rom(&mut self, rom: Vec<u8>) {
-        match self {
-            MbcState::Mbc0(mbc) => mbc.set_rom(rom),
-            MbcState::Mbc1(mbc) => mbc.set_rom(rom),
-            MbcState::Mbc2(mbc) => mbc.set_rom(rom),
-            MbcState::Mbc3(mbc) => mbc.set_rom(rom),
-            MbcState::Mbc5(mbc) => mbc.set_rom(rom),
-        }
+        dispatch!(self, m => m.set_rom(rom))
+    }
+    fn rumble(&self) -> bool {
+        dispatch!(self, m => m.rumble())
+    }
+    fn tick(&mut self, ticks: u32) {
+        dispatch!(self, m => m.tick(ticks))
+    }
+    fn set_tilt(&mut self, x: f32, y: f32) {
+        dispatch!(self, m => m.set_tilt(x, y))
     }
 }
 
@@ -172,11 +144,13 @@ pub fn get_mbc(data: Vec<u8>, skip_checksum: bool) -> StrResult<MbcState> {
         check_checksum(&data)?;
     }
     match data[0x147] {
-        0x00 => mbc0::MBC0::new(data).map(MbcState::Mbc0),
+        0x00 | 0x08 | 0x09 => mbc0::MBC0::new(data).map(MbcState::Mbc0),
         0x01..=0x03 => mbc1::MBC1::new(data).map(MbcState::Mbc1),
         0x05..=0x06 => mbc2::MBC2::new(data).map(MbcState::Mbc2),
         0x0F..=0x13 => mbc3::MBC3::new(data).map(MbcState::Mbc3),
         0x19..=0x1E => mbc5::MBC5::new(data).map(MbcState::Mbc5),
+        0x22 => mbc7::MBC7::new(data).map(MbcState::Mbc7),
+        0xFF => huc1::HuC1::new(data).map(MbcState::HuC1),
         _ => Err("Unsupported MBC type"),
     }
 }
@@ -193,9 +167,19 @@ impl FileBackedMBC {
         File::open(&rompath)
             .and_then(|mut f| f.read_to_end(&mut data))
             .map_err(|_| "Could not read ROM")?;
+        Self::from_bytes(data, &rompath, skip_checksum)
+    }
+
+    /// ROM already in memory (e.g. unpacked from an archive); battery saves
+    /// go next to `save_base` as `<save_base>.gbsave`.
+    pub fn from_bytes(
+        data: Vec<u8>,
+        save_base: &path::Path,
+        skip_checksum: bool,
+    ) -> StrResult<FileBackedMBC> {
         let mut mbc = get_mbc(data, skip_checksum)?;
 
-        let rampath = rompath.with_extension("gbsave");
+        let rampath = save_base.with_extension("gbsave");
         // println!("DEBUG: FileBackedMBC will use save path: {}", rampath.display());
 
         if mbc.is_battery_backed() {
@@ -262,25 +246,24 @@ impl MBC for FileBackedMBC {
         Some(self.rampath.clone())
     }
 
+    fn rumble(&self) -> bool {
+        self.mbc.rumble()
+    }
+
+    fn tick(&mut self, ticks: u32) {
+        self.mbc.tick(ticks)
+    }
+
+    fn set_tilt(&mut self, x: f32, y: f32) {
+        self.mbc.set_tilt(x, y)
+    }
+
     fn take_rom(&mut self) -> Vec<u8> {
         self.mbc.take_rom()
     }
 
     fn set_rom(&mut self, rom: Vec<u8>) {
         self.mbc.set_rom(rom)
-    }
-}
-
-impl Drop for FileBackedMBC {
-    fn drop(&mut self) {
-        if self.mbc.is_battery_backed() {
-            // TODO: error handling
-            let mut file = match fs::File::create(&self.rampath) {
-                Ok(f) => f,
-                Err(..) => return,
-            };
-            let _ = file.write_all(&self.mbc.dumpram());
-        }
     }
 }
 
@@ -297,6 +280,49 @@ impl Cartridge {
 
     pub fn from_buffer(data: Vec<u8>, skip_checksum: bool) -> StrResult<Cartridge> {
         get_mbc(data, skip_checksum).map(Cartridge::Memory)
+    }
+
+    pub fn from_bytes_with_save(
+        data: Vec<u8>,
+        save_base: &path::Path,
+        skip_checksum: bool,
+    ) -> StrResult<Cartridge> {
+        FileBackedMBC::from_bytes(data, save_base, skip_checksum).map(Cartridge::FileBacked)
+    }
+
+    fn state(&self) -> &MbcState {
+        match self {
+            Cartridge::Memory(mbc) => mbc,
+            Cartridge::FileBacked(fb) => &fb.mbc,
+        }
+    }
+
+    /// Whether `other` (typically decoded from a save state) has the same
+    /// mapper and cartridge-RAM layout. Save states don't carry the ROM, so
+    /// this is the guard against loading one game's state onto another.
+    pub fn same_layout(&self, other: &Cartridge) -> bool {
+        std::mem::discriminant(self.state()) == std::mem::discriminant(other.state())
+            && self.dumpram().len() == other.dumpram().len()
+    }
+
+    /// Carry what belongs to the physical cartridge, not the saved console
+    /// state, over to a cartridge decoded from a save state: the battery-save
+    /// path (the state has the one from when it was written) and the RTC,
+    /// which keeps running on the cart regardless of console state.
+    pub fn adopt_live_state(&mut self, live: &Cartridge) {
+        if let (Cartridge::FileBacked(dst), Cartridge::FileBacked(src)) = (&mut *self, live) {
+            dst.rampath = src.rampath.clone();
+        }
+        if let (MbcState::Mbc3(dst), MbcState::Mbc3(src)) = (self.state_mut(), live.state()) {
+            dst.set_rtc_state(src.rtc_state());
+        }
+    }
+
+    fn state_mut(&mut self) -> &mut MbcState {
+        match self {
+            Cartridge::Memory(mbc) => mbc,
+            Cartridge::FileBacked(fb) => &mut fb.mbc,
+        }
     }
 }
 
@@ -364,6 +390,27 @@ impl MBC for Cartridge {
         }
     }
 
+    fn rumble(&self) -> bool {
+        match self {
+            Cartridge::Memory(mbc) => mbc.rumble(),
+            Cartridge::FileBacked(mbc) => mbc.rumble(),
+        }
+    }
+
+    fn tick(&mut self, ticks: u32) {
+        match self {
+            Cartridge::Memory(mbc) => mbc.tick(ticks),
+            Cartridge::FileBacked(mbc) => mbc.tick(ticks),
+        }
+    }
+
+    fn set_tilt(&mut self, x: f32, y: f32) {
+        match self {
+            Cartridge::Memory(mbc) => mbc.set_tilt(x, y),
+            Cartridge::FileBacked(mbc) => mbc.set_tilt(x, y),
+        }
+    }
+
     fn take_rom(&mut self) -> Vec<u8> {
         match self {
             Cartridge::Memory(mbc) => mbc.take_rom(),
@@ -377,6 +424,13 @@ impl MBC for Cartridge {
             Cartridge::FileBacked(mbc) => mbc.set_rom(rom),
         }
     }
+}
+
+/// RAM banks for a cartridge whose type byte says it has RAM. A size byte of 0
+/// there is contradictory (Blargg's halt_bug.gb, some homebrew); give it one
+/// 8 KiB bank instead of silently dropping every RAM write.
+fn ram_banks_with_ram(v: u8) -> usize {
+    ram_banks(v).max(1)
 }
 
 fn ram_banks(v: u8) -> usize {
@@ -404,14 +458,16 @@ fn rom_banks(v: u8) -> usize {
     }
 }
 
+/// Error returned when the cartridge header checksum doesn't match.
+pub const CHECKSUM_INVALID: &str = "Cartridge checksum is invalid";
+
 fn check_checksum(data: &[u8]) -> StrResult<()> {
-    let mut value: u8 = 0;
-    for i in 0x134..0x14D {
-        value = value.wrapping_sub(data[i]).wrapping_sub(1);
-    }
+    let value = data[0x134..0x14D]
+        .iter()
+        .fold(0u8, |v, &b| v.wrapping_sub(b).wrapping_sub(1));
     match data[0x14D] == value {
         true => Ok(()),
-        false => Err("Cartridge checksum is invalid"),
+        false => Err(CHECKSUM_INVALID),
     }
 }
 

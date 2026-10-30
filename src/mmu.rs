@@ -10,6 +10,9 @@ use crate::StrResult;
 const WRAM_SIZE: usize = 0x8000;
 const ZRAM_SIZE: usize = 0x7F;
 
+/// T-cycles by which serial clock edges lead the system counter's bit 8.
+const SERIAL_CLOCK_LEAD: u32 = 4;
+
 #[derive(PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 enum DMAType {
     NoDMA,
@@ -28,7 +31,6 @@ pub struct MMU {
     pub timer: Timer,
     pub keypad: Keypad,
     pub gpu: GPU,
-    #[rkyv(with = rkyv::with::Skip)]
     pub sound: Option<Sound>,
     hdma_status: DMAType,
     hdma_src: u16,
@@ -41,6 +43,13 @@ pub struct MMU {
     speed_switch_req: bool,
     undocumented_cgb_regs: [u8; 3], // 0xFF72, 0xFF73, 0xFF75
     oam_dma_source: u8,
+    // OAM DMA in flight: copies byte `oam_dma_index` from `oam_dma_base`
+    // each M-cycle. A FF46 write is pending (source, M-cycles left) during
+    // setup, while a running transfer continues.
+    oam_dma_active: bool,
+    oam_dma_base: u16,
+    oam_dma_index: u8,
+    oam_dma_pending: Option<(u16, u8)>,
 }
 
 fn fill_random(slice: &mut [u8], start: u32) {
@@ -69,7 +78,7 @@ impl MMU {
             wrambank: 1,
             inte: 0,
             intf: 0,
-            serial: serial,
+            serial,
             timer: Timer::new(),
             keypad: Keypad::new(),
             gpu: GPU::new(),
@@ -84,12 +93,23 @@ impl MMU {
             hdma_len: 0xFF,
             undocumented_cgb_regs: [0; 3],
             oam_dma_source: 0xFF,
+            oam_dma_active: false,
+            oam_dma_base: 0,
+            oam_dma_index: 0,
+            oam_dma_pending: None,
         };
         fill_random(&mut res.wram, 42);
         if res.rb(0x0143) == 0xC0 {
             return Err("This game does not work in Classic mode");
         }
         res.set_initial();
+        res.gpu.set_post_boot_clock(0);
+        // P1: the DMG boot ROM leaves both select lines low (reads 0xCF); the
+        // CGB one leaves them high (0xFF, the power-on value).
+        res.wb(0xFF00, 0x00);
+        // Where the DMG boot ROM leaves the divider at PC=0x0100 (DIV = 0xAB),
+        // calibrated against Mooneye boot_div-dmgABCmgb.
+        res.timer.set_internal_counter(0xABC8);
         Ok(res)
     }
 
@@ -105,7 +125,7 @@ impl MMU {
             hdma: [0; 4],
             inte: 0,
             intf: 0,
-            serial: serial,
+            serial,
             timer: Timer::new(),
             keypad: Keypad::new(),
             gpu: GPU::new(),
@@ -120,10 +140,22 @@ impl MMU {
             hdma_len: 0xFF,
             undocumented_cgb_regs: [0; 3],
             oam_dma_source: 0xFF,
+            oam_dma_active: false,
+            oam_dma_base: 0,
+            oam_dma_index: 0,
+            oam_dma_pending: None,
         };
         fill_random(&mut res.wram, 42);
         res.determine_mode();
         res.set_initial();
+        res.gpu.set_post_boot_clock(0);
+        // DMG carts on CGB run the boot ROM's colorization path; this is
+        // where it leaves the divider (calibrated against Mooneye
+        // boot_div-cgbABCDE). Native CGB carts boot faster; their value
+        // isn't covered by a test ROM, so they keep starting from 0.
+        if res.gbmode == GbMode::ColorAsClassic {
+            res.timer.set_internal_counter(0x2674);
+        }
         Ok(res)
     }
 
@@ -158,6 +190,8 @@ impl MMU {
         self.wb(0xFF49, 0xFF);
         self.wb(0xFF4A, 0);
         self.wb(0xFF4B, 0);
+        // IF: the VBlank flag from the boot ROM's last frame is still set.
+        self.intf = 0x01;
     }
 
     fn determine_mode(&mut self) {
@@ -170,12 +204,28 @@ impl MMU {
     }
 
     pub fn do_cycle(&mut self, ticks: u32) -> u32 {
+        if self.oam_dma_busy() {
+            // OAM DMA runs on the CPU clock: one byte per M-cycle.
+            for _ in 0..ticks / 4 {
+                self.step_oam_dma();
+            }
+        }
         let cpudivider = self.gbspeed as u32;
         let vramticks = self.perform_vramdma();
         let gputicks = ticks / cpudivider + vramticks;
         let cputicks = ticks + vramticks * cpudivider;
 
+        let counter_before = self.timer.internal_counter() as u32;
         self.timer.do_cycle(cputicks);
+        if self.serial.transferring() {
+            // The serial clock is system-counter bit 8 (8192 Hz): one shift
+            // per falling edge, i.e. per multiple of 512 crossed. Its edges
+            // lead our counter by one M-cycle (calibrated against Mooneye
+            // boot_sclk_align).
+            let phase = counter_before + SERIAL_CLOCK_LEAD;
+            let edges = ((phase + cputicks) >> 9) - (phase >> 9);
+            self.serial.clock(edges);
+        }
         self.intf |= self.timer.interrupt;
         self.timer.interrupt = 0;
 
@@ -186,29 +236,60 @@ impl MMU {
         self.intf |= self.gpu.interrupt;
         self.gpu.interrupt = 0;
 
-        let _ = self.sound.as_mut().map_or((), |s| s.do_cycle(gputicks));
+        if let Some(s) = self.sound.as_mut() {
+            s.do_cycle(gputicks);
+        }
+
+        self.mbc.tick(gputicks);
 
         self.intf |= self.serial.interrupt;
         self.serial.interrupt = 0;
 
-        return gputicks;
+        gputicks
+    }
+
+    /// True while a CGB general-purpose or HBlank VRAM DMA is in progress.
+    pub fn vram_dma_active(&self) -> bool {
+        self.hdma_status != DMAType::NoDMA
+    }
+
+    /// CPU T-cycles that can pass before any peripheral could raise an
+    /// interrupt (used to fast-forward HALT). 0 means "don't skip".
+    pub fn ticks_until_event(&self) -> u32 {
+        // DMAs run per M-cycle / per HBlank; keep them exact.
+        if self.hdma_status != DMAType::NoDMA || self.oam_dma_busy() {
+            return 0;
+        }
+        let gpu = self.gpu.ticks_until_event().saturating_mul(self.gbspeed as u32);
+        let serial = if self.serial.transferring() {
+            512 - ((self.timer.internal_counter() as u32 + SERIAL_CLOCK_LEAD) & 0x1FF)
+        } else {
+            u32::MAX
+        };
+        gpu.min(self.timer.ticks_until_event()).min(serial)
     }
 
     pub fn rb(&mut self, address: u16) -> u8 {
         match address {
             0x0000..=0x7FFF => self.mbc.readrom(address),
+            0x8000..=0x9FFF if self.gpu.vram_blocked() => 0xFF,
             0x8000..=0x9FFF => self.gpu.rb(address),
             0xA000..=0xBFFF => self.mbc.readram(address),
             0xC000..=0xCFFF | 0xE000..=0xEFFF => self.wram[address as usize & 0x0FFF],
             0xD000..=0xDFFF | 0xF000..=0xFDFF => {
                 self.wram[(self.wrambank * 0x1000) | address as usize & 0x0FFF]
             }
+            // OAM is on the DMA's bus while a transfer runs, and the PPU's
+            // during modes 2-3.
+            0xFE00..=0xFE9F if self.oam_dma_active || self.gpu.oam_blocked() => 0xFF,
             0xFE00..=0xFE9F => self.gpu.rb(address),
             0xFF00 => self.keypad.rb(),
             0xFF01..=0xFF02 => self.serial.rb(address),
             0xFF04..=0xFF07 => self.timer.rb(address),
             0xFF0F => self.intf | 0b11100000,
             0xFF10..=0xFF3F => self.sound.as_mut().map_or(0xFF, |s| s.rb(address)),
+            // CGB hardware running a DMG cart: VBK reads as bank 0, fixed.
+            0xFF4F if self.gbmode == GbMode::ColorAsClassic => 0xFE,
             0xFF4D | 0xFF4F | 0xFF51..=0xFF55 | 0xFF6C | 0xFF70 if self.gbmode != GbMode::Color => {
                 0xFF
             }
@@ -243,16 +324,23 @@ impl MMU {
     pub fn wb(&mut self, address: u16, value: u8) {
         match address {
             0x0000..=0x7FFF => self.mbc.writerom(address, value),
+            0x8000..=0x9FFF if self.gpu.vram_write_blocked() => {}
             0x8000..=0x9FFF => self.gpu.wb(address, value),
             0xA000..=0xBFFF => self.mbc.writeram(address, value),
             0xC000..=0xCFFF | 0xE000..=0xEFFF => self.wram[address as usize & 0x0FFF] = value,
             0xD000..=0xDFFF | 0xF000..=0xFDFF => {
                 self.wram[(self.wrambank * 0x1000) | (address as usize & 0x0FFF)] = value
             }
+            0xFE00..=0xFE9F if self.oam_dma_active || self.gpu.oam_write_blocked() => {}
             0xFE00..=0xFE9F => self.gpu.wb(address, value),
             0xFF00 => self.keypad.wb(value),
             0xFF01..=0xFF02 => self.serial.wb(address, value),
             0xFF04 => {
+                // Resetting the counter while bit 8 is high is a falling
+                // edge of the serial clock.
+                if (self.timer.internal_counter() as u32 + SERIAL_CLOCK_LEAD) & 0x100 != 0 {
+                    self.serial.clock(1);
+                }
                 self.timer.wb(address, value);
                 // The DIV-APU frame sequencer is tapped off DIV; resetting DIV
                 // must reset the APU's frame-sequencer phase too.
@@ -287,6 +375,15 @@ impl MMU {
             0xFFFF => self.inte = value,
             _ => {}
         };
+        // A register write can itself raise an interrupt (e.g. LCD enable
+        // making LY=LYC, a DIV write's timer glitch). Latch it into IF now so
+        // the very next instruction boundary sees it.
+        if address >= 0xFF00 {
+            self.intf |= self.gpu.interrupt | self.timer.interrupt | self.serial.interrupt;
+            self.gpu.interrupt = 0;
+            self.timer.interrupt = 0;
+            self.serial.interrupt = 0;
+        }
     }
 
     pub fn ww(&mut self, address: u16, value: u16) {
@@ -317,13 +414,42 @@ impl MMU {
         self.speed_switch_req = false;
     }
 
+    /// FF46 write: (re)start an OAM DMA. Sources at E000 and up read the
+    /// WRAM they echo. Hardware has one setup M-cycle after the write's; since
+    /// CPU writes land at the end of their M-cycle here, that is two steps
+    /// (calibrated against Mooneye oam_dma_start / _restart / _timing).
     fn oamdma(&mut self, value: u8) {
         self.oam_dma_source = value;
         let base = (value as u16) << 8;
-        for i in 0..0xA0 {
-            let b = self.rb(base + i);
-            self.wb(0xFE00 + i, b);
+        let base = if base >= 0xE000 { base - 0x2000 } else { base };
+        self.oam_dma_pending = Some((base, 2));
+    }
+
+    /// Advance OAM DMA by one M-cycle.
+    fn step_oam_dma(&mut self) {
+        if self.oam_dma_active {
+            let i = self.oam_dma_index as u16;
+            let b = self.rb(self.oam_dma_base + i);
+            self.gpu.wb(0xFE00 + i, b);
+            self.oam_dma_index += 1;
+            if self.oam_dma_index as usize == 0xA0 {
+                self.oam_dma_active = false;
+            }
         }
+        if let Some((base, left)) = self.oam_dma_pending.take() {
+            if left > 1 {
+                self.oam_dma_pending = Some((base, left - 1));
+            } else {
+                self.oam_dma_active = true;
+                self.oam_dma_base = base;
+                self.oam_dma_index = 0;
+            }
+        }
+    }
+
+    /// True while an OAM DMA is being set up or transferring.
+    pub fn oam_dma_busy(&self) -> bool {
+        self.oam_dma_active || self.oam_dma_pending.is_some()
     }
 
     fn hdma_read(&self, a: u16) -> u8 {
@@ -396,7 +522,9 @@ impl MMU {
             self.hdma_status = DMAType::NoDMA;
         }
 
-        return 8;
+        // Pan Docs: each 16-byte block takes 8 M-cycles at single speed
+        // (16 at double speed), i.e. 32 dots either way. Callers count in dots.
+        32
     }
 
     fn perform_gdma(&mut self) -> u32 {
@@ -406,7 +534,7 @@ impl MMU {
         }
 
         self.hdma_status = DMAType::NoDMA;
-        return len * 8;
+        len * 32
     }
 
     fn perform_vramdma_row(&mut self) {

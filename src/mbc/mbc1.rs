@@ -1,4 +1,4 @@
-use crate::mbc::{ram_banks, rom_banks, MBC};
+use crate::mbc::{ram_banks_with_ram, rom_banks, MBC};
 use crate::StrResult;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -9,18 +9,22 @@ pub struct MBC1 {
     ram_on: bool,
     ram_updated: bool,
     banking_mode: u8,
-    rombank: usize,
-    rambank: usize,
+    /// BANK1 register (2000-3FFF), 5 bits, never 0.
+    bank1: usize,
+    /// BANK2 register (4000-5FFF), 2 bits: upper ROM bits or RAM bank.
+    bank2: usize,
     has_battery: bool,
     rombanks: usize,
     rambanks: usize,
+    /// MBC1M multicart wiring: BANK2 sits above 4 BANK1 bits, not 5.
+    multicart: bool,
 }
 
 impl MBC1 {
     pub fn new(data: Vec<u8>) -> StrResult<MBC1> {
         let (has_battery, rambanks) = match data[0x147] {
-            0x02 => (false, ram_banks(data[0x149])),
-            0x03 => (true, ram_banks(data[0x149])),
+            0x02 => (false, ram_banks_with_ram(data[0x149])),
+            0x03 => (true, ram_banks_with_ram(data[0x149])),
             _ => (false, 0),
         };
         let rombanks = rom_banks(data[0x148]);
@@ -31,75 +35,79 @@ impl MBC1 {
             return Err("Invalid ROM size in cartridge header");
         }
         let ramsize = rambanks * 0x2000;
+        let multicart = is_multicart(&data);
 
-        let res = MBC1 {
+        Ok(MBC1 {
             rom: data,
-            ram: ::std::iter::repeat(0u8).take(ramsize).collect(),
+            ram: vec![0; ramsize],
             ram_on: false,
             banking_mode: 0,
-            rombank: 1,
-            rambank: 0,
+            bank1: 1,
+            bank2: 0,
             ram_updated: false,
-            has_battery: has_battery,
-            rombanks: rombanks,
-            rambanks: rambanks,
-        };
-
-        Ok(res)
+            has_battery,
+            rombanks,
+            rambanks,
+            multicart,
+        })
     }
+
+    fn bank1_bits(&self) -> u32 {
+        if self.multicart { 4 } else { 5 }
+    }
+
+    fn rom_bank_low(&self) -> usize {
+        if self.banking_mode == 1 {
+            (self.bank2 << self.bank1_bits()) % self.rombanks
+        } else {
+            0
+        }
+    }
+
+    fn rom_bank_high(&self) -> usize {
+        let mask = (1 << self.bank1_bits()) - 1;
+        ((self.bank2 << self.bank1_bits()) | (self.bank1 & mask)) % self.rombanks
+    }
+
+    fn ram_offset(&self, a: u16) -> usize {
+        let bank = if self.banking_mode == 1 && self.rambanks > 1 {
+            self.bank2 % self.rambanks
+        } else {
+            0
+        };
+        (bank * 0x2000) | ((a & 0x1FFF) as usize)
+    }
+}
+
+/// MBC1M multicarts (8 Mbit compilations) are wired so BANK2 selects 256 KiB
+/// games; each game has its own header. Detect them by a second Nintendo logo
+/// at the start of bank 0x10, as other emulators do.
+fn is_multicart(rom: &[u8]) -> bool {
+    const LOGO: std::ops::Range<usize> = 0x104..0x134;
+    rom.len() == 0x100000
+        && rom[0x40000 + LOGO.start..0x40000 + LOGO.end] == rom[LOGO]
 }
 
 impl MBC for MBC1 {
     fn readrom(&self, a: u16) -> u8 {
-        let bank = if a < 0x4000 {
-            if self.banking_mode == 0 {
-                0
-            } else {
-                self.rombank & 0xE0
-            }
-        } else {
-            self.rombank
-        };
-        let idx = bank * 0x4000 | ((a as usize) & 0x3FFF);
+        let bank = if a < 0x4000 { self.rom_bank_low() } else { self.rom_bank_high() };
+        let idx = (bank * 0x4000) | ((a as usize) & 0x3FFF);
         *self.rom.get(idx).unwrap_or(&0xFF)
     }
     fn readram(&self, a: u16) -> u8 {
         if !self.ram_on || self.ram.is_empty() {
             return 0xFF;
         }
-        let rambank = if self.banking_mode == 1 {
-            self.rambank
-        } else {
-            0
-        };
-        let idx = (rambank * 0x2000) | ((a & 0x1FFF) as usize);
-        *self.ram.get(idx).unwrap_or(&0xFF)
+        *self.ram.get(self.ram_offset(a)).unwrap_or(&0xFF)
     }
 
     fn writerom(&mut self, a: u16, v: u8) {
         match a {
-            0x0000..=0x1FFF => {
-                self.ram_on = v & 0xF == 0xA;
-            }
-            0x2000..=0x3FFF => {
-                let lower_bits = match (v as usize) & 0x1F {
-                    0 => 1,
-                    n => n,
-                };
-                self.rombank = ((self.rombank & 0x60) | lower_bits) % self.rombanks;
-            }
-            0x4000..=0x5FFF => {
-                if self.rombanks > 0x20 {
-                    let upper_bits = (v as usize & 0x03) % (self.rombanks >> 5);
-                    self.rombank = self.rombank & 0x1F | (upper_bits << 5)
-                }
-                if self.rambanks > 1 {
-                    self.rambank = (v as usize) & 0x03;
-                }
-            }
-            0x6000..=0x7FFF => {
-                self.banking_mode = v & 0x01;
-            }
+            0x0000..=0x1FFF => self.ram_on = v & 0xF == 0xA,
+            // The zero check sees all 5 bits, even on multicarts.
+            0x2000..=0x3FFF => self.bank1 = ((v as usize) & 0x1F).max(1),
+            0x4000..=0x5FFF => self.bank2 = (v as usize) & 0x03,
+            0x6000..=0x7FFF => self.banking_mode = v & 0x01,
             _ => (),
         }
     }
@@ -108,12 +116,7 @@ impl MBC for MBC1 {
         if !self.ram_on || self.ram.is_empty() {
             return;
         }
-        let rambank = if self.banking_mode == 1 {
-            self.rambank
-        } else {
-            0
-        };
-        let address = (rambank * 0x2000) | ((a & 0x1FFF) as usize);
+        let address = self.ram_offset(a);
         if address < self.ram.len() {
             self.ram[address] = v;
             self.ram_updated = true;
@@ -125,11 +128,10 @@ impl MBC for MBC1 {
     }
 
     fn loadram(&mut self, ramdata: &[u8]) -> StrResult<()> {
-        if ramdata.len() != self.ram.len() {
-            return Err("Loaded RAM has incorrect length");
-        }
-
-        self.ram = ramdata.to_vec();
+        // Accept saves of any size (other emulators pad or append footers):
+        // load whatever overlaps and leave the rest zeroed.
+        let n = ramdata.len().min(self.ram.len());
+        self.ram[..n].copy_from_slice(&ramdata[..n]);
 
         Ok(())
     }

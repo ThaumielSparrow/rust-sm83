@@ -51,7 +51,7 @@ pub fn palette_for_preset(preset: DmgPalettePreset, custom: &[[u8; 3]; 4]) -> Dm
 /// Input buffer is interleaved RGB (3 bytes per pixel) as produced by
 /// `Device::get_gpu_data()` in DMG mode.
 pub fn apply_dmg_palette(buf: &mut [u8], pal: &DmgPalette) {
-    for px in buf.chunks_exact_mut(3) {
+    for px in buf.as_chunks_mut::<3>().0 {
         let dst = match px[0] {
             255 => pal.colors[0],
             192 => pal.colors[1],

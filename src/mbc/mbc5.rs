@@ -1,4 +1,4 @@
-use crate::mbc::{ram_banks, rom_banks, MBC};
+use crate::mbc::{ram_banks_with_ram, rom_banks, MBC};
 use crate::StrResult;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -14,17 +14,19 @@ pub struct MBC5 {
     rombanks: usize,
     rambanks: usize,
     has_rumble: bool,
+    /// Rumble carts: motor state (bit 3 of the last RAM-bank write).
+    rumble_on: bool,
 }
 
 impl MBC5 {
     pub fn new(data: Vec<u8>) -> StrResult<MBC5> {
         let (has_battery, has_rumble, rambanks) = match data[0x147] {
             0x19 => (false, false, 0),
-            0x1A => (false, false, ram_banks(data[0x149])),
-            0x1B => (true,  false, ram_banks(data[0x149])),
+            0x1A => (false, false, ram_banks_with_ram(data[0x149])),
+            0x1B => (true,  false, ram_banks_with_ram(data[0x149])),
             0x1C => (false, true,  0),
-            0x1D => (false, true,  ram_banks(data[0x149])),
-            0x1E => (true,  true,  ram_banks(data[0x149])),
+            0x1D => (false, true,  ram_banks_with_ram(data[0x149])),
+            0x1E => (true,  true,  ram_banks_with_ram(data[0x149])),
             _    => (false, false, 0),
         };
         let ramsize = 0x2000 * rambanks;
@@ -36,15 +38,16 @@ impl MBC5 {
 
         let res = MBC5 {
             rom: data,
-            ram: ::std::iter::repeat(0u8).take(ramsize).collect(),
+            ram: std::iter::repeat_n(0u8, ramsize).collect(),
             rombank: 1,
             rambank: 0,
             ram_updated: false,
             ram_on: false,
-            has_battery: has_battery,
-            rombanks: rombanks,
-            rambanks: rambanks,
-            has_rumble: has_rumble,
+            has_battery,
+            rombanks,
+            rambanks,
+            has_rumble,
+            rumble_on: false,
         };
 
         Ok(res)
@@ -56,7 +59,7 @@ impl MBC for MBC5 {
         let idx = if a < 0x4000 {
             a as usize
         } else {
-            self.rombank * 0x4000 | ((a as usize) & 0x3FFF)
+            (self.rombank * 0x4000) | ((a as usize) & 0x3FFF)
         };
         *self.rom.get(idx).unwrap_or(&0xFF)
     }
@@ -64,7 +67,7 @@ impl MBC for MBC5 {
         if !self.ram_on || self.ram.is_empty() {
             return 0xFF;
         }
-        let idx = self.rambank * 0x2000 | ((a as usize) & 0x1FFF);
+        let idx = (self.rambank * 0x2000) | ((a as usize) & 0x1FFF);
         *self.ram.get(idx).unwrap_or(&0xFF)
     }
     fn writerom(&mut self, a: u16, v: u8) {
@@ -78,15 +81,17 @@ impl MBC for MBC5 {
                     ((self.rombank & 0x0FF) | (((v & 0x1) as usize) << 8)) % self.rombanks
             }
             0x4000..=0x5FFF => {
+                // Bit 3 on rumble carts drives the motor, not the RAM bank.
+                if self.has_rumble {
+                    self.rumble_on = v & 0x08 != 0;
+                }
                 if self.rambanks == 0 {
-                    return; // no RAM; rumble bit, if any, has no host effect
+                    return;
                 }
                 let bank_mask: usize = if self.has_rumble { 0x07 } else { 0x0F };
                 if self.rambanks > 1 {
                     self.rambank = (v as usize) & bank_mask;
                 }
-                // Bit 3 on rumble carts drives the motor; we don't implement physical rumble,
-                // but it must NOT be routed into rambank.
             }
             0x6000..=0x7FFF => { /* ? */ }
             _ => (),
@@ -96,7 +101,7 @@ impl MBC for MBC5 {
         if !self.ram_on || self.ram.is_empty() {
             return;
         }
-        let idx = self.rambank * 0x2000 | ((a as usize) & 0x1FFF);
+        let idx = (self.rambank * 0x2000) | ((a as usize) & 0x1FFF);
         if idx < self.ram.len() {
             self.ram[idx] = v;
             self.ram_updated = true;
@@ -108,11 +113,10 @@ impl MBC for MBC5 {
     }
 
     fn loadram(&mut self, ramdata: &[u8]) -> StrResult<()> {
-        if ramdata.len() != self.ram.len() {
-            return Err("Loaded RAM has incorrect length");
-        }
-
-        self.ram = ramdata.to_vec();
+        // Accept saves of any size (other emulators pad or append footers):
+        // load whatever overlaps and leave the rest zeroed.
+        let n = ramdata.len().min(self.ram.len());
+        self.ram[..n].copy_from_slice(&ramdata[..n]);
 
         Ok(())
     }
@@ -125,6 +129,10 @@ impl MBC for MBC5 {
         let result = self.ram_updated;
         self.ram_updated = false;
         result
+    }
+
+    fn rumble(&self) -> bool {
+        self.rumble_on
     }
 
     fn take_rom(&mut self) -> Vec<u8> {
@@ -148,6 +156,15 @@ mod test {
         // 32 KiB RAM (4 banks)
         rom[0x149] = 0x03;
         rom
+    }
+
+    #[test]
+    fn mbc5_rumble_bit_drives_the_motor() {
+        let mut mbc = MBC5::new(rumble_cart_4_banks()).unwrap();
+        mbc.writerom(0x4000, 0x08);
+        assert!(mbc.rumble());
+        mbc.writerom(0x4000, 0x01);
+        assert!(!mbc.rumble());
     }
 
     #[test]

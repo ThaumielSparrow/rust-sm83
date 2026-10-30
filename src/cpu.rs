@@ -4,15 +4,26 @@ use crate::register::CpuFlag::{C, H, N, Z};
 use crate::register::Registers;
 use crate::StrResult;
 
+/// T-cycle within its M-cycle at which a TAC write takes effect.
+const TAC_WRITE_DOT: u32 = 2;
+
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CPU {
-    reg: Registers,
+    pub(crate) reg: Registers,
     pub mmu: MMU,
-    halted: bool,
+    pub(crate) halted: bool,
     halt_bug: bool,
     ime: bool,
     setdi: u32,
     setei: u32,
+    // Per-instruction bookkeeping for M-cycle timing (see `tick`). Always
+    // zero between `do_cycle` calls, so not saved.
+    #[rkyv(with = rkyv::with::Skip)]
+    mcycles: u32,
+    #[rkyv(with = rkyv::with::Skip)]
+    pending_ticks: u32,
+    #[rkyv(with = rkyv::with::Skip)]
+    elapsed: u32,
 }
 
 impl CPU {
@@ -26,9 +37,13 @@ impl CPU {
             reg: registers,
             halted: false,
             halt_bug: false,
-            ime: true,
+            // Post-boot-ROM state: interrupts disabled until the game runs EI.
+            ime: false,
             setdi: 0,
             setei: 0,
+            mcycles: 0,
+            pending_ticks: 0,
+            elapsed: 0,
             mmu: cpu_mmu,
         })
     }
@@ -43,16 +58,105 @@ impl CPU {
             reg: registers,
             halted: false,
             halt_bug: false,
-            ime: true,
+            // Post-boot-ROM state: interrupts disabled until the game runs EI.
+            ime: false,
             setdi: 0,
             setei: 0,
+            mcycles: 0,
+            pending_ticks: 0,
+            elapsed: 0,
             mmu: cpu_mmu,
         })
     }
 
     pub fn do_cycle(&mut self) -> u32 {
-        let ticks = self.docycle() * 4;
-        return self.mmu.do_cycle(ticks);
+        // HALT fast-forward: with nothing pending and no EI/DI in flight, a
+        // halted CPU just burns M-cycles until a peripheral raises an
+        // interrupt. Advance in one step to just before the next point where
+        // that could happen; this is identical to stepping one M-cycle at a
+        // time, only cheaper.
+        if self.halted
+            && self.setei == 0
+            && self.setdi == 0
+            && self.mmu.inte & self.mmu.intf & 0x1F == 0
+        {
+            const MAX_SKIP_TICKS: u32 = 4096;
+            let until = self.mmu.ticks_until_event().min(MAX_SKIP_TICKS);
+            let mcycles = until.saturating_sub(1) / 4;
+            if mcycles > 1 {
+                return self.mmu.do_cycle(mcycles * 4);
+            }
+        }
+        self.mcycles = 0;
+        self.elapsed = 0;
+        let total = self.docycle();
+        // Internal M-cycles the instruction didn't spend on bus accesses.
+        while self.mcycles < total {
+            self.tick();
+        }
+        self.sync();
+        self.elapsed
+    }
+
+    /// One M-cycle passes. The rest of the system is advanced lazily, right
+    /// before the next bus access (or at the end of the instruction): each
+    /// access then sees peripherals exactly as of its own M-cycle, without
+    /// paying for a peripheral update on internal cycles.
+    fn tick(&mut self) {
+        self.mcycles += 1;
+        self.pending_ticks += 4;
+    }
+
+    fn sync(&mut self) {
+        if self.pending_ticks > 0 {
+            self.elapsed += self.mmu.do_cycle(self.pending_ticks);
+            self.pending_ticks = 0;
+        }
+    }
+
+    /// Bus read taking one M-cycle; the value is sampled at the end of it.
+    fn read(&mut self, address: u16) -> u8 {
+        self.tick();
+        if self.timing_sensitive(address) {
+            self.sync();
+        }
+        self.mmu.rb(address)
+    }
+
+    /// Bus write taking one M-cycle, landing at the end of it.
+    fn write(&mut self, address: u16, value: u8) {
+        if address == 0xFF07 {
+            // TAC: the timer's input mux switches partway through the write's
+            // M-cycle (Mooneye rapid_toggle).
+            self.mcycles += 1;
+            self.sync();
+            self.elapsed += self.mmu.do_cycle(TAC_WRITE_DOT);
+            self.mmu.wb(address, value);
+            self.pending_ticks += 4 - TAC_WRITE_DOT;
+            return;
+        }
+        self.tick();
+        if self.timing_sensitive(address) {
+            self.sync();
+        }
+        self.mmu.wb(address, value)
+    }
+
+    /// Whether an access can observe (or affect) peripheral timing, so the
+    /// rest of the system must be brought up to date first. ROM / cart RAM,
+    /// WRAM and HRAM can't: deferring the catch-up past them is unobservable,
+    /// and it saves a peripheral update on most accesses. While a DMA is
+    /// running it reads those regions during catch-up, so then every access
+    /// syncs.
+    fn timing_sensitive(&self, address: u16) -> bool {
+        !matches!(address, 0x0000..=0x7FFF | 0xA000..=0xFDFF | 0xFF80..=0xFFFE)
+            || self.mmu.vram_dma_active()
+            || self.mmu.oam_dma_busy()
+    }
+
+    fn write_word(&mut self, address: u16, value: u16) {
+        self.write(address, value as u8);
+        self.write(address.wrapping_add(1), (value >> 8) as u8);
     }
 
     fn docycle(&mut self) -> u32 {
@@ -71,7 +175,7 @@ impl CPU {
     }
 
     fn fetchbyte(&mut self) -> u8 {
-        let b = self.mmu.rb(self.reg.pc);
+        let b = self.read(self.reg.pc);
         if self.halt_bug {
             self.halt_bug = false;
         } else {
@@ -121,28 +225,54 @@ impl CPU {
         }
         self.ime = false;
 
-        let n = triggered.trailing_zeros();
-        if n >= 5 {
-            panic!("Invalid interrupt triggered");
+        // `EI; HALT` with an interrupt already pending: HALT set halt_bug, but
+        // IME turns on before the next fetch, so the interrupt is taken first.
+        // The bugged (non-advancing) fetch then lands on HALT itself, which
+        // means the return address is the HALT, not the handler's first byte.
+        let pc = if self.halt_bug {
+            self.halt_bug = false;
+            self.reg.pc.wrapping_sub(1)
+        } else {
+            self.reg.pc
+        };
+        // Dispatch: 2 internal M-cycles, push PC high, push PC low, jump.
+        self.tick();
+        self.tick();
+        self.reg.sp = self.reg.sp.wrapping_sub(1);
+        self.write(self.reg.sp, (pc >> 8) as u8);
+        // The vector is chosen only now: if that push overwrote IE (SP was
+        // 0x0000), a no-longer-enabled interrupt is cancelled and the CPU
+        // jumps to 0x0000 instead (Mooneye ie_push).
+        let triggered = self.mmu.inte & self.mmu.intf & 0x1F;
+        self.reg.sp = self.reg.sp.wrapping_sub(1);
+        self.write(self.reg.sp, pc as u8);
+        if triggered == 0 {
+            self.reg.pc = 0x0000;
+        } else {
+            let n = triggered.trailing_zeros();
+            self.mmu.intf &= !(1 << n);
+            self.reg.pc = 0x0040 | ((n as u16) << 3);
         }
-        self.mmu.intf &= !(1 << n);
-        let pc = self.reg.pc;
-        self.pushstack(pc);
-        self.reg.pc = 0x0040 | ((n as u16) << 3);
 
         // Hardware spec: 5 M-cycles (2 NOPs, PUSH PC, vector load).
         5
     }
 
+    /// PUSH-style: one internal M-cycle, then high byte, then low byte.
     fn pushstack(&mut self, value: u16) {
-        self.reg.sp = self.reg.sp.wrapping_sub(2);
-        self.mmu.ww(self.reg.sp, value);
+        self.tick();
+        self.reg.sp = self.reg.sp.wrapping_sub(1);
+        self.write(self.reg.sp, (value >> 8) as u8);
+        self.reg.sp = self.reg.sp.wrapping_sub(1);
+        self.write(self.reg.sp, value as u8);
     }
 
     fn popstack(&mut self) -> u16 {
-        let res = self.mmu.rw(self.reg.sp);
-        self.reg.sp = self.reg.sp.wrapping_add(2);
-        res
+        let lo = self.read(self.reg.sp) as u16;
+        self.reg.sp = self.reg.sp.wrapping_add(1);
+        let hi = self.read(self.reg.sp) as u16;
+        self.reg.sp = self.reg.sp.wrapping_add(1);
+        (hi << 8) | lo
     }
 
     // Table based dispatcher
@@ -188,7 +318,7 @@ impl CPU {
         self.reg.flag(Z, r == 0);
         self.reg.flag(H, (a & 0x0F) + 1 > 0x0F);
         self.reg.flag(N, false);
-        return r;
+        r
     }
 
     fn alu_dec(&mut self, a: u8) -> u8 {
@@ -196,7 +326,7 @@ impl CPU {
         self.reg.flag(Z, r == 0);
         self.reg.flag(H, (a & 0x0F) == 0);
         self.reg.flag(N, true);
-        return r;
+        r
     }
 
     fn alu_add16(&mut self, b: u16) {
@@ -214,7 +344,7 @@ impl CPU {
         self.reg.flag(Z, false);
         self.reg.flag(H, (a & 0x000F) + (b & 0x000F) > 0x000F);
         self.reg.flag(C, (a & 0x00FF) + (b & 0x00FF) > 0x00FF);
-        return a.wrapping_add(b);
+        a.wrapping_add(b)
     }
 
     fn alu_swap(&mut self, a: u8) -> u8 {
@@ -222,7 +352,7 @@ impl CPU {
         self.reg.flag(C, false);
         self.reg.flag(H, false);
         self.reg.flag(N, false);
-        (a >> 4) | (a << 4)
+        a.rotate_left(4)
     }
 
     fn alu_srflagupdate(&mut self, r: u8, c: bool) {
@@ -236,49 +366,49 @@ impl CPU {
         let c = a & 0x80 == 0x80;
         let r = (a << 1) | (if c { 1 } else { 0 });
         self.alu_srflagupdate(r, c);
-        return r;
+        r
     }
 
     fn alu_rl(&mut self, a: u8) -> u8 {
         let c = a & 0x80 == 0x80;
         let r = (a << 1) | (if self.reg.getflag(C) { 1 } else { 0 });
         self.alu_srflagupdate(r, c);
-        return r;
+        r
     }
 
     fn alu_rrc(&mut self, a: u8) -> u8 {
         let c = a & 0x01 == 0x01;
         let r = (a >> 1) | (if c { 0x80 } else { 0 });
         self.alu_srflagupdate(r, c);
-        return r;
+        r
     }
 
     fn alu_rr(&mut self, a: u8) -> u8 {
         let c = a & 0x01 == 0x01;
         let r = (a >> 1) | (if self.reg.getflag(C) { 0x80 } else { 0 });
         self.alu_srflagupdate(r, c);
-        return r;
+        r
     }
 
     fn alu_sla(&mut self, a: u8) -> u8 {
         let c = a & 0x80 == 0x80;
         let r = a << 1;
         self.alu_srflagupdate(r, c);
-        return r;
+        r
     }
 
     fn alu_sra(&mut self, a: u8) -> u8 {
         let c = a & 0x01 == 0x01;
         let r = (a >> 1) | (a & 0x80);
         self.alu_srflagupdate(r, c);
-        return r;
+        r
     }
 
     fn alu_srl(&mut self, a: u8) -> u8 {
         let c = a & 0x01 == 0x01;
         let r = a >> 1;
         self.alu_srflagupdate(r, c);
-        return r;
+        r
     }
 
     fn alu_bit(&mut self, a: u8, b: u8) {
@@ -375,22 +505,22 @@ fn op_rot_a(cpu: &mut CPU, op: u8) -> u32 {
 // LD r,r' (and LD r,(HL)) group 0x40-0x7F excluding 0x76 HALT already mapped.
 fn op_ld_r_r(cpu: &mut CPU, op: u8) -> u32 {
     let hl = cpu.reg.hl();
-    let read_hl = |cpu: &mut CPU| cpu.mmu.rb(hl);
+    let read_hl = |cpu: &mut CPU| cpu.read(hl);
     // decode dest/source indices: bits 3-5 dest, 0-2 src (A=7,B=0,C=1,D=2,E=3,H=4,L=5,(HL)=6)
     let dest = (op >> 3) & 0x07; let src = op & 0x07;
     let val = match src { 0 => cpu.reg.b, 1 => cpu.reg.c, 2 => cpu.reg.d, 3 => cpu.reg.e, 4 => cpu.reg.h, 5 => cpu.reg.l, 6 => read_hl(cpu), 7 => cpu.reg.a, _ => unreachable!() };
     match dest { 0 => cpu.reg.b = val, 1 => cpu.reg.c = val, 2 => cpu.reg.d = val, 3 => cpu.reg.e = val, 4 => cpu.reg.h = val, 5 => cpu.reg.l = val, 6 => { // LD (HL),r
-            cpu.mmu.wb(hl, val);
+            cpu.write(hl, val);
         }, 7 => cpu.reg.a = val, _ => unreachable!() };
 
     if dest == 6 || src == 6 { 2 } else { 1 }
 }
 
 // LD r,d8 already handled for specific opcodes
-fn op_ld_hl_d8(cpu: &mut CPU, _op: u8) -> u32 { let v = cpu.fetchbyte(); let hl = cpu.reg.hl(); cpu.mmu.wb(hl, v); 3 }
+fn op_ld_hl_d8(cpu: &mut CPU, _op: u8) -> u32 { let v = cpu.fetchbyte(); let hl = cpu.reg.hl(); cpu.write(hl, v); 3 }
 
 // ALU helpers mapping register code to value (including (HL))
-fn read_reg_by_code(cpu: &mut CPU, code: u8) -> u8 { match code { 0 => cpu.reg.b, 1 => cpu.reg.c, 2 => cpu.reg.d, 3 => cpu.reg.e, 4 => cpu.reg.h, 5 => cpu.reg.l, 6 => cpu.mmu.rb(cpu.reg.hl()), 7 => cpu.reg.a, _ => unreachable!() } }
+fn read_reg_by_code(cpu: &mut CPU, code: u8) -> u8 { match code { 0 => cpu.reg.b, 1 => cpu.reg.c, 2 => cpu.reg.d, 3 => cpu.reg.e, 4 => cpu.reg.h, 5 => cpu.reg.l, 6 => cpu.read(cpu.reg.hl()), 7 => cpu.reg.a, _ => unreachable!() } }
 
 // ADD/ADC/SUB/SBC/AND/XOR/OR/CP r (0x80-0xBF)
 fn op_alu_r(cpu: &mut CPU, op: u8) -> u32 {
@@ -483,17 +613,17 @@ fn op_pop_rr(cpu: &mut CPU, op: u8) -> u32 {
 }
 
 // 0x08 LD (nn),SP and 0xFA LD A,(nn) and 0xEA LD (nn),A handled separately
-fn op_store_nn_sp(cpu: &mut CPU, _op:u8) -> u32 { let a = cpu.fetchword(); cpu.mmu.ww(a, cpu.reg.sp); 5 }
-fn op_ld_a_nn(cpu: &mut CPU, _op:u8) -> u32 { let a = cpu.fetchword(); cpu.reg.a = cpu.mmu.rb(a); 4 }
-fn op_ld_nn_a(cpu: &mut CPU, _op:u8) -> u32 { let a = cpu.fetchword(); cpu.mmu.wb(a, cpu.reg.a); 4 }
+fn op_store_nn_sp(cpu: &mut CPU, _op:u8) -> u32 { let a = cpu.fetchword(); cpu.write_word(a, cpu.reg.sp); 5 }
+fn op_ld_a_nn(cpu: &mut CPU, _op:u8) -> u32 { let a = cpu.fetchword(); cpu.reg.a = cpu.read(a); 4 }
+fn op_ld_nn_a(cpu: &mut CPU, _op:u8) -> u32 { let a = cpu.fetchword(); cpu.write(a, cpu.reg.a); 4 }
 
 // LDH (0xE0,0xF0,0xE2,0xF2)
 fn op_ldh(cpu: &mut CPU, op: u8) -> u32 {
     match op {
-        0xE0 => { let off = cpu.fetchbyte() as u16; cpu.mmu.wb(0xFF00 + off, cpu.reg.a); 3 },
-        0xF0 => { let off = cpu.fetchbyte() as u16; cpu.reg.a = cpu.mmu.rb(0xFF00 + off); 3 },
-        0xE2 => { cpu.mmu.wb(0xFF00 + cpu.reg.c as u16, cpu.reg.a); 2 },
-        0xF2 => { cpu.reg.a = cpu.mmu.rb(0xFF00 + cpu.reg.c as u16); 2 },
+        0xE0 => { let off = cpu.fetchbyte() as u16; cpu.write(0xFF00 + off, cpu.reg.a); 3 },
+        0xF0 => { let off = cpu.fetchbyte() as u16; cpu.reg.a = cpu.read(0xFF00 + off); 3 },
+        0xE2 => { cpu.write(0xFF00 + cpu.reg.c as u16, cpu.reg.a); 2 },
+        0xF2 => { cpu.reg.a = cpu.read(0xFF00 + cpu.reg.c as u16); 2 },
         _ => unreachable!(),
     }
 }
@@ -532,6 +662,7 @@ fn op_ret(cpu: &mut CPU, op: u8) -> u32 {
     0xC9 => { let v = cpu.popstack(); cpu.reg.pc = v; 4 },
     0xD9 => { let v = cpu.popstack(); cpu.reg.pc = v; cpu.setei = 1; 4 },
         0xC0 | 0xC8 | 0xD0 | 0xD8 => {
+            cpu.tick(); // condition check precedes the pops
             let cond = match op { 0xC0 => !cpu.reg.getflag(Z), 0xC8 => cpu.reg.getflag(Z), 0xD0 => !cpu.reg.getflag(C), 0xD8 => cpu.reg.getflag(C), _ => unreachable!() };
         if cond { let v = cpu.popstack(); cpu.reg.pc = v; 5 } else { 2 }
         }
@@ -540,10 +671,10 @@ fn op_ret(cpu: &mut CPU, op: u8) -> u32 {
 }
 
 // RST t (0xC7,CF,D7,DF,E7,EF,F7,FF)
-fn op_rst(cpu: &mut CPU, op: u8) -> u32 { let target = match op { 0xC7 => 0x00, 0xCF => 0x08, 0xD7 => 0x10, 0xDF => 0x18, 0xE7 => 0x20, 0xEF => 0x28, 0xF7 => 0x30, 0xFF => 0x38, _ => unreachable!() }; let pc = cpu.reg.pc; cpu.reg.sp = cpu.reg.sp.wrapping_sub(1); cpu.mmu.wb(cpu.reg.sp, (pc >> 8) as u8); cpu.reg.sp = cpu.reg.sp.wrapping_sub(1); cpu.mmu.wb(cpu.reg.sp, pc as u8); cpu.reg.pc = target; 4 }
+fn op_rst(cpu: &mut CPU, op: u8) -> u32 { let target = match op { 0xC7 => 0x00, 0xCF => 0x08, 0xD7 => 0x10, 0xDF => 0x18, 0xE7 => 0x20, 0xEF => 0x28, 0xF7 => 0x30, 0xFF => 0x38, _ => unreachable!() }; let pc = cpu.reg.pc; cpu.pushstack(pc); cpu.reg.pc = target; 4 }
 
 // Misc single opcodes: DAA(0x27), CPL(0x2F), SCF(0x37), CCF(0x3F), DI(0xF3), EI(0xFB), STOP(0x10)
-fn op_misc(cpu: &mut CPU, op: u8) -> u32 { match op { 0x27 => { cpu.alu_daa(); 1 }, 0x2F => { cpu.reg.a = !cpu.reg.a; cpu.reg.flag(H,true); cpu.reg.flag(N,true); 1 }, 0x37 => { cpu.reg.flag(C,true); cpu.reg.flag(H,false); cpu.reg.flag(N,false); 1 }, 0x3F => { let c = cpu.reg.getflag(C); cpu.reg.flag(C,!c); cpu.reg.flag(H,false); cpu.reg.flag(N,false); 1 }, 0xF3 => { cpu.ime = false; 1 }, 0xFB => { cpu.setei = 2; 1 }, 0x10 => {
+fn op_misc(cpu: &mut CPU, op: u8) -> u32 { match op { 0x27 => { cpu.alu_daa(); 1 }, 0x2F => { cpu.reg.a = !cpu.reg.a; cpu.reg.flag(H,true); cpu.reg.flag(N,true); 1 }, 0x37 => { cpu.reg.flag(C,true); cpu.reg.flag(H,false); cpu.reg.flag(N,false); 1 }, 0x3F => { let c = cpu.reg.getflag(C); cpu.reg.flag(C,!c); cpu.reg.flag(H,false); cpu.reg.flag(N,false); 1 }, 0xF3 => { cpu.ime = false; cpu.setei = 0; 1 }, 0xFB => { if cpu.setei == 0 && !cpu.ime { cpu.setei = 2; } 1 }, 0x10 => {
     // STOP is a two-byte opcode (10 00). Consume the operand.
     let _ = cpu.fetchbyte();
     // Speed switch only applies on CGB when KEY1 bit 0 is set.
@@ -554,19 +685,19 @@ fn op_misc(cpu: &mut CPU, op: u8) -> u32 { match op { 0x27 => { cpu.alu_daa(); 1
 }, _ => unreachable!() } }
 
 // Simple LD A,(rr) and LD (rr),A for BC/DE plus HL +/- (0x0A,0x1A,0x02,0x12,0x22,0x2A,0x32,0x3A)
-fn op_ld_a_rr_ind(cpu: &mut CPU, op:u8) -> u32 { match op { 0x0A => cpu.reg.a = cpu.mmu.rb(cpu.reg.bc()), 0x1A => cpu.reg.a = cpu.mmu.rb(cpu.reg.de()), _=> unreachable!()}; 2 }
-fn op_ld_rr_ind_a(cpu: &mut CPU, op:u8) -> u32 { match op { 0x02 => cpu.mmu.wb(cpu.reg.bc(), cpu.reg.a), 0x12 => cpu.mmu.wb(cpu.reg.de(), cpu.reg.a), _=> unreachable!()}; 2 }
-fn op_ld_hl_incdec_a(cpu:&mut CPU, op:u8) -> u32 { match op { 0x22 => { cpu.mmu.wb(cpu.reg.hli(), cpu.reg.a); }, 0x2A => { cpu.reg.a = cpu.mmu.rb(cpu.reg.hli()); }, 0x32 => { cpu.mmu.wb(cpu.reg.hld(), cpu.reg.a); }, 0x3A => { cpu.reg.a = cpu.mmu.rb(cpu.reg.hld()); }, _=> unreachable!()}; 2 }
+fn op_ld_a_rr_ind(cpu: &mut CPU, op:u8) -> u32 { match op { 0x0A => cpu.reg.a = cpu.read(cpu.reg.bc()), 0x1A => cpu.reg.a = cpu.read(cpu.reg.de()), _=> unreachable!()}; 2 }
+fn op_ld_rr_ind_a(cpu: &mut CPU, op:u8) -> u32 { match op { 0x02 => cpu.write(cpu.reg.bc(), cpu.reg.a), 0x12 => cpu.write(cpu.reg.de(), cpu.reg.a), _=> unreachable!()}; 2 }
+fn op_ld_hl_incdec_a(cpu:&mut CPU, op:u8) -> u32 { match op { 0x22 => { let a = cpu.reg.hli(); cpu.write(a, cpu.reg.a); }, 0x2A => { let a = cpu.reg.hli(); cpu.reg.a = cpu.read(a); }, 0x32 => { let a = cpu.reg.hld(); cpu.write(a, cpu.reg.a); }, 0x3A => { let a = cpu.reg.hld(); cpu.reg.a = cpu.read(a); }, _=> unreachable!()}; 2 }
 
 // INC (HL) 0x34 , DEC (HL) 0x35
-fn op_incdec_hl_mem(cpu:&mut CPU, op:u8) -> u32 { let addr = cpu.reg.hl(); let v = cpu.mmu.rb(addr); let v2 = if op==0x34 { cpu.alu_inc(v) } else { cpu.alu_dec(v) }; cpu.mmu.wb(addr, v2); 3 }
+fn op_incdec_hl_mem(cpu:&mut CPU, op:u8) -> u32 { let addr = cpu.reg.hl(); let v = cpu.read(addr); let v2 = if op==0x34 { cpu.alu_inc(v) } else { cpu.alu_dec(v) }; cpu.write(addr, v2); 3 }
 
 // CB prefix table
 type CbHandler = fn(&mut CPU, u8) -> u32;
-fn cb_rot(cpu:&mut CPU, op:u8)->u32 { let target = op & 0x07; let group = op >> 3; let mut v = match target {0=>cpu.reg.b,1=>cpu.reg.c,2=>cpu.reg.d,3=>cpu.reg.e,4=>cpu.reg.h,5=>cpu.reg.l,6=>cpu.mmu.rb(cpu.reg.hl()),7=>cpu.reg.a,_=>unreachable!()}; v = match group {0=>cpu.alu_rlc(v),1=>cpu.alu_rrc(v),2=>cpu.alu_rl(v),3=>cpu.alu_rr(v),4=>cpu.alu_sla(v),5=>cpu.alu_sra(v),6=>cpu.alu_swap(v),7=>cpu.alu_srl(v),_=>unreachable!()}; if target==6 { cpu.mmu.wb(cpu.reg.hl(), v); 4 } else { match target {0=>cpu.reg.b=v,1=>cpu.reg.c=v,2=>cpu.reg.d=v,3=>cpu.reg.e=v,4=>cpu.reg.h=v,5=>cpu.reg.l=v,7=>cpu.reg.a=v,_=>{} }; 2 } }
-fn cb_bit(cpu:&mut CPU, op:u8)->u32 { let bit = (op>>3)&0x07; let target = op & 0x07; let v = if target==6 { cpu.mmu.rb(cpu.reg.hl()) } else { match target {0=>cpu.reg.b,1=>cpu.reg.c,2=>cpu.reg.d,3=>cpu.reg.e,4=>cpu.reg.h,5=>cpu.reg.l,7=>cpu.reg.a,_=>unreachable!()} }; cpu.alu_bit(v, bit); if target==6 {3} else {2} }
-fn cb_res(cpu:&mut CPU, op:u8)->u32 { let bit = (op>>3)&0x07; let mask = !(1<<bit); let target = op & 0x07; if target==6 { let addr=cpu.reg.hl(); let mut v=cpu.mmu.rb(addr); v &= mask; cpu.mmu.wb(addr,v); 4 } else { let reg = match target {0=>&mut cpu.reg.b,1=>&mut cpu.reg.c,2=>&mut cpu.reg.d,3=>&mut cpu.reg.e,4=>&mut cpu.reg.h,5=>&mut cpu.reg.l,7=>&mut cpu.reg.a,_=>unreachable!()}; *reg &= mask; 2 } }
-fn cb_set(cpu:&mut CPU, op:u8)->u32 { let bit = (op>>3)&0x07; let mask = 1<<bit; let target = op & 0x07; if target==6 { let addr=cpu.reg.hl(); let mut v=cpu.mmu.rb(addr); v |= mask; cpu.mmu.wb(addr,v); 4 } else { let reg = match target {0=>&mut cpu.reg.b,1=>&mut cpu.reg.c,2=>&mut cpu.reg.d,3=>&mut cpu.reg.e,4=>&mut cpu.reg.h,5=>&mut cpu.reg.l,7=>&mut cpu.reg.a,_=>unreachable!()}; *reg |= mask; 2 } }
+fn cb_rot(cpu:&mut CPU, op:u8)->u32 { let target = op & 0x07; let group = op >> 3; let mut v = match target {0=>cpu.reg.b,1=>cpu.reg.c,2=>cpu.reg.d,3=>cpu.reg.e,4=>cpu.reg.h,5=>cpu.reg.l,6=>cpu.read(cpu.reg.hl()),7=>cpu.reg.a,_=>unreachable!()}; v = match group {0=>cpu.alu_rlc(v),1=>cpu.alu_rrc(v),2=>cpu.alu_rl(v),3=>cpu.alu_rr(v),4=>cpu.alu_sla(v),5=>cpu.alu_sra(v),6=>cpu.alu_swap(v),7=>cpu.alu_srl(v),_=>unreachable!()}; if target==6 { cpu.write(cpu.reg.hl(), v); 4 } else { match target {0=>cpu.reg.b=v,1=>cpu.reg.c=v,2=>cpu.reg.d=v,3=>cpu.reg.e=v,4=>cpu.reg.h=v,5=>cpu.reg.l=v,7=>cpu.reg.a=v,_=>{} }; 2 } }
+fn cb_bit(cpu:&mut CPU, op:u8)->u32 { let bit = (op>>3)&0x07; let target = op & 0x07; let v = if target==6 { cpu.read(cpu.reg.hl()) } else { match target {0=>cpu.reg.b,1=>cpu.reg.c,2=>cpu.reg.d,3=>cpu.reg.e,4=>cpu.reg.h,5=>cpu.reg.l,7=>cpu.reg.a,_=>unreachable!()} }; cpu.alu_bit(v, bit); if target==6 {3} else {2} }
+fn cb_res(cpu:&mut CPU, op:u8)->u32 { let bit = (op>>3)&0x07; let mask = !(1<<bit); let target = op & 0x07; if target==6 { let addr=cpu.reg.hl(); let mut v=cpu.read(addr); v &= mask; cpu.write(addr,v); 4 } else { let reg = match target {0=>&mut cpu.reg.b,1=>&mut cpu.reg.c,2=>&mut cpu.reg.d,3=>&mut cpu.reg.e,4=>&mut cpu.reg.h,5=>&mut cpu.reg.l,7=>&mut cpu.reg.a,_=>unreachable!()}; *reg &= mask; 2 } }
+fn cb_set(cpu:&mut CPU, op:u8)->u32 { let bit = (op>>3)&0x07; let mask = 1<<bit; let target = op & 0x07; if target==6 { let addr=cpu.reg.hl(); let mut v=cpu.read(addr); v |= mask; cpu.write(addr,v); 4 } else { let reg = match target {0=>&mut cpu.reg.b,1=>&mut cpu.reg.c,2=>&mut cpu.reg.d,3=>&mut cpu.reg.e,4=>&mut cpu.reg.h,5=>&mut cpu.reg.l,7=>&mut cpu.reg.a,_=>unreachable!()}; *reg |= mask; 2 } }
 static CB_TABLE: [CbHandler;256] = { let mut t:[CbHandler;256] = [cb_rot;256]; let mut i=0; while i<256 { t[i]= if i<0x40 { cb_rot } else if i<0x80 { cb_bit } else if i<0xC0 { cb_res } else { cb_set }; i+=1;} t };
 fn op_cb(cpu:&mut CPU,_:u8)->u32 { let opc = cpu.fetchbyte(); CB_TABLE[opc as usize](cpu, opc) }
 
@@ -639,116 +770,6 @@ mod test {
     use super::CPU;
     use crate::mbc;
 
-    const CPU_INSTRS: &'static str = "test/cpu_instrs.gb";
-    const INSTR_TIMING: &'static str = "test/instr_timing.gb";
-    const GPU_CLASSIC_CHECKSUM: u32 = 3112234583;
-    const GPU_COLOR_CHECKSUM: u32 = 938267576;
-    const TIMING_CLASSIC_CHECKSUM: u32 = 1949059212;
-    const TIMING_COLOR_CHECKSUM: u32 = 2805078112;
-
-    #[test]
-    fn cpu_instrs_classic() {
-        let mut sum_classic = 0_u32;
-        {
-            let cart = mbc::Cartridge::from_file(CPU_INSTRS.into(), false).unwrap();
-            let mut c = match CPU::new(cart, None) {
-                Err(message) => {
-                    panic!("{}", message);
-                }
-                Ok(cpu) => cpu,
-            };
-            let mut ticks = 0;
-            while ticks < 63802933 * 4 {
-                ticks += c.do_cycle();
-            }
-            let fb = c.mmu.gpu.front_buffer();
-            for i in 0..fb.len() {
-                sum_classic = sum_classic.wrapping_add((fb[i] as u32).wrapping_mul(i as u32));
-            }
-        }
-
-        assert!(
-            sum_classic == GPU_CLASSIC_CHECKSUM,
-            "GPU did not produce expected graphics"
-        );
-    }
-
-    #[test]
-    fn cpu_instrs_color() {
-        let mut sum_color = 0_u32;
-
-        {
-            let cart = mbc::Cartridge::from_file(CPU_INSTRS.into(), false).unwrap();
-            let mut c = match CPU::new_cgb(cart, None) {
-                Err(message) => {
-                    panic!("{}", message);
-                }
-                Ok(cpu) => cpu,
-            };
-            let mut ticks = 0;
-            while ticks < 63802933 * 2 {
-                ticks += c.do_cycle();
-            }
-            let fb = c.mmu.gpu.front_buffer();
-            for i in 0..fb.len() {
-                sum_color = sum_color.wrapping_add((fb[i] as u32).wrapping_mul(i as u32));
-            }
-        }
-
-        assert!(
-            sum_color == GPU_COLOR_CHECKSUM,
-            "GPU did not produce expected graphics"
-        );
-    }
-
-    #[test]
-    fn instr_timing_classic() {
-        let mut sum_classic = 0_u32;
-        {
-            let cart = mbc::Cartridge::from_file(INSTR_TIMING.into(), false).unwrap();
-            let mut c = match CPU::new(cart, None) {
-                Err(message) => { panic!("{}", message); }
-                Ok(cpu) => cpu,
-            };
-            let mut ticks = 0;
-            while ticks < 63802933 * 4 {
-                ticks += c.do_cycle();
-            }
-            let fb = c.mmu.gpu.front_buffer();
-            for i in 0..fb.len() {
-                sum_classic = sum_classic.wrapping_add((fb[i] as u32).wrapping_mul(i as u32));
-            }
-        }
-        assert!(
-            sum_classic == TIMING_CLASSIC_CHECKSUM, 
-            "Classic mode instruction timing test failed"
-        );
-    }
-
-    #[test]
-    fn instr_timing_color() {
-        let mut sum_color = 0_u32;
-        {
-            let cart = mbc::Cartridge::from_file(INSTR_TIMING.into(), false).unwrap();
-            let mut c = match CPU::new_cgb(cart, None) {
-                Err(message) => { panic!("{}", message); }
-                Ok(cpu) => cpu,
-            };
-            let mut ticks = 0;
-            while ticks < 63802933 * 2 {
-                ticks += c.do_cycle();
-            }
-            let fb = c.mmu.gpu.front_buffer();
-            for i in 0..fb.len() {
-                sum_color = sum_color.wrapping_add((fb[i] as u32).wrapping_mul(i as u32));
-            }
-        }
-        assert!(
-            sum_color == TIMING_COLOR_CHECKSUM,
-            "Color mode instruction timing test failed"
-        );
-    }
-
     #[test]
     fn undefined_opcode_halts_instead_of_panicking() {
         let mut rom = vec![0u8; 0x8000];
@@ -776,5 +797,65 @@ mod test {
         let _ = cpu.do_cycle(); // executes STOP
         assert_eq!(cpu.reg.pc, 0x102,
             "STOP must advance PC by 2 (opcode + operand), got {:04X}", cpu.reg.pc);
+    }
+
+    fn cpu_with_code(code: &[u8]) -> CPU {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x100..0x100 + code.len()].copy_from_slice(code);
+        rom[0x147] = 0x00; // MBC0
+        let cart = mbc::Cartridge::from_buffer(rom, true).unwrap();
+        let mut cpu = CPU::new(cart, None).unwrap();
+        cpu.reg.pc = 0x100;
+        cpu
+    }
+
+    #[test]
+    fn ime_is_clear_after_boot() {
+        let cpu = cpu_with_code(&[]);
+        assert!(!cpu.ime, "IME must be 0 when the boot ROM hands off");
+    }
+
+    #[test]
+    fn di_cancels_pending_ei() {
+        // EI; DI; NOP; NOP -- the EI must never take effect.
+        let mut cpu = cpu_with_code(&[0xFB, 0xF3, 0x00, 0x00]);
+        cpu.mmu.inte = 0x01;
+        cpu.mmu.intf = 0x01;
+        for _ in 0..4 {
+            cpu.do_cycle();
+        }
+        assert!(!cpu.ime);
+        assert_eq!(cpu.reg.pc, 0x104, "no interrupt should have been dispatched");
+    }
+
+    #[test]
+    fn second_ei_does_not_extend_the_delay() {
+        // EI; EI; NOP with an interrupt pending: IME turns on after the
+        // instruction following the *first* EI, so the third step dispatches.
+        let mut cpu = cpu_with_code(&[0xFB, 0xFB, 0x00]);
+        cpu.reg.sp = 0xDFF0;
+        cpu.mmu.inte = 0x01;
+        cpu.mmu.intf = 0x01;
+        cpu.do_cycle(); // EI
+        cpu.do_cycle(); // EI
+        cpu.do_cycle(); // dispatch
+        assert_eq!(cpu.reg.pc, 0x0040);
+    }
+
+    #[test]
+    fn ei_halt_with_pending_interrupt_returns_to_halt() {
+        // EI; HALT with VBlank already pending: the interrupt is serviced and
+        // the pushed return address is the HALT (0x101), not the byte after.
+        let mut cpu = cpu_with_code(&[0xFB, 0x76, 0x00]);
+        cpu.reg.sp = 0xDFF0;
+        cpu.mmu.inte = 0x01;
+        cpu.mmu.intf = 0x01;
+        cpu.do_cycle(); // EI
+        cpu.do_cycle(); // HALT (bugged: IME not yet on)
+        cpu.do_cycle(); // interrupt dispatch
+        assert_eq!(cpu.reg.pc, 0x0040);
+        assert!(!cpu.halt_bug, "dispatch must consume the halt bug");
+        let ret = cpu.mmu.rw(cpu.reg.sp);
+        assert_eq!(ret, 0x101);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rust-gbe"
-version = "2.1.0"
+version = "3.0.0"
 edition = "2024"
 
 [dependencies]
@@ -18,13 +18,23 @@ rkyv = { version = "0.8.16", features = ["little_endian", "unaligned", "pointer_
 time = { version = "0.3.47", features = ["formatting", "local-offset"] }
 gilrs = "0.11"
 lz4_flex = "0.11"
+png = "0.17"
+rtrb = "0.3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.dev]
 debug = "line-tables-only"
 
+# The test-ROM harness emulates minutes of Game Boy time; unoptimized it is
+# too slow to run routinely.
+[profile.test]
+opt-level = 3
+
 [profile.release]
 codegen-units = 1
 lto = "fat"
-panic = "abort"
+# Unwind (not abort) so emulator-thread panics can be caught, logged to
+# crash.log, and battery RAM flushed before exit.
+panic = "unwind"
 debug = false
 strip = "symbols"

@@ -13,15 +13,17 @@ Build with `cargo b --release`.
 
 On Linux systems, some system dependencies are required:
 
-```sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libwayland-dev libxkbcommon-dev mesa-common-dev```
+```sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libgtk-3-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libwayland-dev libxkbcommon-dev mesa-common-dev```
 
-Run with `cargo r --release`, or run the executable in `target\release`. Select your ROM using the GUI.
+Run with `cargo r --release`, or run the executable in `target\release`. Select your ROM (.gb, .gbc, or a .zip containing one) using the GUI, drag it onto the window, or pass its path as the first argument.
 
-Supports saving in-game (battery-backed RAM) or with savestates.
+Supports saving in-game (battery-backed RAM) or with savestates. Gamepads are supported (bindings under Settings > Keybindings; the right stick tilts MBC7 games like Kirby Tilt 'n' Tumble), as are GameShark RAM cheats (Emulation > Cheats).
+
+Files written next to the ROM: `<rom>.gbsave` (battery RAM, interchangeable with other emulators), `<rom>.state` (session auto-save), and `<rom>.slotN.state` (save-state slots). `config.json` and `crash.log` are written next to the executable.
 
 ### Emulator Keybinds:
 
-Emulator keybinds are configurable and can be adjusted from the Options dropdown while emulator is running.
+Emulator keybinds are configurable and can be adjusted from Settings > Keybindings while the emulator is running. Bindings follow the physical key position, so the defaults sit in the same place on AZERTY and other layouts.
 
 `A`: `X`
 
@@ -29,23 +31,39 @@ Emulator keybinds are configurable and can be adjusted from the Options dropdown
 
 `Dpad`: `ArrowKeys`
 
-`Start`: `Space`
+`Start`: `Enter`
 
-`Select`: `Enter`
+`Select`: `Space`
 
 ### System Keybinds:
 
 These are reserved keybinds for system functionality and cannot be adjusted through config menu.
 
-`F1-F4`: Save state, slots 1-4
+`F1-F4`: Save state, slots 1-4 (`Ctrl+F1-F4`: slots 5-8)
 
-`F5-F8`: Load state, slots 1-4
+`F5-F8`: Load state, slots 1-4 (`Ctrl+F5-F8`: slots 5-8)
+
+`F9`: Toggle FPS overlay
+
+`F11`: Toggle fullscreen
+
+`F12`: Screenshot (PNG saved next to the ROM)
 
 `T`: Toggle turbo
 
-`RShift`: Hold turbo
+`Shift`: Hold turbo
 
-`Y`: Toggle interpolation
+`Y`: Cycle screen filter (nearest / bilinear / sharp bilinear; LCD grid in Display menu)
+
+`P`: Pause
+
+`M`: Mute
+
+`Backspace`: Hold to rewind
+
+`\`: Step back one rewind snapshot
+
+`Ctrl+R`: Reset
 
 `Esc`: Close menu/Close emulator (double-press required to close emulator)
 
