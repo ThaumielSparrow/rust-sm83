@@ -2030,7 +2030,7 @@ checksum = "fae8ee26b0371a29a77d2b2d6b3ae13aa81def6f9bf1b1b92a32d279a5e709b7"
 
 [[package]]
 name = "rust-gbe"
-version = "2.1.0"
+version = "3.0.0"
 dependencies = [
  "blip_buf",
  "cpal",
